@@ -13440,7 +13440,17 @@ describe('the goal loop', () => {
       ...goalReplies(),
       goal_draft: () => {
         asked += 1;
-        if (working) return { ok: false, error: 'chat_still_working', message: 'This chat is still working on its answer.' };
+        if (working) {
+          return {
+            ok: false,
+            status: 409,
+            data: {
+              error: 'chat_still_working',
+              retryable: true,
+              message: 'This chat is still working on its answer.'
+            }
+          };
+        }
         return goalReplies().goal_draft();
       }
     });

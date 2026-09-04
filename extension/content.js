@@ -8726,7 +8726,10 @@
       // a failure, and not a released claim either: the obligation is filed app-side, and
       // this document keeps the turn and asks again on a fixed short wait until the app
       // says the chat has finished. The bar stays on the settling step meanwhile.
-      if (reply && reply.error === 'chat_still_working') {
+      if (
+        reply &&
+        (reply.error === 'chat_still_working' || (reply.data && reply.data.error === 'chat_still_working'))
+      ) {
         setGoalPhase('settling', 'the app still sees this chat working');
         void retryGoalDraft(forTurn, true);
         return;
