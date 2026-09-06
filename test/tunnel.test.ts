@@ -18,7 +18,12 @@ import {
   routeObservation
 } from '../src/main/tunnel/index.js';
 import { describeRoute, metadataErrorIsCurrent } from '../src/main/diagnostics.js';
-import { commonBinaryDirsForPlatform, locateBinary, tunnelExecutableName } from '../src/main/tunnel/locate.js';
+import {
+  commonBinaryDirsForPlatform,
+  locateBinary,
+  resetTunnelLocatorCacheForTests,
+  tunnelExecutableName
+} from '../src/main/tunnel/locate.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 describe('cross-platform tunnel executable discovery', () => {
@@ -39,20 +44,45 @@ describe('cross-platform tunnel executable discovery', () => {
 
   it.runIf(process.platform !== 'win32')('requires the executable bit for an explicit tunnel binary', async () => {
     const root = await makeTempDir('clf-tunnel-exec-');
+    const previousResourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
     try {
       const blockedDir = path.join(root, 'blocked');
       const allowedDir = path.join(root, 'allowed');
       await mkdir(blockedDir, { recursive: true });
       await mkdir(allowedDir, { recursive: true });
+      // A dev checkout that staged `npm run tunnel` has its own working mirror at
+      // resources/tunnel, and this suite imports locate.js from source where that
+      // mirror answers. Pin a deterministic test bundle via resourcesPath instead
+      // of assuming no other copy of the binary exists on this machine.
+      const tempResources = path.join(root, 'resources');
+      await mkdir(tempResources, { recursive: true });
+      Object.defineProperty(process, 'resourcesPath', {
+        configurable: true,
+        writable: true,
+        value: tempResources
+      });
+      const bundled = path.join(tempResources, 'tunnel', 'tunnel-client');
+      await mkdir(path.join(tempResources, 'tunnel'), { recursive: true });
       const blocked = path.join(blockedDir, 'tunnel-client');
       const allowed = path.join(allowedDir, 'tunnel-client');
+      await writeFile(bundled, '#!/bin/sh\n', { mode: 0o755 });
       await writeFile(blocked, '#!/bin/sh\n', { mode: 0o644 });
       await writeFile(allowed, '#!/bin/sh\n', { mode: 0o644 });
       await chmod(allowed, 0o755);
+      resetTunnelLocatorCacheForTests();
 
-      expect(locateBinary('tunnel-client', blocked)).toBeNull();
+      // A non-executable explicit path is never honored: the fallback bundle wins.
+      expect(locateBinary('tunnel-client', blocked)).toBe(bundled);
+      expect(locateBinary('tunnel-client', blocked)).not.toBe(blocked);
+      // A valid explicit executable still overrides any bundle.
       expect(locateBinary('tunnel-client', allowed)).toBe(allowed);
     } finally {
+      Object.defineProperty(process, 'resourcesPath', {
+        configurable: true,
+        writable: true,
+        value: previousResourcesPath
+      });
+      resetTunnelLocatorCacheForTests();
       await removeTempDir(root);
     }
   });

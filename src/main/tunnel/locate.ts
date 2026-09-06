@@ -155,10 +155,14 @@ export function locateBinary(name: BinaryName, hint?: string): string | null {
 function bundledDir(): string | null {
   const packaged = process.resourcesPath ? path.join(process.resourcesPath, 'tunnel') : null;
   if (packaged && existsSync(packaged)) return packaged;
-  // Source: src/main/tunnel -> repo root is three levels up.
-  // Packaged/compiled dev output keeps the same main/tunnel nesting under dist.
-  const dev = path.resolve(__dirname, '..', '..', '..', 'resources', 'tunnel');
-  return existsSync(dev) ? dev : null;
+  // The dev mirror lives at <repo-root>/resources/tunnel, but the anchor differs
+  // by how this module is loaded: imported from source here (src/main/tunnel, three
+  // levels up) or bundled by electron-vite into out/main (two levels up). Probe both
+  // so `npm run tunnel`'s staged mirror is found from either depth.
+  const dev = path.resolve(__dirname, '..', '..', 'resources', 'tunnel');
+  if (existsSync(dev)) return dev;
+  const devFromSource = path.resolve(__dirname, '..', '..', '..', 'resources', 'tunnel');
+  return existsSync(devFromSource) ? devFromSource : null;
 }
 
 /** The bundled tunnel-client version, for the diagnostics panel. */
