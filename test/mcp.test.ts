@@ -2880,6 +2880,54 @@ describe('exec_command and write_stdin', () => {
     expect(textOf(rg).toLowerCase()).toContain(bundled.toLowerCase());
   });
 
+  it.runIf(process.platform === 'darwin').each([false, true])(
+    'keeps bundled rg first after a login profile replaces PATH (tty=%s)',
+    async (tty) => {
+      const root = await makeTempDir('clf-rg-profile-');
+      const heldZdotdir = process.env.ZDOTDIR;
+      const heldResources = Object.getOwnPropertyDescriptor(process, 'resourcesPath');
+      const quote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+      try {
+        // A controlled profile replaces PATH rather than relying on the host's dotfiles.
+        // Special characters in the bundle directory must remain literal shell data.
+        const resources = path.join(root, "bundle's $(echo literal)");
+        const bundled = path.join(resources, 'rg', 'rg');
+        const shadowDir = path.join(root, 'profile-bin');
+        const shadow = path.join(shadowDir, 'rg');
+        await fs.mkdir(path.dirname(bundled), { recursive: true });
+        await fs.mkdir(shadowDir);
+        await fs.writeFile(bundled, '#!/bin/sh\nprintf BUNDLED-RG', { mode: 0o755 });
+        await fs.writeFile(shadow, '#!/bin/sh\nprintf EXPLICIT-RG', { mode: 0o755 });
+        await fs.writeFile(path.join(root, '.zprofile'),
+          `export PATH=${quote(shadowDir)}:/usr/bin:/bin\nexport COS_PROFILE_LOADED=yes\n`);
+        process.env.ZDOTDIR = root;
+        Object.defineProperty(process, 'resourcesPath', { configurable: true, value: resources });
+        const reply = await core('tools/call', {
+          name: 'exec_command',
+          arguments: {
+            cmd: `command -v rg; /bin/sh -c rg; printf '\\n%s\\n' "$COS_PROFILE_LOADED"; ${quote(shadow)}`,
+            shell: '/bin/zsh',
+            login: true,
+            tty,
+            workdir: '/workspace',
+            yield_time_ms: 5_000
+          }
+        });
+        expect(failed(reply), textOf(reply)).toBe(false);
+        expect(textOf(reply)).toContain(bundled);
+        expect(textOf(reply)).toContain('BUNDLED-RG');
+        expect(textOf(reply)).toContain('yes');
+        expect(textOf(reply)).toContain('EXPLICIT-RG');
+      } finally {
+        if (heldZdotdir === undefined) delete process.env.ZDOTDIR;
+        else process.env.ZDOTDIR = heldZdotdir;
+        if (heldResources) Object.defineProperty(process, 'resourcesPath', heldResources);
+        else Reflect.deleteProperty(process, 'resourcesPath');
+        await removeTempDir(root);
+      }
+    }
+  );
+
   it.runIf(IS_WINDOWS)('binds bare PowerShell rg to the bundled binary instead of a shadowing function', async () => {
     const bundled = locateRipgrep();
     if (!bundled) return;

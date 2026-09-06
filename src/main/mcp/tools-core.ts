@@ -715,6 +715,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // going to reject outright. Repairing first means the rest of the pipeline sees a
           // line PowerShell can actually parse, and a line it cannot repair is left exactly
           // as written for the shell to refuse and the hint to explain.
+          const ripgrep = shell.shellType === 'cmd' ? null : locateRipgrep();
           const commandNotes: string[] = [];
           const boundCommands = rawCommands.map((rawCommand, index) => {
             const repaired = repairPowerShellQuoting(rawCommand, shell.shellType);
@@ -722,11 +723,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               nodeFs.readdirSync(nodePath.resolve(dir.real, relativeDirectory))
             );
             const prefix = (note: string): string => (isBatch ? `Command ${index + 1}: ${note}` : note);
-            const bound = bindBundledRipgrep(
-              normalized.cmd,
-              shell.shellType,
-              shell.shellType === 'cmd' ? null : locateRipgrep()
-            );
+            const bound = bindBundledRipgrep(normalized.cmd, shell.shellType, ripgrep);
             const chained = normalizePowerShellOperators(bound, shell.shellType, shell.shellPath);
             commandNotes.push(
               ...repaired.notes.map(prefix),
@@ -801,8 +798,15 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             // id cannot briefly authorize its previous chat before this call publishes the new owner.
             forgetExecOwner(processId);
 
+            // POSIX startup files can replace childEnv's PATH (macOS path_helper does).
+            // Restore the shipped runtime after profiles, preserving their other PATH entries
+            // and explicit executable paths. Do this only after apply_patch interception: the
+            // parser must see the user's script, not an injected export statement.
+            const launchScript = ripgrep && ['zsh', 'bash', 'sh'].includes(shell.shellType)
+              ? `export PATH=${shlexJoin([nodePath.dirname(ripgrep)])}:"$PATH"\n${boundCommand}`
+              : boundCommand;
             const output = await unifiedExecManager.execCommand({
-              command,
+              command: deriveExecArgs(shell, launchScript, useLoginShell),
               shellType: shell.shellType,
               hookCommand: commandDetail,
               processId,
