@@ -799,6 +799,86 @@ describe('observations', () => {
 // ---------------------------------------------------------------- activity
 
 describe('activity feed', () => {
+  it('projects the exact source turn on a pending Compact & Resume job', async () => {
+    await pair();
+    const conversationId = '98989898-7777-4666-8555-444444444445';
+    const opened = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'turn_start', time: Date.now(), turnId: 'compaction-source-turn' }]
+      }
+    });
+    const sessionId = opened.body.sessionId as string;
+    const continuation = await openContinuationNow(sessionId, conversationId, true);
+    expect(continuation.sourceTurnId).toBe('compaction-source-turn');
+    expect(resumeJobFor(sessionId)).toMatchObject({ sourceTurnId: 'compaction-source-turn' });
+    const feed = await request('GET', `/activity?conversationId=${conversationId}`);
+    expect(feed.body.job).toMatchObject({ sourceTurnId: 'compaction-source-turn' });
+  });
+
+  it('cancels an unsent automatic ticket after a newer durable turn starts', async () => {
+    await pair();
+    const conversationId = '98989898-7777-4666-8555-444444444446';
+    const opened = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'turn_start', time: Date.now(), turnId: 'auto-source-turn' }]
+      }
+    });
+    const sessionId = opened.body.sessionId as string;
+    const continuation = await openContinuationNow(sessionId, conversationId, true);
+    expect(continuation.sourceTurnId).toBe('auto-source-turn');
+
+    // The user moved on before the handoff prompt reached Source Send. Even if this newer turn
+    // has already ended by the time the replacement document polls, the old automatic ticket
+    // must not interrupt or summarise it.
+    await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'turn_end', time: Date.now() + 1, turnId: 'auto-source-turn', outcome: 'stopped' },
+      { kind: 'turn_start', time: Date.now() + 2, turnId: 'newer-user-turn' },
+      { kind: 'turn_end', time: Date.now() + 3, turnId: 'newer-user-turn', outcome: 'completed' }
+    ] } });
+
+    const feed = await request('GET', `/activity?conversationId=${conversationId}`);
+    expect(feed.status).toBe(200);
+    expect(continuationForSession(sessionId)).toBeNull();
+    expect(continuationByToken(continuation.token)).toMatchObject({
+      state: 'aborted',
+      error: 'source_turn_superseded'
+    });
+    expect(feed.body.job).toBeNull();
+  });
+
+  it('does not auto-cancel a source handoff after its dispatch fence is crossed', async () => {
+    await pair();
+    const conversationId = '98989898-7777-4666-8555-444444444447';
+    const opened = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'turn_start', time: Date.now(), turnId: 'dispatched-source-turn' }]
+      }
+    });
+    const sessionId = opened.body.sessionId as string;
+    const continuation = await openContinuationNow(sessionId, conversationId, true);
+    expect((await request('POST', '/compact', {
+      body: { conversationId, token: continuation.token, sourceAttempt: true }
+    })).status).toBe(200);
+    expect((await request('POST', '/compact', {
+      body: { conversationId, token: continuation.token, sourceDispatch: true }
+    })).status).toBe(200);
+
+    await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'turn_end', time: Date.now() + 1, turnId: 'dispatched-source-turn', outcome: 'stopped' },
+      { kind: 'turn_start', time: Date.now() + 2, turnId: 'newer-after-dispatch' }
+    ] } });
+    await request('GET', `/activity?conversationId=${conversationId}`);
+
+    expect(continuationForSession(sessionId)).toMatchObject({
+      token: continuation.token,
+      state: 'awaiting-summary',
+      sourceSend: { state: 'dispatched-unresolved' }
+    });
+  });
+
   it('reopens a durable still-open chat after recorder memory is lost', async () => {
     await pair();
     const conversationId = '98989898-7777-6666-5555-444444444444';

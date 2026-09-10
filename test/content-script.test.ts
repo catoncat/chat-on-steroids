@@ -11781,19 +11781,122 @@ describe('the context meter and automatic compaction', () => {
    * resume a ticket it reads back — raise its tab, stop the turn, send the prompt once — and
    * that is what these prove.
    */
-  function automaticTicket(sendState: string) {
+  function automaticTicket(sendState: string, sourceTurnId: string | null = null) {
     return {
       job: {
         sessionId: 's1',
         stage: 'handoff-pending',
         busy: true,
         automatic: true,
+        sourceTurnId,
         handoffId: null,
         error: null,
         sourceSend: { state: sendState, messageId: null }
       }
     };
   }
+
+  it('continues the same automatic ticket when Stop lands after the first bounded wait', async () => {
+    let sendState = 'not-attempted';
+    let showTicket = false;
+    live = await harness(undefined, {
+      activity: () => withContext(
+        205_000,
+        settings({ auto: true, threshold: 200_000 }),
+        showTicket ? automaticTicket(sendState) : {}
+      ),
+      compact: (message: Record<string, unknown>) => {
+        if (message.sourceAttempt) {
+          sendState = 'attempted-unresolved';
+          return { ok: true, data: { allowed: true } };
+        }
+        if (message.sourceDispatch) {
+          sendState = 'dispatched-unresolved';
+          return { ok: true, data: { armed: true } };
+        }
+        if (message.ticket) {
+          return {
+            ok: true,
+            data: {
+              started: false,
+              filed: true,
+              token: 'tok-late-stop',
+              prompt: null,
+              sourceSend: { state: sendState, messageId: null },
+              ...automaticTicket(sendState)
+            }
+          };
+        }
+        return {
+          ok: true,
+          data: {
+            started: false,
+            token: 'tok-late-stop',
+            prompt: 'write the handoff after the late stop',
+            sourceSend: { state: sendState, messageId: null },
+            ...automaticTicket(sendState)
+          }
+        };
+      }
+    });
+    live.hook.injectControl();
+    startGenerating(live.document);
+    const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
+    stop.addEventListener('click', (event) => event.preventDefault());
+    const sends = watchSend(live.document);
+
+    showTicket = true;
+    await live.hook.pullActivity();
+    await settle();
+    expect(sends()).toBe(0);
+    expect(startedCompactions(live)).toHaveLength(0);
+
+    // ChatGPT acknowledges the already-requested Stop after the 15-second browser budget.
+    // The durable pre-Send ticket is still safe to continue; no reload should be required.
+    stopGenerating(live.document);
+    await live.hook.pullActivity();
+    await settle();
+
+    expect(sends()).toBe(1);
+    expect(startedCompactions(live)).toHaveLength(1);
+    expect(live.sent).toContainEqual(expect.objectContaining({
+      type: 'compact',
+      token: 'tok-late-stop',
+      sourceAttempt: true
+    }));
+  });
+
+  it('cancels an unsent automatic ticket instead of interrupting a newer real user turn', async () => {
+    let showTicket = false;
+    let cancelled = 0;
+    live = await harness(undefined, {
+      activity: () => withContext(
+        205_000,
+        settings({ auto: true, threshold: 200_000 }),
+        showTicket ? automaticTicket('not-attempted', 'g-older-source-turn') : {}
+      ),
+      compact: (message: Record<string, unknown>) => {
+        if (message.cancel) {
+          cancelled++;
+          showTicket = false;
+          return { ok: true, data: { cancelled: true, job: null } };
+        }
+        return { ok: false, error: 'unexpected_compaction_attempt' };
+      }
+    });
+    live.hook.injectControl();
+    startGenerating(live.document);
+    live.hook.observe();
+    await settle();
+    showTicket = true;
+
+    await live.hook.pullActivity();
+    await settle();
+
+    expect(cancelled).toBe(1);
+    expect(live.sent.some((message) => message.type === 'compact' && message.cancel === true)).toBe(true);
+    expect(live.sent.some((message) => message.type === 'focus_tab')).toBe(false);
+  });
 
   it('resumes an automatic ticket the app filed: raises the tab, stops the turn, sends once', async () => {
     let sendState = 'not-attempted';

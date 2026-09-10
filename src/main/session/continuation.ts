@@ -396,6 +396,8 @@ export function setContinuationRecoveryHooks(hooks: ContinuationRecoveryHooks): 
 }
 
 export interface ContinuationView {
+  /** The recorder turn this ticket was opened against; null only for legacy/id-less opens. */
+  sourceTurnId: string | null;
   touchedAt: number;
   token: string;
   sessionId: string;
@@ -415,6 +417,7 @@ export interface ContinuationView {
 }
 
 const view = (entry: Continuation): ContinuationView => ({
+  sourceTurnId: entry.sourceTurnId,
   touchedAt: entry.touchedAt,
   token: entry.token,
   sessionId: entry.sessionId,

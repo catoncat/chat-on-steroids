@@ -1894,6 +1894,38 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // seconds. The browser stream is presentation state, so send a bounded newest window and
     // explicitly tell the page to replace its local projection when its cursor predates it.
     const recent = await readRecentEvents(live.sessionId, 1200);
+    // A threshold-created ticket is scoped to the exact turn that crossed the line until its
+    // source prompt reaches the irreversible Send fence. If the user starts another turn first,
+    // the old ticket no longer describes a stable source snapshot and must not interrupt that
+    // newer work on its next browser pickup. The durable turn log is stronger than whichever
+    // document happens to be mounted: this also catches a newer turn that already finished.
+    const pendingCompaction = continuationForSession(live.sessionId);
+    if (
+      pendingCompaction?.automatic &&
+      pendingCompaction.state === 'awaiting-summary' &&
+      pendingCompaction.sourceTurnId &&
+      sendUnattempted(pendingCompaction.sourceSend)
+    ) {
+      const latestTurnStart = [...recent].reverse().find((event) => event.kind === 'turn_start' && event.turnId);
+      if (latestTurnStart?.turnId && latestTurnStart.turnId !== pendingCompaction.sourceTurnId) {
+        try {
+          if (await abortContinuationSourceBeforeSendNow(pendingCompaction.token, 'source_turn_superseded')) {
+            compactionWatch.delete(id);
+            if (repairsInFlight.get(id)?.reason === 'compaction') repairsInFlight.delete(id);
+            logInfo(
+              `bridge: cancelled unsent auto-compaction ${pendingCompaction.token.slice(0, 8)} for ${id} — source turn ${pendingCompaction.sourceTurnId} was superseded by ${latestTurnStart.turnId}`
+            );
+            changed();
+          }
+        } catch (err) {
+          // Keep presenting the still-durable ticket rather than pretending cancellation won.
+          // The next /activity poll retries this exact safe pre-Send transition.
+          logWarn(
+            `bridge: could not durably cancel stale auto-compaction ${pendingCompaction.token.slice(0, 8)} — ${err instanceof Error ? err.message : String(err)}`
+          );
+        }
+      }
+    }
     const firstAvailable = recent.reduce((first, event) => Math.min(first, event.seq), Number.MAX_SAFE_INTEGER);
     const resetActivity =
       firstAvailable !== Number.MAX_SAFE_INTEGER &&
@@ -4366,6 +4398,8 @@ export type ResumeStage =
 export interface ResumeJobView {
   sessionId: string;
   token: string;
+  /** The exact source turn the durable ticket was filed against. */
+  sourceTurnId: string | null;
   stage: ResumeStage;
   startedAt: number;
   /** True only for a threshold-triggered ticket; Auto Off may cancel only these. */
@@ -4424,6 +4458,7 @@ export function resumeJobFor(sessionId: string): ResumeJobView | null {
   return {
     sessionId,
     token: entry.token,
+    sourceTurnId: entry.sourceTurnId,
     stage,
     startedAt: entry.openedAt,
     automatic: entry.automatic,

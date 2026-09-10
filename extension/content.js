@@ -7963,10 +7963,37 @@
    */
   async function maybeResumePendingCompaction(forId = conversationId, forEpoch = epoch) {
     const source = job && job.stage === 'handoff-pending' ? job.sourceSend : null;
-    if (!source || nativeBusy || localError) return;
+    if (!source || nativeBusy) return;
     if (source.state !== 'not-attempted' && source.state !== 'attempted-unresolved') return;
     if (!alive || conversationId !== forId || epoch !== forEpoch || CLF_DOM.conversationId() !== forId) return;
     const automatic = job.automatic === true;
+    // Before the handoff prompt is sent an automatic ticket belongs to the exact turn that
+    // crossed the context threshold. If the user has already started another real turn, the
+    // old ticket must not interrupt that newer work or summarise it under the old boundary.
+    // Cancel the unsent ticket; if the new turn is still above threshold the app will file a
+    // fresh ticket for that turn through the normal automatic-compaction path.
+    if (
+      automatic &&
+      typeof job.sourceTurnId === 'string' &&
+      job.sourceTurnId &&
+      generating &&
+      turnId &&
+      turnId !== job.sourceTurnId
+    ) {
+      localError = '';
+      await cancelCompact();
+      return;
+    }
+    // Stop is an asynchronous ChatGPT action, not a 15-second transaction. A long reasoning
+    // turn can acknowledge Stop after our bounded wait expired. The old code left the timeout
+    // in `localError`, and maybeResumePendingCompaction() then refused every later activity
+    // poll on this same page even after Stop had actually landed. Automatic tickets are
+    // durable and retryable before source Send, so once the page is genuinely idle, clear only
+    // this one retryable barrier error and continue the same ticket.
+    if (localError) {
+      if (!(automatic && localError === COMPACTION_STOP_TIMEOUT && !CLF_DOM.generating())) return;
+      localError = '';
+    }
     // An automatic ticket is the app's decision about a chat nobody is necessarily looking at,
     // and a hidden tab is a throttled one: on 2026-09-03 the source page froze solid while the
     // brief was being written in the background. Raising it first is presentation, not
@@ -8006,7 +8033,7 @@
       userStopped = true;
       const stopped = await waitUntil(() => !current() || !CLF_DOM.generating(), INTERRUPT_WAIT_MS);
       if (!current()) return 'This chat changed while compaction was stopping the turn.';
-      if (!stopped) return 'ChatGPT would not stop the current turn. Nothing was compacted.';
+      if (!stopped) return COMPACTION_STOP_TIMEOUT;
     }
 
     // SETTLING — bounded and fail-closed. A call that is still running at the deadline is
@@ -8933,6 +8960,8 @@
 
   /** How long to wait for ChatGPT to actually stop after the stop button is pressed. */
   const INTERRUPT_WAIT_MS = 15_000;
+  /** A retryable pre-Send barrier: a late Stop may make this false on the next activity poll. */
+  const COMPACTION_STOP_TIMEOUT = 'ChatGPT would not stop the current turn. Nothing was compacted.';
   /**
    * How long to wait for local tool calls and their recorder tail to settle before refusing.
    *
