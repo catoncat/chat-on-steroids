@@ -91,6 +91,7 @@ import {
   getSession,
   listUsageSessions,
   readRecentEvents,
+  refuseAutomaticCompactionNow,
   sessionDurableModifiedAt
 } from './session/store.js';
 import { inFlightMcpRequests, runningToolCalls, runningToolProgress, settlingToolCalls } from './mcp/call-context.js';
@@ -2936,6 +2937,22 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // moves the app-wide setting, which is exactly where it should be set: it is the default
     // every chat with no answer of its own inherits.
     const scoped = which !== null && settingsConversation !== null;
+    // Turning Auto on from a live chat is a preference change, not an implicit press of the
+    // destructive Compact button. Preserve the turn the user is currently watching and arm
+    // automatic compaction from the next turn instead. The refusal is durable and written
+    // before the config flip, so no activity callback can observe auto=true in the gap and
+    // immediately file a ticket that stops this very response.
+    if (auto === true && getConfig().compaction.auto === false && settingsConversation) {
+      const currentSession = await findSessionByConversation(settingsConversation, { requireUnique: true });
+      if (currentSession?.activeTurnId) {
+        try {
+          await refuseAutomaticCompactionNow(currentSession.id, settingsConversation, currentSession.activeTurnId);
+        } catch (err) {
+          logWarn(`bridge: could not durably defer newly enabled auto-compaction for the current turn — ${err instanceof Error ? err.message : String(err)}`);
+          return json(res, 503, { error: 'auto_compaction_fence_not_durable', retryable: true }, origin);
+        }
+      }
+    }
     // Read inside the queued update rather than before it, so a settings change racing this
     // one cannot leave the comparison below looking at a config neither request ever wrote.
     let driving: 'goal' | 'loop' | null = null;

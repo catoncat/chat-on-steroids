@@ -1654,6 +1654,26 @@ describe('automatic compaction', () => {
     });
   });
 
+  it('enables auto-compaction from the next turn instead of stopping the turn being watched', async () => {
+    await pair();
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac07';
+    expect((await request('POST', '/settings', { body: { autoCompact: false } })).status).toBe(200);
+    await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'turn_start', time: Date.now(), turnId: 'turn-before-auto-on' }
+    ] } });
+    const session = await findSessionByConversation(conversationId, { requireUnique: true });
+    expect(session).not.toBeNull();
+
+    const enabled = await request('POST', '/settings', { body: { conversationId, autoCompact: true } });
+    expect(enabled.status).toBe(200);
+    expect(getConfig().compaction.auto).toBe(true);
+    expect((await getSession(session!.id))?.autoCompactionRefusal).toEqual({
+      conversationId,
+      turnId: 'turn-before-auto-on'
+    });
+    expect(continuationForSession(session!.id)).toBeNull();
+  });
+
   it('durably ends an automatic ticket when the source page proves the handoff never reached Send', async () => {
     await pair();
     const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac08';
