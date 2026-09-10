@@ -3363,6 +3363,7 @@ it.each(['matching', 'wrong-document', 'unsafe-draft', 'newer-navigation'])('ret
   const sendMessage = vi.fn(async (..._args: unknown[]) => ({ safe: scenario !== 'unsafe-draft', conversationId, navigationEpoch: 0 }));
   const code = backgroundSource.slice(backgroundSource.indexOf('async function pruneManagedTabs('), backgroundSource.indexOf('\nfunction maintain(', backgroundSource.indexOf('async function pruneManagedTabs(')));
   const prune = vm.runInNewContext(`${code}\npruneManagedTabs`, {
+    setTimeout, clearTimeout, Promise,
     cleanConversationId: (id: string) => id, conversationForTab: () => conversationId,
     conversationFromUrl: (url: string) => url.split('/c/')[1], tabDocuments: { '71': scenario === 'wrong-document' ? 'replacement' : 'doc' },
     tabEpochs: { '71': 0 }, ownsDocument: () => true, journalCountForConversation: () => 0,
@@ -3372,4 +3373,31 @@ it.each(['matching', 'wrong-document', 'unsafe-draft', 'newer-navigation'])('ret
   await prune([tab], { managedConversations: [conversationId], retiredConversations: [conversationId], cancelledDecisionClaims: claims }, new Set(), new Set());
   expect(tabsRemove).toHaveBeenCalledTimes(scenario === 'matching' ? 1 : 0);
   if (scenario === 'matching') expect(sendMessage.mock.calls[0]?.[1]).toMatchObject({ cancelledDecisions: claims });
+});
+
+it('does not let an unresponsive tab-close proof wedge later browser maintenance', async () => {
+  vi.useFakeTimers();
+  try {
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const tab = { id: 71, url: `https://chatgpt.com/c/${conversationId}`, active: false };
+    const neverReplies = new Promise(() => {});
+    const code = backgroundSource.slice(backgroundSource.indexOf('async function pruneManagedTabs('), backgroundSource.indexOf('\nfunction maintain(', backgroundSource.indexOf('async function pruneManagedTabs(')));
+    const prune = vm.runInNewContext(`${code}\npruneManagedTabs`, {
+      setTimeout, clearTimeout, Promise,
+      cleanConversationId: (id: string) => id, conversationForTab: () => conversationId,
+      conversationFromUrl: (url: string) => url.split('/c/')[1], tabDocuments: { '71': 'doc' },
+      tabEpochs: { '71': 0 }, ownsDocument: () => true, journalCountForConversation: () => 0,
+      chrome: { tabs: { get: async () => tab, sendMessage: async () => neverReplies, remove: vi.fn() } }
+    });
+    let settled = false;
+    const pending = prune([tab], { managedConversations: [conversationId], retiredConversations: [conversationId] }, new Set(), new Set())
+      .then(() => { settled = true; });
+    await vi.advanceTimersByTimeAsync(2999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    await pending;
+    expect(settled).toBe(true);
+  } finally {
+    vi.useRealTimers();
+  }
 });

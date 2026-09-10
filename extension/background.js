@@ -2103,8 +2103,17 @@ async function pruneManagedTabs(tabs, policy, protectedChats, closable) {
       const current = await chrome.tabs.get(tab.id);
       if (conversationFromUrl(current.url) !== conversationId || current.pendingUrl) continue;
 
-      const proof = await chrome.tabs.sendMessage(tab.id, { type: 'clf-tab-close-check', conversationId,
-        allowGenerating: blocked.has(conversationId), ...(cancelledDecisions.length ? { cancelledDecisions } : {}) }, { documentId: source.documentId });
+      // This is cleanup proof, never a reason to hold the whole maintenance owner. A stale
+      // content document can keep an async runtime message open indefinitely; if that happened
+      // here, the single-flight `maintenanceFlight` never settled and every later app input,
+      // browser-preference request and alarm merely joined the wedged promise. No reply means
+      // no close authority: keep the tab and let unrelated maintenance continue.
+      let proofTimer;
+      const proof = await Promise.race([
+        chrome.tabs.sendMessage(tab.id, { type: 'clf-tab-close-check', conversationId,
+          allowGenerating: blocked.has(conversationId), ...(cancelledDecisions.length ? { cancelledDecisions } : {}) }, { documentId: source.documentId }),
+        new Promise(resolve => { proofTimer = setTimeout(() => resolve(null), 3000); })
+      ]).finally(() => clearTimeout(proofTimer));
       if (proof?.safe !== true || proof.conversationId !== conversationId || proof.navigationEpoch !== source.navigationEpoch || !ownsDocument(source)) continue;
       const latest = await chrome.tabs.get(tab.id);
       if (latest.pendingUrl || conversationFromUrl(latest.url) !== conversationId || !ownsDocument(source) || journalCountForConversation(conversationId) > 0) continue;
