@@ -11,7 +11,7 @@ function workflow(options: { unchanged?: boolean; deny?: boolean; navigateDuring
   let refreshed = false;
   const click = vi.fn(() => { refreshed = true; });
   const context = vm.createContext({ URL, alive: true, generating: false, epoch: 1,
-    location: { pathname: '/', href: `https://chatgpt.com/?cos-plugin-refresh=${id}#settings/Plugins/plugin_asdk_app_synthetic` },
+    location: { pathname: '/plugins', href: `https://chatgpt.com/plugins?cos-plugin-refresh=${id}#settings/Plugins/plugin_asdk_app_synthetic` },
     CLF_DOM: { generating: () => false, pluginManagementIdle: () => true,
       pluginRefreshView: () => ({ appId: 'asdk_app_synthetic', refresh: options.refreshAvailable === false ? null : { click }, tools: options.unchanged || refreshed ? tools : [{ ...tools[0], description: 'Old description.' }] }) }
   });
@@ -37,7 +37,7 @@ it.each([false, true])('waits for readable tool schemas before claim (navigation
   const ask = vi.fn(async () => ({ data: { ok: true } }));
   const context = vm.createContext({ URL, setTimeout, clearTimeout, pageViewChecks: new Set(), MutationObserver: dom.window.MutationObserver,
     document: dom.window.document, alive: true, generating: false, epoch: 1, ask,
-    location: { pathname: '/', href: `https://chatgpt.com/?cos-plugin-refresh=${id}#settings/Plugins/plugin_asdk_app_synthetic` },
+    location: { pathname: '/plugins', href: `https://chatgpt.com/plugins?cos-plugin-refresh=${id}#settings/Plugins/plugin_asdk_app_synthetic` },
     CLF_DOM: { generating: () => false, pluginManagementIdle: () => true,
       pluginRefreshView: () => ({ appId: 'asdk_app_synthetic', refresh: { click },
         tools: ready ? (refreshed ? tools : [{ ...tools[0], description: 'Old' }]) : null }) }
@@ -57,7 +57,7 @@ it.each([false, true])('waits for readable tool schemas before claim (navigation
 it('keeps a loading settings index pending and restores custody after its installed button drops the marker', async () => {
   const replace = vi.fn(), ask = vi.fn();
   let buttons: Array<{ click: () => void }> | null = null;
-  const location = { pathname: '/', href: `https://chatgpt.com/?cos-plugin-refresh=${id}#settings/Plugins`, replace };
+  const location = { pathname: '/plugins', href: `https://chatgpt.com/plugins?cos-plugin-refresh=${id}#settings/Plugins`, replace };
   const context = vm.createContext({ URL, alive: true, generating: false, epoch: 1, ask,
     location, history: { replaceState: replace },
     CLF_DOM: { generating: () => false, pluginManagementIdle: () => true, pluginInstalledButtons: () => buttons,
@@ -67,9 +67,9 @@ it('keeps a loading settings index pending and restores custody after its instal
   const run = () => (context.run as Function)({ id, appId: null, connectorName: 'Chat On Steroids Core', tools });
   expect(await run()).toBe(false);
   expect(ask).not.toHaveBeenCalled(); // no durable missing-plugin verdict while loading
-  buttons = [{ click: () => { location.href = 'https://chatgpt.com/#settings/Plugins/plugin_asdk_app_synthetic'; } }];
+  buttons = [{ click: () => { location.href = 'https://chatgpt.com/plugins#settings/Plugins/plugin_asdk_app_synthetic'; } }];
   expect(await run()).toBe(true);
-  expect(replace).toHaveBeenCalledExactlyOnceWith(undefined, '', `https://chatgpt.com/?cos-plugin-refresh=${id}#settings/Plugins/plugin_asdk_app_synthetic`);
+  expect(replace).toHaveBeenCalledExactlyOnceWith(undefined, '', `https://chatgpt.com/plugins?cos-plugin-refresh=${id}#settings/Plugins/plugin_asdk_app_synthetic`);
   expect(ask).not.toHaveBeenCalled();
 });
 it('records an already current schema without clicking Refresh and invalidating old chats', async () => {
@@ -105,7 +105,7 @@ it('opens an enrolled exact App Id directly in marked settings without name disc
   });
   vm.runInContext(`${code}\nglobalThis.run = inspectRequestedPluginRefresh;`, context);
   await (context.run as Function)([{ surface: 'core' }], true);
-  expect(create).toHaveBeenCalledExactlyOnceWith(`https://chatgpt.com/?cos-plugin-refresh=${id}#settings/Plugins/plugin_asdk_app_synthetic`, true);
+  expect(create).toHaveBeenCalledExactlyOnceWith(`https://chatgpt.com/plugins?cos-plugin-refresh=${id}#settings/Plugins/plugin_asdk_app_synthetic`, true);
 });
 it.each([{ deny: true }, { navigateDuringClaim: true }])('never clicks after denied claim or changed navigation: %j', async options => {
   const h = workflow(options);
@@ -117,7 +117,7 @@ it('reuses one owned management tab and preserves unreachable helpers and user c
   const background = readFileSync(new URL('../extension/background.js', import.meta.url), 'utf8');
   const code = background.slice(background.indexOf('let pluginRefreshFlight = null;'), background.indexOf('async function catalogProbe('));
   let requests: object[] = [{ id }];
-  const tabs = [{ id: 7, url: `https://chatgpt.com/?cos-plugin-refresh=${id}#settings/Plugins` }, { id: 8, url: 'https://chatgpt.com/c/user-conversation' }];
+  const tabs = [{ id: 7, url: `https://chatgpt.com/plugins?cos-plugin-refresh=${id}#settings/Plugins` }, { id: 8, url: 'https://chatgpt.com/c/user-conversation' }];
   const create = vi.fn(async () => ({ id: 9 }));
   const remove = vi.fn();
   const sendMessage = vi.fn(async (): Promise<object> => ({ ok: true }));

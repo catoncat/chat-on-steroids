@@ -1865,8 +1865,12 @@ function offerStopTurns(requests) {
 let modelCatalogFlight = null;
 let modelCatalogTarget = null;
 let pluginRefreshFlight = null;
+function pluginSettingsPage(url) {
+  return url.origin === 'https://chatgpt.com' && (url.pathname === '/' || url.pathname === '/plugins') &&
+    /^#settings\/Plugins(?:\/plugin_asdk_app_[a-zA-Z0-9_-]+)?$/.test(url.hash);
+}
 function pluginRefreshMarker(tab) {
-  try { const url = new URL(tab?.pendingUrl || tab?.url || ''); return url.origin === 'https://chatgpt.com' && url.pathname === '/' && /^#settings\/Plugins(?:\/plugin_asdk_app_[a-zA-Z0-9_-]+)?$/.test(url.hash) ? url.searchParams.get('cos-plugin-refresh') : null; } catch { return null; }
+  try { const url = new URL(tab?.pendingUrl || tab?.url || ''); return pluginSettingsPage(url) ? url.searchParams.get('cos-plugin-refresh') : null; } catch { return null; }
 }
 function inspectRequestedPluginRefresh(publications, background, browserOnly = false) {
   if (pluginRefreshFlight || !Array.isArray(publications) || !publications.length) return pluginRefreshFlight;
@@ -1884,7 +1888,7 @@ function inspectRequestedPluginRefresh(publications, background, browserOnly = f
       if (!current) return; // A user-closed helper is not permission to reopen it every poll.
       if (pluginRefreshMarker(current) !== owner.id) {
         const url = new URL(current.pendingUrl || current.url || '');
-        if (url.origin !== 'https://chatgpt.com' || url.pathname !== '/' || !/^#settings\/Plugins(?:\/plugin_asdk_app_[a-zA-Z0-9_-]+)?$/.test(url.hash)) return;
+        if (!pluginSettingsPage(url)) return;
         url.searchParams.set('cos-plugin-refresh', owner.id);
         await chrome.tabs.update(current.id, { url: url.href });
         return;
@@ -1904,7 +1908,7 @@ function inspectRequestedPluginRefresh(publications, background, browserOnly = f
     if (!held) {
       if (browserOnly) return;
       try {
-        const tab = await createChatTab(`https://chatgpt.com/?cos-plugin-refresh=${request.id}#settings/Plugins${request.appId ? `/plugin_${request.appId}` : ''}`, background);
+        const tab = await createChatTab(`https://chatgpt.com/plugins?cos-plugin-refresh=${request.id}#settings/Plugins${request.appId ? `/plugin_${request.appId}` : ''}`, background);
         await chrome.storage.session.set({ pluginRefreshOwner: { id: request.id, tab: tab.id } });
       }
       catch {

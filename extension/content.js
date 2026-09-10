@@ -10037,10 +10037,13 @@
 
   let modelCatalogBusy = false;
   let pluginRefreshBusy = false;
+  function pluginSettingsPage(url) {
+    return url.origin === 'https://chatgpt.com' && (url.pathname === '/' || url.pathname === '/plugins') &&
+      /^#settings\/Plugins(?:\/plugin_asdk_app_[a-zA-Z0-9_-]+)?$/.test(url.hash);
+  }
   function ownsPluginRefreshPage(id) {
     const url = new URL(location.href);
-    return alive && !generating && !CLF_DOM.generating() && url.pathname === '/' &&
-      /^#settings\/Plugins(?:\/plugin_asdk_app_[a-zA-Z0-9_-]+)?$/.test(url.hash) && url.searchParams.get('cos-plugin-refresh') === id;
+    return alive && !generating && !CLF_DOM.generating() && pluginSettingsPage(url) && url.searchParams.get('cos-plugin-refresh') === id;
   }
   function waitPageView(read, current, milliseconds) {
     return new Promise(resolve => {
@@ -10089,7 +10092,7 @@
           const next = await CLF_DOM.pluginRefreshView(request.connectorName, request.tools);
           return route && next?.appId === route[1] ? url.href : null;
         }, () => alive && epoch === requestEpoch && !generating && !CLF_DOM.generating() &&
-          new URL(location.href).origin === 'https://chatgpt.com' && location.pathname === '/' && CLF_DOM.pluginManagementIdle(), 8000);
+          pluginSettingsPage(new URL(location.href)) && CLF_DOM.pluginManagementIdle(), 8000);
         if (!discovered || !alive || epoch !== requestEpoch || location.href !== discovered) return false;
         const url = new URL(discovered); url.searchParams.set('cos-plugin-refresh', request.id);
         history.replaceState(history.state, '', url.href); return true;
