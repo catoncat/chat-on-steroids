@@ -6589,6 +6589,13 @@ describe('a content script reloaded into a turn already in flight', () => {
     expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
 
     live.advance(live.hook.TURN_SETTLE_MS);
+    // Reaching the fallback threshold requests one fresh activity verdict before a local
+    // generation may be invented. The harness does not run the production activity timer.
+    live.hook.observe();
+    await settle();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    await live.hook.pullActivity();
+    await settle();
     live.hook.observe();
     await settle();
     await live.hook.flush();
@@ -6649,6 +6656,56 @@ describe('a content script reloaded into a turn already in flight', () => {
 
     expect(attempts).toBe(2);
     expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+  });
+
+  it('rechecks a cached idle verdict before inventing a reload turn and adopts work that arrived meanwhile', async () => {
+    let attempts = 0;
+    live = await harness(
+      'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      {
+        activity: () => {
+          attempts += 1;
+          return activity({ activeTurnId: attempts === 1 ? null : 'g-existing-server-turn' });
+        }
+      },
+      midTurn
+    );
+
+    // The boot answer was genuinely idle. Stop then survives the fallback window, but that
+    // cached null is not authority to mint a turn: a real MCP call can have reached the app in
+    // the meantime, exactly as it did 657 ms before the live 2026-09-10 duplicate start.
+    live.hook.observe();
+    await settle();
+    live.advance(live.hook.TURN_SETTLE_MS);
+    live.hook.observe();
+    await settle();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+
+    // The post-settle activity read now sees the durable turn. It must be adopted, not merely
+    // cached as a reason to suppress the fallback, so its eventual native final closes that id.
+    await live.hook.pullActivity();
+    await settle();
+    await replyFiber([], [{
+      turnId: 'turn-live',
+      conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      endMessageId: 'late-adopted-final',
+      calls: [],
+      messages: [{
+        messageId: 'late-adopted-final',
+        rawMessageId: 'late-adopted-final',
+        stable: true,
+        order: 1,
+        rawText: 'The original server turn finished.',
+        renderedHtml: '<p>The original server turn finished.</p>'
+      }],
+      activities: []
+    }]);
+    await live.hook.flush();
+    await settle();
+
+    expect(attempts).toBe(2);
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    expect(emitted(live.sent, 'turn_end').map((entry) => entry.event.turnId)).toEqual(['g-existing-server-turn']);
   });
 
   it('files everything after the reload under the turn it resumed', async () => {

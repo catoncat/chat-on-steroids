@@ -1350,7 +1350,20 @@
       unrecordedGeneratingSince = Date.now();
       return null;
     }
-    return Date.now() - unrecordedGeneratingSince >= TURN_SETTLE_MS ? newest : null;
+    const settledAt = unrecordedGeneratingSince + TURN_SETTLE_MS;
+    if (Date.now() < settledAt) return null;
+    // `appActiveTurnId` is a sampled fact. A real connector call can land between the last
+    // /activity response and this four-second Stop-control fallback — the 2026-09-10 live
+    // failure did exactly that 657 ms before this branch minted a replacement generation.
+    // Before inventing the one kind of turn that has no send receipt, require a successful
+    // activity read taken *after* the settle window. Production pulls it immediately; tests
+    // drive pullActivity explicitly. A late pull that discovers the durable open turn adopts
+    // it below instead of manufacturing a second id for the same server response.
+    if (observed.pulledAt < settledAt) {
+      expediteActivityPull();
+      return null;
+    }
+    return newest;
   }
 
   function adoptOpenTurn(open) {
@@ -5770,6 +5783,21 @@
       if (resumeIdentityPending) {
         resumeIdentityPending = false;
         if (appActiveTurnId) adoptOpenTurn(appActiveTurnId);
+      } else if (
+        appActiveTurnId &&
+        unrecordedGeneratingSince > 0 &&
+        !generating &&
+        !turnId &&
+        genCount === 0 &&
+        CLF_DOM.generating()
+      ) {
+        // The boot read may honestly have said "no active turn" and become stale a moment
+        // later while this page is still watching Stop. If a fresh activity read now names
+        // the app's durable generation before the fallback claims one, adopt that exact id.
+        // This is intentionally limited to the pre-first-generation recovery window; ordinary
+        // later turns are opened only by their send receipts.
+        unrecordedGeneratingSince = 0;
+        adoptOpenTurn(appActiveTurnId);
       }
       tokens = Number.isFinite(Number(data.tokens)) ? Number(data.tokens) : 0;
       context = readContext(data.context);
