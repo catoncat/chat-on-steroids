@@ -4539,7 +4539,16 @@ export async function cancelResumeNow(sessionId: string): Promise<boolean> {
   if (entry?.state === 'committing' || entry?.state === 'committed') return false;
   let aborted = false;
   if (entry && entry.state !== 'aborted') {
-    aborted = await abortContinuationNow(entry.token, 'cancelled');
+    // A threshold-created ticket cancelled before Source Send is also the user's decision not
+    // to auto-compact *this exact turn*. Use the source-side abort so it writes the existing
+    // per-turn refusal fence; otherwise considerAutomaticCompaction() immediately files an
+    // identical ticket again on the next activity update and the Cancel button is effectively
+    // a one-poll pause. Manual tickets and anything past dispatch keep the ordinary explicit
+    // cancellation semantics — after dispatch the prompt may already exist at ChatGPT.
+    aborted =
+      entry.automatic && entry.state === 'awaiting-summary' && sendUnattempted(entry.sourceSend)
+        ? await abortContinuationSourceBeforeSendNow(entry.token, 'cancelled')
+        : await abortContinuationNow(entry.token, 'cancelled');
     const afterAbort = continuationByToken(entry.token);
     if (!aborted && (afterAbort?.state === 'committing' || afterAbort?.state === 'committed')) return false;
   }

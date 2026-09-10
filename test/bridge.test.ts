@@ -1632,6 +1632,28 @@ describe('automatic compaction', () => {
     expect(continuationForSession(session!.id)).toBeNull();
   });
 
+  it('fences the same source turn when the page cancels an unsent automatic ticket', async () => {
+    await pair();
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac06';
+    await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'turn_start', time: Date.now(), turnId: 'auto-cancel-source' }
+    ] } });
+    const filed = await request('POST', '/compact', {
+      body: { conversationId, ticket: true, automatic: true }
+    });
+    expect(filed.status).toBe(202);
+    const token = filed.body.token as string;
+    const sessionId = filed.body.sessionId as string;
+
+    const cancelled = await request('POST', '/compact', { body: { conversationId, cancel: true } });
+    expect(cancelled.status).toBe(200);
+    expect(continuationByToken(token)).toMatchObject({ state: 'aborted', error: 'cancelled' });
+    expect((await getSession(sessionId))?.autoCompactionRefusal).toEqual({
+      conversationId,
+      turnId: 'auto-cancel-source'
+    });
+  });
+
   it('durably ends an automatic ticket when the source page proves the handoff never reached Send', async () => {
     await pair();
     const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac08';
