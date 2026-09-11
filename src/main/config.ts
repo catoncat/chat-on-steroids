@@ -130,10 +130,8 @@ const DEFAULT_ARTIFACTS: ArtifactSettings = {
 /**
  * The goal loop's defaults.
  *
- * Off, because it types into somebody's chat on its own and because it cannot work at all
- * until an OpenRouter API key exists. The model is a starting point rather than a
- * recommendation: the Chat settings picker lists what OpenRouter actually publishes,
- * newest first, and whatever is chosen there is stored here verbatim.
+ * Off until explicitly enabled, with ChatGPT as the default response source.
+ * API provider/model settings apply only when API is selected; saved choices remain exact.
  */
 /**
  * The shipped Goal baseline. Keep the exact OpenRouter model id here rather than a provider
@@ -154,8 +152,7 @@ const DEFAULT_GOAL: GoalSettings = {
   // the one that can end by itself: a loop that never stops is a deliberate choice, not a
   // default anybody should discover by turning something on.
   mode: 'goal',
-  // OpenRouter stays the default provider so an upgrade changes nothing for anyone who
-  // never touches the switch; a hand-written config predating the field parses the same way.
+  // Default for the optional API backend only; ChatGPT does not read this block.
   provider: { kind: 'openrouter', baseUrl: '' },
   model: DEFAULT_GOAL_MODEL,
   reasoning: 'default',
@@ -242,6 +239,24 @@ function migrateCapabilities(value: unknown): unknown {
   return caps;
 }
 
+/**
+ * Local 2.0.6 Goal-provider configs stored `provider` as `'openrouter' | 'custom'` plus
+ * `customBaseUrl`. 2.0.7 nested that as `{ kind, baseUrl }`. Without this rewrite a still-valid
+ * folder/tunnel file fails the whole schema and conservative recovery wipes every root.
+ */
+function migrateGoalProvider(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  const goal = { ...(value as Record<string, unknown>) };
+  const provider = goal.provider;
+  if (typeof provider === 'string' && (GOAL_PROVIDERS as readonly string[]).includes(provider)) {
+    const baseUrl = typeof goal.customBaseUrl === 'string' ? goal.customBaseUrl : '';
+    goal.provider = { kind: provider, baseUrl };
+  }
+  delete goal.customBaseUrl;
+  delete goal.customAuth;
+  return goal;
+}
+
 // Missing capability keys are filled from safe defaults so adding a new optional
 // permission in an update never resets an existing user's folders/tunnel settings.
 const capabilitiesSchema = z
@@ -293,7 +308,7 @@ const configSchema = z.object({
     planBackend: z.enum(['chatgpt', 'api']).optional(),
     finishAction: z.enum(['notify', 'goal']).optional(),
     finishLeadMinutes: z.number().int().min(3).max(5).optional(),
-    backgroundChats: z.boolean().optional().default(false),
+    backgroundChats: z.boolean().optional().default(true),
     browserOnly: z.boolean().optional().default(false),
     autoRefreshPlugins: z.boolean().optional().default(false),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
@@ -365,8 +380,9 @@ const configSchema = z.object({
   // An empty model id is repaired rather than rejected: the id is free text from a
   // provider listing that changes weekly, and a config that lost it must still load with
   // every root and permission in it intact.
-  goal: z
-    .object({
+  goal: z.preprocess(
+    migrateGoalProvider,
+    z.object({
       impulseMinutes: z.number().int().min(0).max(60).optional().default(0).catch(0),
       includeToolCalls: z.boolean().optional().default(false),
       enabled: z.boolean().optional().default(DEFAULT_GOAL.enabled),
@@ -389,7 +405,8 @@ const configSchema = z.object({
           baseUrl: z.string().max(2048).optional().default('')
         })
         .optional()
-        .default({ ...DEFAULT_GOAL.provider }),
+        .default({ ...DEFAULT_GOAL.provider })
+        .catch({ ...DEFAULT_GOAL.provider }),
       model: z
         .string()
         .max(160)
@@ -439,7 +456,8 @@ const configSchema = z.object({
         .catch(DEFAULT_GOAL.loopPrompt)
     })
     .optional()
-    .default({ ...DEFAULT_GOAL, backend: 'chatgpt', loopBackend: 'chatgpt', impulseMinutes: 0, includeToolCalls: false, helperModel: 'gpt-5.6-sol', helperReasoning: 'high' }),
+    .default({ ...DEFAULT_GOAL, backend: 'chatgpt', loopBackend: 'chatgpt', impulseMinutes: 0, includeToolCalls: false, helperModel: 'gpt-5.6-sol', helperReasoning: 'high' })
+    .catch({ ...DEFAULT_GOAL, backend: 'chatgpt', loopBackend: 'chatgpt', impulseMinutes: 0, includeToolCalls: false, helperModel: 'gpt-5.6-sol', helperReasoning: 'high' })),
   mcp: z
     .object({
       // Repaired rather than rejected, like the Goal prompts above: this is free text a person
@@ -476,7 +494,7 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     capabilities: firstLaunchCapabilities(platform, release),
     readOnly: false,
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false },
+    ui: { minimizeToTray: true, autoConnect: false, startAtLogin: false, privacyScreenshots: false, theme: 'dark', autoRefreshPlugins: false, backgroundChats: true },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
     multiAgent: { ...FIRST_LAUNCH_MULTI_AGENT },
