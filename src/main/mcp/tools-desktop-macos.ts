@@ -57,10 +57,19 @@ const DEFAULT_WINDOW_RESULTS = 60;
  * with ctrl+tab and typed a URL into one. The window the keys would reach is the last one a
  * focus action in this batch named, else the one in front now.
  */
-function newBrowserWindowHint(): string {
-  return process.platform === 'darwin'
-    ? 'open -na "Google Chrome" --args --new-window "$url"'
-    : "Start-Process chrome.exe -ArgumentList '--new-window', $url";
+function newBrowserWindowHint(processName: string): string {
+  const browser = processName.trim().toLowerCase();
+  if (process.platform === 'darwin') {
+    const app = browser.includes('helium') ? 'Helium'
+      : browser.includes('brave') ? 'Brave Browser'
+        : browser.includes('edge') || browser.includes('msedge') ? 'Microsoft Edge'
+          : 'Google Chrome';
+    return `open -na "${app}" --args --new-window "$url"`;
+  }
+  const executable = browser.includes('brave') ? 'brave.exe'
+    : browser.includes('edge') || browser.includes('msedge') ? 'msedge.exe'
+      : 'chrome.exe';
+  return `Start-Process ${executable} -ArgumentList '--new-window', $url`;
 }
 
 async function browserChordRefusal(actions: Action[]): Promise<string | null> {
@@ -79,7 +88,7 @@ async function browserChordRefusal(actions: Action[]): Promise<string | null> {
       `BROWSER_TAB_CHORD: ${chord} would close, open or switch tabs or windows of "${target.title}" (${target.process}). ` +
       'A browser here may be holding the ChatGPT chats this app runs, and a chord cannot tell which tab it lands on, so ' +
       'tab and window chords are refused in every browser window. Open the page you are testing in a browser window of its ' +
-      `own (${newBrowserWindowHint()}), keep that window in front, and drive it there — ` +
+      `own (${newBrowserWindowHint(target.process)}), keep that window in front, and drive it there — ` +
       'navigate with set_value on its address bar, never by keyboard tab or window chords.'
     );
   }

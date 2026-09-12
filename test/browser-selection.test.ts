@@ -61,3 +61,18 @@ it('finds Brave installations on each platform without mixing in Chrome or Edge'
   expect(linux).toContain('/snap/bin/brave');
   expect(linux.every(candidate => !/chrome|chromium|edge/.test(candidate))).toBe(true);
 });
+
+it('finds Helium installations on each platform without falling back to another Chromium family', () => {
+  expect(preferredBrowserCandidates('win32', { LOCALAPPDATA: 'C:\\Local', ProgramFiles: 'C:\\Apps' }, undefined, 'helium'))
+    .toEqual(['C:\\Local\\imput\\Helium\\Application\\chrome.exe']);
+  const mac = preferredBrowserCandidates('darwin', {}, '/Users/example', 'helium');
+  expect(mac).toEqual([
+    '/Applications/Helium.app/Contents/MacOS/Helium',
+    '/Users/example/Applications/Helium.app/Contents/MacOS/Helium'
+  ]);
+  const linux = preferredBrowserCandidates('linux', { PATH: '/custom/bin:/usr/bin' }, '/home/example', 'helium');
+  expect(linux).toContain('/custom/bin/helium');
+  expect(linux).toContain('/usr/bin/helium');
+  expect(linux).toContain('/home/example/Applications/Helium.AppImage');
+  expect(linux.every(candidate => !/google-chrome|chromium|microsoft-edge|brave/.test(candidate))).toBe(true);
+});

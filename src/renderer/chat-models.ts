@@ -13,7 +13,7 @@ let discovery: Promise<void> | null = null;
 let catalogSubscribed = false;
 type ObservedSelection = { model: string; reasoningEffort?: ReasoningEffort; observedAt: number };
 let composerContext: { scope: string | null; observation: ObservedSelection | null; edited: boolean } | null = null;
-const pairs = [['composerModel', 'composerReasoning'], ['workerModel', 'workerReasoning'], ['helperModel', 'helperReasoning']] as const;
+const pairs = [['composerModel', 'composerReasoning'], ['workerModel', 'workerReasoning'], ['helperModel', 'helperReasoning'], ['plannerModel', 'plannerReasoning']] as const;
 const effortNames: Record<string, string> = { none: "Instant", minimal: "Minimal", low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max", ultra: "Ultra", pro: 'Pro' } satisfies Record<ReasoningEffort, string>;
 const composerEfforts = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'pro'] as const;
 const effortLabel = (effort: string): string => effortNames[effort] ? t(effortNames[effort]) : effort;
@@ -241,6 +241,7 @@ export function applyChatModels(config: Config, previous?: Config): void {
   };
   paintPair('workerModel', 'workerReasoning', chosen('workerModel', config.multiAgent.defaultModel ?? '', previous?.multiAgent.defaultModel), chosen('workerReasoning', config.multiAgent.defaultReasoning ?? '', previous?.multiAgent.defaultReasoning));
   paintPair('helperModel', 'helperReasoning', chosen('helperModel', config.goal.helperModel ?? 'gpt-5.6-sol', previous?.goal.helperModel ?? 'gpt-5.6-sol'), chosen('helperReasoning', config.goal.helperReasoning ?? 'high', previous?.goal.helperReasoning ?? 'high'));
+  paintPair('plannerModel', 'plannerReasoning', chosen('plannerModel', config.goal.plannerModel ?? 'gpt-5.6-sol', previous?.goal.plannerModel ?? 'gpt-5.6-sol'), chosen('plannerReasoning', config.goal.plannerReasoning ?? 'high', previous?.goal.plannerReasoning ?? 'high'));
   if (catalogSubscribed && catalog.state !== 'unknown') return;
   const requested = ++generation;
   void window.api.getChatModels().then(result => {

@@ -96,7 +96,7 @@ const BROWSER_TAB_CHORDS = new Set([
  * (the window owner's application name: "Google Chrome", "Brave Browser", "Safari").
  */
 export const BROWSER_PROCESS_PATTERN =
-  /(^|[\s_-])(chrome|chromium|msedge|edge|firefox|brave|opera|vivaldi|arc|safari)([\s_-]|$)/;
+  /(^|[\s_-])(chrome|chromium|msedge|edge|firefox|brave|helium|opera|vivaldi|arc|safari)([\s_-]|$)/;
 
 /** The normalized chord when it is one a browser takes for tab or window management, else null. */
 export function browserTabChord(keys: readonly string[]): string | null {

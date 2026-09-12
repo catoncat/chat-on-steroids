@@ -77,6 +77,7 @@ describe('Desktop computer browser chords', () => {
   // chat with ctrl+w mid-turn, and later walked the worker chats with ctrl+tab.
   const screen = { x: 0, y: 0, width: 1920, height: 1080 };
   const chrome = { id: 41, title: 'Build GTA Web Game - Google Chrome', process: 'chrome', ...screen, state: 'foreground' };
+  const helium = { ...chrome, id: 43, title: 'Build GTA Web Game - Helium', process: 'Helium' };
   const notepad = { ...chrome, id: 42, title: 'notes.txt - Notepad', process: 'notepad' };
   const acted = { completedCount: 1, routes: ['helper'], cursor: null, clipboard: [], screenshot: null, verification: null };
 
@@ -89,6 +90,18 @@ describe('Desktop computer browser chords', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain('BROWSER_TAB_CHORD: ctrl+w');
     expect(result.content[0].text).toContain('Build GTA Web Game - Google Chrome');
+    expect(desktop.actAndCapture).not.toHaveBeenCalled();
+  });
+
+  it('recognizes Helium as a browser when refusing tab-management chords', async () => {
+    desktop.actAndCapture.mockClear();
+    desktop.activeWindow.mockResolvedValueOnce({ window: helium, screen });
+    const computer = desktopSurface({ control: true }).get('computer')!;
+
+    const result = await computer.handler({ actions: [{ type: 'keypress', keys: ['cmd', 'w'] }] });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('BROWSER_TAB_CHORD: cmd+w');
+    expect(result.content[0].text).toContain('Build GTA Web Game - Helium');
     expect(desktop.actAndCapture).not.toHaveBeenCalled();
   });
 

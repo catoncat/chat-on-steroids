@@ -53,6 +53,8 @@ describe('browser tab and window chords', () => {
     expect(isBrowserProcess('Google Chrome')).toBe(true);
     expect(isBrowserProcess('Google Chrome Canary')).toBe(true);
     expect(isBrowserProcess('Brave Browser')).toBe(true);
+    expect(isBrowserProcess('Helium')).toBe(true);
+    expect(isBrowserProcess('Helium Helper (Renderer)')).toBe(true);
     expect(isBrowserProcess('Microsoft Edge')).toBe(true);
     expect(isBrowserProcess('Safari')).toBe(true);
     expect(isBrowserProcess('Arc')).toBe(true);

@@ -45,6 +45,9 @@ describe('browser-backed ChatGPT commands', () => {
     expect(probe.mock.calls[0]?.[0]).not.toContain("ProcessName -eq 'chrome'");
     expect(await isPreferredBrowserRunning('win32', probe, 'brave')).toBe(true);
     expect(probe.mock.calls[1]?.[0]).toContain("ProcessName -eq 'brave'");
+    expect(await isPreferredBrowserRunning('win32', probe, 'helium')).toBe(true);
+    expect(probe.mock.calls[2]?.[0]).toContain("ProcessName -eq 'chrome'");
+    expect(probe.mock.calls[2]?.[0]).toContain('imput\\Helium\\Application\\chrome.exe');
   });
   it('grants process absence only from a successful bounded Windows probe', async () => {
     const result = { stdout: 'absent\r\n', stderr: '', exitCode: 0, timedOut: false, truncated: false, durationMs: 1 };
@@ -74,6 +77,9 @@ describe('browser-backed ChatGPT commands', () => {
     expect(await isPreferredBrowserRunning(platform, undefined, 'brave', probe)).toBe(true);
     expect(await isPreferredBrowserRunning(platform, undefined, 'chrome', probe)).toBe(false);
     expect(await isPreferredBrowserRunning(platform, undefined, 'edge', probe)).toBe(false);
+    result.stdout = 'init\n/Applications/Helium.app/Contents/MacOS/Helium\nHelium Helper (Renderer)\nps\n';
+    expect(await isPreferredBrowserRunning(platform, undefined, 'helium', probe)).toBe(true);
+    expect(await isPreferredBrowserRunning(platform, undefined, 'chrome', probe)).toBe(false);
     result.truncated = true;
     expect(await isPreferredBrowserRunning(platform, undefined, 'chrome', probe)).toBeNull();
     result.truncated = false; result.stdout = '';

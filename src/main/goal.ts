@@ -53,7 +53,7 @@ import { writeDurableNow, writeDurableSoon } from './durable.js';
 import { logInfo, logWarn } from './logger.js';
 import { getSecret } from './secrets.js';
 import { getSession, readEvents, readHandoff, readRecentEvents } from './session/store.js';
-import { foldProgress } from '../shared/session.js';
+import { foldProgress, type ReasoningEffort } from '../shared/session.js';
 import { isAstraModel } from '../shared/chat-models.js';
 
 /** Astra continuation belongs to session_finish, never to a new browser turn. */
@@ -1326,6 +1326,9 @@ interface GoalRequest {
   lifetime?: 'temporary-planner';
   sourceSessionId?: string;
   backend?: GoalBackend;
+  /** Optional ChatGPT-only selection override. Goal/Loop normally use the saved helper pair. */
+  chatModel?: string;
+  chatReasoning?: ReasoningEffort;
   reasoning: GoalReasoning | 'none';
   /** Captured together with the credential before any async work; never reread its destination. */
   endpoint: GoalEndpoint;
@@ -1371,7 +1374,9 @@ async function requestGoalDecision(request: GoalRequest): Promise<GoalDecision |
     const protocol = request.mode === 'loop' ? LOOP_OUTPUT_PROTOCOL : GOAL_OUTPUT_PROTOCOL;
     const helper = request.sourceSessionId ? [...goalSwitches].find(([, row]) => row.role === 'decision' && row.sourceSessionId === request.sourceSessionId) : undefined;
     const hash = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-    const instructions = hash([request.system, protocol, request.trailer, settings.helperModel, settings.helperReasoning]);
+    const chatModel = request.chatModel ?? settings.helperModel ?? 'gpt-5.6-sol';
+    const chatReasoning = request.chatReasoning ?? settings.helperReasoning ?? 'high';
+    const instructions = hash([request.system, protocol, request.trailer, chatModel, chatReasoning]);
     const prior = helper?.[1].context;
     // A full-prefix digest proves the helper already received precisely this recording.
     // Compaction, edited history or changed instructions replace the reference context in
@@ -1387,7 +1392,7 @@ async function requestGoalDecision(request: GoalRequest): Promise<GoalDecision |
       sourceSessionId: request.sourceSessionId, conversationId: helper?.[0] ?? null,
       lifetime: request.lifetime,
       publish: request.publish,
-      model: settings.helperModel ?? 'gpt-5.6-sol', reasoningEffort: settings.helperReasoning ?? 'high'
+      model: chatModel, reasoningEffort: chatReasoning
     }), false);
     request.signal.throwIfAborted();
     if (request.sourceSessionId && (decision.action === 'continue' || decision.action === 'stop')) {
@@ -1665,7 +1670,9 @@ export async function draftTaskPlan(prompt: string, backend: 'api' | 'chatgpt', 
   // Custom endpoints may be keyless; only OpenRouter fails here without one.
   if (backend === 'api' && !key && endpoint.kind === 'openrouter') throw new Error('Configure a Goal API key or choose ChatGPT');
   onProgress?.({ phase: 'generating', text: '' });
-  const result = await requestGoalDecision({ backend, endpoint, reasoning: settings.reasoning, lifetime: 'temporary-planner', key: key ?? '', model: settings.model, mode: 'goal', publish: text => onProgress?.({ phase: 'generating', text: planProgressText(text) }),
+  const result = await requestGoalDecision({ backend, endpoint, reasoning: settings.reasoning, lifetime: 'temporary-planner', key: key ?? '', model: settings.model, mode: 'goal',
+    chatModel: settings.plannerModel ?? 'gpt-5.6-sol', chatReasoning: settings.plannerReasoning ?? 'high',
+    publish: text => onProgress?.({ phase: 'generating', text: planProgressText(text) }),
     system: ['You are a task planner, not the executor. Produce 2 to 12 substantial workflow stages; prefer a complete implementation stage followed by a few meaningful verification passes. The executor receives the original user request and the ENTIRE workflow in its first message. Stage 1 must state the complete objective, all implementation requirements and constraints, and the end-to-end execution approach. Never restrict Stage 1 to discovery, planning, a skeleton, or a fraction of the product. If the user requests subagents, include their concrete assignments and early delegation in Stage 1 so they can work in parallel immediately. Later stages are verification and improvement checkpoints, not withheld implementation requirements: where relevant, exercise the actual app with computer use, inspect failures, repair underlying causes, rebuild or reinstall when authorized, and repeat the failed workflows. Include independent subagent code review when requested and a final check of the whole original request. Preserve the user\'s scope, authorization limits, platform, constraints and required evidence; do not invent unrelated work or claim installation/browser checks were performed. Return action continue; its reply must be a JSON string encoding {"stages":["complete implementation workflow", "verification workflow"]}. Keep the entire plan below 12000 characters. Later checkpoints are queued to the same conversation at Session finish, or after a completed turn when the user enables that delivery.'],
     messages: [{ role: 'user', content: prompt.trim() }], trailer: 'Produce the staged plan now. Do not execute the task.', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]) : AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
     .catch(error => { throw nativeGoalFailure(`request_failed: ${error instanceof Error ? error.message : error}`, backend); });

@@ -176,6 +176,8 @@ const settingsPatch = z.object({
       loopBackend: z.enum(['api', 'chatgpt']).optional(),
       helperModel: z.string().trim().min(1).max(80).optional(),
       helperReasoning: z.enum(REASONING_EFFORTS).optional(),
+      plannerModel: z.string().trim().min(1).max(80).optional(),
+      plannerReasoning: z.enum(REASONING_EFFORTS).optional(),
     enabled: z.boolean(),
     // Which of the two standing modes the switch runs. One field, so the renderer has no way
     // to describe a state where Goal and Loop are both on.
@@ -306,6 +308,8 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       loopBackend: pick(current.goal.loopBackend, base.goal.loopBackend, wanted.goal.loopBackend),
       helperModel: pick(current.goal.helperModel, base.goal.helperModel, wanted.goal.helperModel),
       helperReasoning: pick(current.goal.helperReasoning, base.goal.helperReasoning, wanted.goal.helperReasoning),
+      plannerModel: pick(current.goal.plannerModel, base.goal.plannerModel, wanted.goal.plannerModel),
+      plannerReasoning: pick(current.goal.plannerReasoning, base.goal.plannerReasoning, wanted.goal.plannerReasoning),
       enabled: pick(current.goal.enabled, base.goal.enabled, wanted.goal.enabled),
       mode: pick(current.goal.mode, base.goal.mode, wanted.goal.mode),
       provider: {

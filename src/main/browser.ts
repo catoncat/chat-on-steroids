@@ -26,13 +26,18 @@ export async function isPreferredBrowserRunning(
         ? /^(?:msedge|microsoft-edge(?:-(?:stable|beta|dev))?|Microsoft Edge(?: Beta| Dev| Canary)?(?: Helper.*)?)$/i
         : browser === 'brave'
           ? /^(?:brave|brave-browser(?:-(?:stable|beta|dev|nightly))?|Brave Browser(?: Beta| Dev| Nightly)?(?: Helper.*)?)$/i
-        : /^(?:chrome|google-chrome(?:-(?:stable|beta|unstable))?|chromium(?:-browser)?|Google Chrome(?: Beta| Dev| Canary)?(?: Helper.*)?|Chromium(?: Helper.*)?)$/i;
+          : browser === 'helium'
+            ? /^(?:helium|Helium(?: Helper.*)?)$/i
+            : /^(?:chrome|google-chrome(?:-(?:stable|beta|unstable))?|chromium(?:-browser)?|Google Chrome(?: Beta| Dev| Canary)?(?: Helper.*)?|Chromium(?: Helper.*)?)$/i;
       return result.stdout.split('\n').some(name => family.test(path.posix.basename(name.trim())));
     }
     // Probe only the selected family; another browser cannot prove its presence or absence.
     // Enumerate names only, never user command lines or profile data. Both names are constants.
     const processName = browser === 'edge' ? 'msedge' : browser === 'brave' ? 'brave' : 'chrome';
-    const result = await powershell(`$ErrorActionPreference='Stop'; if (@(Get-Process | Where-Object ProcessName -eq '${processName}').Count) { 'running' } else { 'absent' }`, os.tmpdir(), 5000);
+    const processFilter = browser === 'helium'
+      ? "{ $_.ProcessName -eq 'chrome' -and $_.Path -like '*\\imput\\Helium\\Application\\chrome.exe' }"
+      : `ProcessName -eq '${processName}'`;
+    const result = await powershell(`$ErrorActionPreference='Stop'; if (@(Get-Process | Where-Object ${processFilter}).Count) { 'running' } else { 'absent' }`, os.tmpdir(), 5000);
     if (result.timedOut || result.truncated || result.exitCode !== 0) return null;
     return result.stdout.trim() === 'absent' ? false : result.stdout.trim() === 'running' ? true : null;
   } catch { return null; }
@@ -88,7 +93,14 @@ export function preferredBrowserCandidates(
       ? ['Microsoft', 'Edge', 'Application', 'msedge.exe']
       : browser === 'brave'
         ? ['BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe']
-        : ['Google', 'Chrome', 'Application', 'chrome.exe'];
+        : browser === 'helium'
+          ? ['imput', 'Helium', 'Application', 'chrome.exe']
+          : ['Google', 'Chrome', 'Application', 'chrome.exe'];
+    if (browser === 'helium') {
+      return [env.LOCALAPPDATA]
+        .filter((root): root is string => Boolean(root))
+        .map(root => p.join(root, ...parts));
+    }
     return [env.LOCALAPPDATA, env.ProgramFiles, env['ProgramFiles(x86)']]
       .filter((root): root is string => Boolean(root))
       .map(root => p.join(root, ...parts));
@@ -107,6 +119,8 @@ export function preferredBrowserCandidates(
       ['Brave Browser Beta.app', 'Brave Browser Beta'],
       ['Brave Browser Dev.app', 'Brave Browser Dev'],
       ['Brave Browser Nightly.app', 'Brave Browser Nightly']
+    ] : browser === 'helium' ? [
+      ['Helium.app', 'Helium']
     ] : [
       ['Google Chrome.app', 'Google Chrome'],
       ['Google Chrome Beta.app', 'Google Chrome Beta'],
@@ -129,6 +143,8 @@ export function preferredBrowserCandidates(
       'brave-browser-dev',
       'brave-browser-nightly',
       'brave'
+    ] : browser === 'helium' ? [
+      'helium'
     ] : [
       'google-chrome',
       'google-chrome-stable',
@@ -157,6 +173,12 @@ export function preferredBrowserCandidates(
       '/usr/lib/brave-browser/brave-browser',
       home ? path.posix.join(home, '.local', 'share', 'flatpak', 'exports', 'bin', 'com.brave.Browser') : '',
       '/var/lib/flatpak/exports/bin/com.brave.Browser'
+    ].filter(Boolean))];
+    if (browser === 'helium') return [...new Set([
+      ...fromPath,
+      '/usr/bin/helium',
+      '/usr/local/bin/helium',
+      home ? path.posix.join(home, 'Applications', 'Helium.AppImage') : ''
     ].filter(Boolean))];
     // Chrome and Chromium are both widely installed through Flatpak on immutable Linux
     // desktops. Flatpak exports host launchers for installed applications under these
@@ -216,7 +238,10 @@ export async function openInPreferredBrowser(
   const usable = options.usable ?? ((candidate: string) => isExecutableBrowser(candidate, platform));
   const launch = options.launch ?? launchCommand;
   const selected = options.browser ?? getConfig().ui.chatBrowser ?? 'chrome';
-  const label = selected === 'edge' ? 'Microsoft Edge' : selected === 'brave' ? 'Brave Browser' : 'Google Chrome / Chromium';
+  const label = selected === 'edge' ? 'Microsoft Edge'
+    : selected === 'brave' ? 'Brave Browser'
+      : selected === 'helium' ? 'Helium'
+        : 'Google Chrome / Chromium';
   const bounds = browserWindowBounds();
   // These switches only affect a newly started Chrome process; handing a URL to an
   // existing instance cannot change its policy. Memory Saver exclusions alone do not

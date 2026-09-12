@@ -500,8 +500,8 @@ it('saves the ChatGPT browser choice from its settings control and restores it o
   await vi.waitFor(() => expect(mounted.calls).toHaveLength(1));
   expect(mounted.calls[0].ui.chatBrowser).toBe('edge');
   expect(browser.value).toBe('edge');
-  mounted.push({ ...mounted.state, config: { ...mounted.state.config, ui: { ...mounted.state.config.ui, chatBrowser: 'chrome' } } });
-  expect(browser.value).toBe('chrome');
+  mounted.push({ ...mounted.state, config: { ...mounted.state.config, ui: { ...mounted.state.config.ui, chatBrowser: 'helium' } } });
+  expect(browser.value).toBe('helium');
 });
 
 it('shows the current host Desktop tools without rebuilding permission controls on state pushes', async () => {

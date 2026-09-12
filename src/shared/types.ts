@@ -121,7 +121,7 @@ export interface TunnelSettings {
   binaryPath: string;
 }
 
-export const CHAT_BROWSERS = ['chrome', 'edge', 'brave'] as const;
+export const CHAT_BROWSERS = ['chrome', 'edge', 'brave', 'helium'] as const;
 export type ChatBrowser = (typeof CHAT_BROWSERS)[number];
 
 export interface UiPrefs {
@@ -248,8 +248,12 @@ export interface GoalSettings {
   impulseMinutes?: number;
   /** Include bounded recorded tool arguments/results in Goal decision context. */
   includeToolCalls?: boolean;
+  /** ChatGPT selection for high-frequency Goal/Loop continuation decisions. */
   helperModel?: string;
   helperReasoning?: ReasoningEffort;
+  /** ChatGPT selection for explicit staged-plan generation. Independent from Goal/Loop. */
+  plannerModel?: string;
+  plannerReasoning?: ReasoningEffort;
   backend?: GoalBackend;
   loopBackend?: 'api' | 'chatgpt';
   enabled: boolean;
