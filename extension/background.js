@@ -1937,6 +1937,23 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
             tab = await createChatTab(url, background);
             await elect(input.id, { tab: tab.id, stage: 'ready', fallbackUsed: true });
             tabs.push(tab);
+            // A failed New Chat transition can leave the borrowed managed page
+            // empty. Its conversation ownership is gone, so ordinary pruning can
+            // never retire it. The same preparation owns this exact one-hop home;
+            // close it only after the replacement exists and a fresh draft check.
+            if (reusable.has(conversationFromUrl(candidate.url)) && latest.url === 'https://chatgpt.com/' &&
+                tabEpochs[String(candidate.id)] === source.navigationEpoch + 1) {
+              const abandoned = { ...source, navigationEpoch: source.navigationEpoch + 1 };
+              try {
+                const proof = await tabReply(candidate.id, { type: 'clf-tab-close-check', conversationId: null }, { documentId: source.documentId });
+                const current = await chrome.tabs.get(candidate.id);
+                if (proof?.safe === true && proof.conversationId === null && proof.navigationEpoch === abandoned.navigationEpoch &&
+                    ownsDocument(abandoned) && current && !current.pinned && !current.pendingUrl && current.url === 'https://chatgpt.com/') {
+                  await chrome.tabs.remove(candidate.id);
+                  tabs = tabs.filter(row => row.id !== candidate.id);
+                }
+              } catch { /* A draft, navigation or missing proof keeps the document. */ }
+            }
           }
           break;
         }
@@ -1949,6 +1966,7 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
       continue;
     }
     offerDesktopInput(tab.id, { type: 'clf-desktop-input', id: input.id, conversationId: target,
+      ...(input.silenceTurnId ? { silenceTurnId: input.silenceTurnId } : {}),
       ...(input.directTurn ? { directTurn: input.directTurn } : {}), ...(input.lifetime ? { lifetime: input.lifetime } : {}) });
   }
 }
@@ -2685,7 +2703,7 @@ const HANDLERS = {
       return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
     }
     const result = await call(typeof message.partial === 'string' ? '/input/progress' : typeof message.response === 'string' ? '/input/answer' : message.fail === true ? '/input/fail' : message.ack === true ? '/input/ack' : '/input/claim', {
-      method: 'POST', body: JSON.stringify({ id, owner, conversationId, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined })
+      method: 'POST', body: JSON.stringify({ id, owner, conversationId, silenceBusyTurnId: typeof message.silenceBusyTurnId === 'string' ? message.silenceBusyTurnId : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined })
     });
     if (typeof message.response === 'string' && message.lifetime !== 'temporary-planner' && result.ok && result.data?.ok === true && ownsDocument(source)) {
       // Accepting the answer retires the helper's work, not the user's tab or draft.
@@ -3018,8 +3036,16 @@ const HANDLERS = {
     // ChatGPT assigns /c/B through an SPA transition. Read Chrome's current tab and
     // retain the exact document/epoch lease across that await before accepting its route.
     const tab = await chrome.tabs.get(source.tab).catch(() => null);
-    if (!ownsDocument(source) || !tab || tab.pendingUrl || tab.status === 'loading' ||
-        !isChatGptUrl(tab.url) || conversationFromUrl(tab.url) !== cleanConversationId(message.conversationId))
+    if (!ownsDocument(source) || !tab || !isChatGptUrl(tab.url))
+      return { ok: false, error: 'stale_document' };
+    const named = cleanConversationId(message.conversationId);
+    // Destination permits precede the first Send and therefore have no chat route.
+    // Loading that same leased document is normal; leaving it for another route is not.
+    // Named source checkpoints still require a fully settled matching conversation.
+    if (named
+      ? (tab.pendingUrl || tab.status === 'loading' || conversationFromUrl(tab.url) !== named)
+      : (conversationFromUrl(tab.url) !== null ||
+          (tab.pendingUrl && tab.pendingUrl !== tab.url)))
       return { ok: false, error: 'stale_document' };
     const sourceUrl = tab.url;
     const result = await call('/compact', {
@@ -3031,6 +3057,8 @@ const HANDLERS = {
         cancel: message.cancel === true,
         ticket: message.ticket === true,
         automatic: message.automatic === true,
+        ...((message.destinationAttempt === true || message.destinationDispatch === true || message.destinationLost === true)
+          ? { commandId: String(message.commandId || ''), client: String(message.client || '') } : {}),
         // The capture. `token` names the transaction the page was given when it marked the
         // compaction turn, and `summary` is that turn's own answer. Both are forwarded
         // verbatim and only together: the app refuses a brief whose token does not name an
@@ -3076,6 +3104,7 @@ const HANDLERS = {
         conversationId,
         turnId: String(message.turnId || ''),
         clientId: String(source.tab),
+        ...(message.nativeBusy === true ? { nativeBusy: true } : {}),
         ...(message.terminalRequired === true ? { terminalRequired: true } : {})
       })
     });
@@ -3201,6 +3230,7 @@ const HANDLERS = {
     const conversationId = cleanConversationId(tabConversations[key]) ?? requestedConversation;
     const body = {};
     if (typeof message.autoCompact === 'boolean') body.autoCompact = message.autoCompact;
+    if (typeof message.loopAfterTurn === 'boolean') body.loopAfterTurn = message.loopAfterTurn;
     // Goal and Loop are one setting behind two switches, and the app refuses a body carrying
     // both. Pass through whichever one the sheet actually moved.
     if (typeof message.goal === 'boolean') body.goal = message.goal;

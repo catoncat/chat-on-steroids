@@ -323,8 +323,8 @@ export type SessionEvent =
    * call under the same server turn then proved it had not. Absent on the page's own starts.
    */
   | (BaseEvent & { kind: 'turn_start'; detail?: string })
-  | (BaseEvent & { kind: 'turn_end'; outcome: TurnOutcome; detail?: string })
-  | (BaseEvent & { kind: 'chat_error'; message: StoredText })
+  | (BaseEvent & { kind: 'turn_end'; outcome: TurnOutcome; detail?: string; reason?: 'thinking_failed' })
+  | (BaseEvent & { kind: 'chat_error'; message: StoredText; recoverable?: boolean; blocking?: boolean; reason?: 'thinking_failed' })
   | (BaseEvent & { kind: 'tool_call'; call: ToolCallRecord })
   /**
    * An app-authored line. `continuation` names the Compact & Resume it is about, so the

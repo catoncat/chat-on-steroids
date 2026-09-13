@@ -811,8 +811,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('chatModels:request', async () => startChatModelDiscovery());
   handle('sessions:controls', async (payload) => sessionControlsFor(sessionIdArg.parse(payload).id));
   handle('sessions:automation', async (payload) => {
-    const { id, automation } = sessionIdArg.extend({ automation: z.enum(['off', 'goal', 'loop']) }).parse(payload);
-    return setSessionAutomation(id, automation);
+    const { id, automation, afterTurn } = sessionIdArg.extend({ automation: z.enum(['off', 'goal', 'loop']), afterTurn: z.boolean().optional() }).parse(payload);
+    return setSessionAutomation(id, automation, afterTurn);
   });
   handle('sessions:objective', async (payload) => {
     const { id, text, mode } = sessionIdArg.extend({ text: z.string().max(16000), mode: z.enum(['goal', 'loop']) }).parse(payload);
@@ -844,11 +844,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const { id, sourceSessionId } = z.object({ id: z.string().uuid(), sourceSessionId: z.string().min(8).max(64) }).parse(payload);
     return retryGoalBrowserHelper(sourceSessionId, id);
   });
-  handle('sessions:editInput', async (payload) => { const { id, text, afterTurn } = z.object({ id: z.string().uuid(), text: z.string().trim().min(1).max(16000), afterTurn: z.boolean().optional() }).parse(payload); return editQueuedInput(id, text, afterTurn); });
+  handle('sessions:editInput', async (payload) => { const { id, text, afterTurn } = z.object({ id: z.string().uuid(), text: inputArgs.shape.text, afterTurn: z.boolean().optional() }).parse(payload); return editQueuedInput(id, text, afterTurn); });
   handle('sessions:cancelInput', async (payload) => cancelDesktopInput(z.object({ id: z.string().uuid() }).parse(payload).id));
   handle('sessions:inputAutomation', async payload => {
-    const { id, mode } = z.object({ id: z.string().uuid(), mode: z.enum(['off', 'goal', 'loop']) }).parse(payload);
-    return setInputAutomation(id, mode);
+    const { id, mode, loopAfterTurn } = z.object({ id: z.string().uuid(), mode: z.enum(['off', 'goal', 'loop']), loopAfterTurn: z.boolean().optional() }).parse(payload);
+    return setInputAutomation(id, mode, loopAfterTurn);
   });
   handle('window:getZoom', async () => (getWindow()?.webContents.getZoomFactor() ?? UI_BASE_ZOOM) / UI_BASE_ZOOM);
   handle('window:zoom', async (payload) => {
@@ -1046,13 +1046,13 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       return !entry.sessionId && !entry.conversationId && !entry.finishOwner && entry.mode !== 'finish'
         ? prepareSessionPrompt(text, entry, limits) : text;
     },
-    applyAutomation: async (conversationId, automation, phase, objective) => {
+    applyAutomation: async (conversationId, automation, phase, objective, loopAfterTurn) => {
       // This message supersedes the old final; never pick that old final up merely
       // because the composer enabled Goal for the next turn.
       const mode = automation === 'off' ? goalSwitchFor(conversationId).mode : automation;
       // Reserve switch ordering immediately, before awaiting another ledger write.
       // A user Off arriving during persistence must remain later than this attempt.
-      const switchWrite = setGoalSwitchNow(conversationId, mode, automation !== 'off');
+      const switchWrite = setGoalSwitchNow(conversationId, mode, automation !== 'off', loopAfterTurn);
       const [held] = await Promise.all([switchWrite, setGoalReplyActiveNow(conversationId, false)]);
       // A fresh chat can finish before its send ACK arrives. Its newest final is
       // this message's own response, so it may be picked up after binding.

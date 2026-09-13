@@ -934,6 +934,38 @@ describe('session store', () => {
     expect(ends.map((event) => event.kind === 'turn_end' && event.outcome)).toEqual(['completed']);
   });
 
+  it.each(['completed', 'stopped'] as const)('does not restore an abandoned older turn after the latest turn %s', async (outcome) => {
+    const conversationId = 'c-restore-latest-terminal';
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'turn_start', time: 10, turnId: 'g-abandoned' },
+      { kind: 'turn_start', time: 20, turnId: 'g-latest' },
+      { kind: 'turn_end', time: 30, turnId: 'g-latest', outcome }
+    ]);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await closeConversation(conversationId);
+      await sessionForConversation(conversationId);
+      expect(liveConversations().find(entry => entry.conversationId === conversationId)).toMatchObject({
+        generating: false, activeTurnId: null
+      });
+    }
+    // The older incomplete history is preserved without inventing a terminal for it.
+    expect((await readEvents(opened.sessionId!, { kinds: ['turn_end'] })).map(event => event.turnId)).toEqual(['g-latest']);
+  });
+
+  it('restores the latest committed start without promoting an older orphan by timestamp', async () => {
+    const conversationId = 'c-restore-latest-start';
+    await recordChatObservations(conversationId, [
+      { kind: 'turn_start', time: 100, turnId: 'g-orphan-clock-ahead' },
+      { kind: 'turn_start', time: 20, turnId: 'g-current' },
+      { kind: 'turn_end', time: 110, turnId: 'g-orphan-clock-ahead', outcome: 'completed' }
+    ]);
+    await closeConversation(conversationId);
+    await sessionForConversation(conversationId);
+    expect(liveConversations().find(entry => entry.conversationId === conversationId)).toMatchObject({
+      generating: true, activeTurnId: 'g-current'
+    });
+  });
+
   it('offers a stable final reply to Goal after reload lost an uncertain turn identity', async () => {
     const conversationId = 'c-goal-final-after-reload';
     await recordChatObservations(conversationId, [
@@ -1896,7 +1928,9 @@ describe('canonical recorder 1.8', () => {
     resetRecorderForTests();
     resetSessionStoreForTests();
     await recordChatObservations(conversationId, [{ ...error, time: error.time + 1_000 }]);
-    expect(await readEvents(sessionId, { kinds: ['chat_error'] })).toHaveLength(1);
+    expect(await readEvents(sessionId, { kinds: ['chat_error'] })).toEqual([
+      expect.objectContaining({ blocking: true, recoverable: false })
+    ]);
 
     await recordChatObservations(conversationId, [{ ...error, time: error.time + 30_001 }]);
     expect(await readEvents(sessionId, { kinds: ['chat_error'] })).toHaveLength(2);
@@ -1928,6 +1962,21 @@ describe('canonical recorder 1.8', () => {
     const retry = await recordChatObservations(conversationId, [error]);
     expect(retry.stored).toBe(1);
     expect(await readEvents(retry.sessionId!, { kinds: ['chat_error'] })).toHaveLength(1);
+  });
+
+  it('keeps one exact Thinking failed notice across reload/restart beyond the burst window', async () => {
+    const conversationId = 'conv-failed-header-reload';
+    const error = { kind: 'chat_error' as const, time: 100_000, text: 'Thinking failed',
+      reason: 'thinking_failed' as const, turnId: 'failed-turn', recoverable: false };
+    const first = await recordChatObservations(conversationId, [error]);
+    await flushSessions(); resetRecorderForTests(); resetSessionStoreForTests();
+    await recordChatObservations(conversationId, [{ ...error, time: 500_000 }]);
+    await recordChatObservations(conversationId, [{ ...error, time: 600_000, turnId: undefined }]);
+    expect(await readEvents(first.sessionId!, { kinds: ['chat_error'] })).toEqual([
+      expect.objectContaining({ reason: 'thinking_failed', turnId: 'failed-turn' })
+    ]);
+    await recordChatObservations(conversationId, [{ ...error, time: 700_000, turnId: 'another-turn' }]);
+    expect(await readEvents(first.sessionId!, { kinds: ['chat_error'] })).toHaveLength(2);
   });
 
   it('deduplicates replayed turn lifecycle boundaries from the at-least-once browser journal', async () => {
