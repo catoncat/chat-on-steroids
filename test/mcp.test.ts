@@ -3492,6 +3492,7 @@ describe('exec sessions belong to the chat that opened them', () => {
       `write_stdin failed: session ${sessionId} is not proven to belong to this durable Chat On Steroids session.`
     );
     expect(textOf(stranger)).not.toContain('echo=stolen');
+    expect(textOf(stranger)).toContain('This refusal concerns this process id, not Read-only mode');
 
     // Caller identity is the authorization boundary. An unattributed call must not inherit
     // the owner's authority merely because it can guess the small numeric session id.
@@ -3503,6 +3504,7 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(unproven.body.result?.isError).toBe(true);
     expect(textOf(unproven)).toContain('is not proven to belong to this durable Chat On Steroids session');
     expect(textOf(unproven)).not.toContain('echo=anon');
+    expect(textOf(unproven)).toContain('This refusal concerns this process id, not Read-only mode');
 
     // The replacement session contract exposes recordings only; the removed status action no
     // longer gives either owner or stranger a side channel into the process manager. Terminal
@@ -3702,6 +3704,10 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(later)).toContain('background-e2e-once');
     expect(textOf(later)).not.toContain(`write_stdin(session_id=${sessionId}`);
 
+    // Publication receipts require a strictly later timestamp; loopback calls can
+    // otherwise share one millisecond even though this response was already read.
+    const receivedAt = Date.now();
+    await vi.waitFor(() => expect(Date.now()).toBeGreaterThan(receivedAt), { timeout: 1000, interval: 1 });
     const after = await asChat('wfr_background_owner', 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(after)).not.toContain(`Background session ${sessionId}`);
     expect(unifiedExecManager.exitedUnread(owned)).toEqual([]);
