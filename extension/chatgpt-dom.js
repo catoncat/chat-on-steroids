@@ -353,8 +353,11 @@ var CLF_DOM = (() => {
    * carrying the same data-turn-id. Treating each section as a turn makes a five-call
    * request look like several partial requests, so every one fails content.js's
    * one-block-per-call safety check and the page is left with a wall of "Called tool".
-   * Group only sections that explicitly share role + id; id-less sections stay
-   * independent because merging those would be a guess.
+   * Group only consecutive sections that explicitly share role + id. A user question
+   * separates responses even when ChatGPT reuses the same page id. Recording and
+   * presentation must agree on that boundary; otherwise one final descriptor is joined
+   * to both the old and current local generation and loses its completion owner.
+   * Id-less sections stay independent because merging those would be a guess.
    */
   /**
    * What this layer has already read out of a section, kept until the section changes.
@@ -465,40 +468,6 @@ var CLF_DOM = (() => {
   function turns() {
     return safe(() => {
       const out = [];
-      const byKey = new Map();
-      for (const node of document.querySelectorAll(TURN)) {
-        const id = node.getAttribute('data-turn-id');
-        const role = node.getAttribute('data-turn');
-        const key = id ? `${role || ''}:${id}` : null;
-        if (key && byKey.has(key)) {
-          byKey.get(key).nodes.push(node);
-          continue;
-        }
-        const turn = { node, nodes: [node], id, role };
-        out.push(turn);
-        if (key) byKey.set(key, turn);
-      }
-      return out;
-    }, []);
-  }
-
-  /**
-   * Logical turns for presentation only.
-   *
-   * Keep this separate from `turns()`: the recorder has a deliberately conservative model
-   * that other code depends on. The renderer needs one extra guarantee the live ChatGPT DOM
-   * no longer gives it: `data-turn-id` can be reused by later requests. Grouping every
-   * section with the same id across the whole page therefore lets one old id swallow several
-   * different assistant turns and the overwrite renderer hides them all as one block.
-   *
-   * Split sections of one response are adjacent, while a later response is separated by a
-   * user turn. So presentation groups only consecutive sections with the same role + id.
-   * This changes no observation, attribution or recording path; it is only the list the
-   * synthetic stream paints into.
-   */
-  function presentationTurns() {
-    return safe(() => {
-      const out = [];
       let previous = null;
       for (const node of document.querySelectorAll(TURN)) {
         const id = node.getAttribute('data-turn-id');
@@ -513,6 +482,8 @@ var CLF_DOM = (() => {
       return out;
     }, []);
   }
+
+  const presentationTurns = turns;
 
   const turnNodes = (turn) =>
     turn && Array.isArray(turn.nodes) && turn.nodes.length > 0 ? turn.nodes : turn && turn.node ? [turn.node] : [];
@@ -1989,6 +1960,21 @@ var CLF_DOM = (() => {
         node.id !== 'composer-plus-btn' && node.getAttribute('data-testid') !== 'composer-plus-btn');
     return candidates.length === 1 ? candidates[0] : null;
   }
+  // Version rows can include a retirement caption below their primary label.
+  // Match the leading label subtree, not the whole row or an arbitrary substring
+  // in its description. Duplicate primary labels still fail closed at the caller.
+  function pickerVersionLabelMatches(row, label) {
+    const text = value => String(value || '').replace(/\s+/g, ' ').trim();
+    const expected = text(label);
+    let node = row;
+    for (let depth = 0; node && depth < 8; depth++) {
+      if (text(node.textContent) === expected) return true;
+      node = [...node.childNodes].find(child => text(child.textContent) &&
+        (child.nodeType === Node.TEXT_NODE || (child.nodeType === Node.ELEMENT_NODE &&
+          !child.matches('svg,[hidden],[aria-hidden="true"],[inert]'))));
+    }
+    return false;
+  }
   function modelPickerAccess(stillCurrent) {
     const shown = node => node && !node.closest('[hidden],[aria-hidden="true"],[inert]') && node.getClientRects().length > 0;
     const picker = () => document.querySelector('[data-testid="composer-intelligence-picker-content"]');
@@ -2037,7 +2023,7 @@ var CLF_DOM = (() => {
           toggle[0].click();
         }
         const option = await wait(() => {
-          const rows = versionRows().filter(node => node.textContent.trim() === label && node.getAttribute('aria-disabled') !== 'true');
+          const rows = versionRows().filter(node => pickerVersionLabelMatches(node, label) && node.getAttribute('aria-disabled') !== 'true');
           return rows.length === 1 ? rows[0] : null;
         });
         if (!key(option, 'Enter')) return null;
