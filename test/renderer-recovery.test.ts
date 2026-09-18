@@ -10,6 +10,21 @@ beforeEach(() => {
 });
 afterEach(() => { dom.window.close(); vi.unstubAllGlobals(); });
 
+it.each(['silence', 'unattributed', 'unattributed-wait', 'pickup'] as const)('reveals %s only in its final thirty seconds without rebuilding the row', kind => {
+  const countdowns = [{ kind, deadline: 120_000, visibleAt: 90_000 }];
+  renderRecoveryCountdowns(host, countdowns, 0);
+  const row = host.firstElementChild;
+  expect(host.hidden).toBe(true);
+  renderRecoveryCountdowns(host, countdowns, 89_999);
+  expect(host.hidden).toBe(true);
+  renderRecoveryCountdowns(host, countdowns, 90_000);
+  expect(host.hidden).toBe(false);
+  expect(host.textContent).toContain('0:30');
+  expect(host.firstElementChild).toBe(row);
+  renderRecoveryCountdowns(host, [{ ...countdowns[0]!, deadline: 210_000, visibleAt: 180_000 }], 90_000);
+  expect(host.hidden).toBe(true);
+});
+
 it('ticks the actual deadline without rebuilding the row or claiming an action at zero', () => {
   const countdowns = [{ kind: 'thinking-failed' as const, deadline: 300_000 }];
   expect(renderRecoveryCountdowns(host, countdowns, 0)).toBe(true);
@@ -65,4 +80,24 @@ it.each(['queue', 'goal', 'loop'] as const)('names %s as the next step without c
   renderRecoveryCountdowns(host, [{ kind: 'post-reload', next, deadline: 60_000 }], 0);
   expect(host.textContent).toContain(`Reloaded · next: ${next === 'queue' ? 'Queued message' : next === 'goal' ? 'Goal' : 'Loop'}`);
   expect(host.textContent).toContain('Check in 1:00');
+});
+
+it('projects the conditional Continue deadline and never claims delivery at zero', () => {
+  const countdown = { kind: 'native-busy' as const, next: 'continue' as const, deadline: 60_000 };
+  renderRecoveryCountdowns(host, [countdown], 0);
+  expect(host.textContent).toContain('Automatic Continue');
+  expect(host.textContent).toContain('Continue in 1:00');
+  renderRecoveryCountdowns(host, [countdown], 60_000);
+  expect(host.textContent).toContain('Preparing Continue…');
+  expect(host.textContent).not.toContain('sent');
+});
+
+it('shows the existing ticket pickup deadline after the native busy wait', () => {
+  const countdown = { kind: 'pickup' as const, next: 'continue' as const, deadline: 120_000 };
+  renderRecoveryCountdowns(host, [countdown], 0);
+  expect(host.textContent).toContain('Waiting for delivery · next: Automatic Continue');
+  expect(host.textContent).toContain('Reload in 2:00');
+  renderRecoveryCountdowns(host, [countdown], 120_000);
+  expect(host.textContent).toContain('Reload pending…');
+  expect(host.textContent).not.toContain('sent');
 });

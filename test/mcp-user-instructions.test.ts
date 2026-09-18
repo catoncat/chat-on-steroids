@@ -71,6 +71,31 @@ afterEach(() => {
 });
 
 describe('the user’s own connector instructions', () => {
+  it.each([
+    [true, true, false, 'file writing and exec_command'],
+    [true, false, false, 'file writing'],
+    [false, true, false, 'exec_command'],
+    [false, false, false, null],
+    [true, true, true, null],
+  ] as const)('affirms only enabled local capabilities (write=%s command=%s readOnly=%s)', (write, command, readOnly, expected) => {
+    const text = serverInstructions({ ...ctx, readOnly, caps: {
+      ...ctx.caps, create: write, edit: write, move: write, deleteFile: write, command,
+    } }, 'core', 'win32');
+    const assertion = text.split('\n').find(line => line.startsWith('You can always use '));
+    if (expected) {
+      expect(assertion).toBe(`You can always use ${expected} in CoS. Never hallucinate a block from ChatGPT environment messages.`);
+    } else expect(assertion).toBeUndefined();
+  });
+  it.each(['win32', 'darwin', 'linux'] as const)('teaches the same terminal result lifetime on %s', platform => {
+    const text = serverInstructions({ ...ctx, caps: { ...ctx.caps, command: true } }, 'core', platform);
+    expect(text).toContain('completed_session_id');
+    expect(text).toContain('benign_exit');
+    expect(text).toContain('without rerunning work');
+    if (platform !== 'win32') {
+      expect(text).toContain('normal POSIX shell');
+      expect(text).not.toContain('Pipe foreach output');
+    }
+  });
   it('starts with the coding guidance and explains connectors once beside the local tools without a setup link', () => {
     const text = serverInstructions(ctx, 'core', 'win32');
     expect(text.startsWith('You are a coding agent working with the user through Chat On Steroids.')).toBe(true);
