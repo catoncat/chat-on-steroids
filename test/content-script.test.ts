@@ -1264,14 +1264,22 @@ describe('desktop input delivery and helper ownership', () => {
     expect(composerText(live.document)).toBe(['worker', 'resume', 'revive'].includes(kind) ? '' : prompt.replaceAll('\n', ''));
   });
 
-  it('acknowledges a fresh resume after its route precedes exact MAIN-world user text', async () => {
+  it.each([0, 35_000])('keeps the resume turn when exact MAIN-world user text arrives after %s ms', async delay => {
     const commandId = 'cmd-delayed-raw-resume';
     const prompt = '[[CLF-RESUME:0123456789abcdef0123456789abcdef]]\nContinue `src/main/bridge.ts`.';
     let user!: HTMLElement;
     let clicks = 0;
+    let committed = false;
     live = await harness(`https://chatgpt.com/?clf=${commandId}`, {
       redeem: () => ({ ok: true, command: { id: commandId, type: 'resume', text: prompt, agent: null } }),
-      ack: () => ({ ok: true })
+      ack: () => { committed = true; return { ok: true }; },
+      compact: message => {
+        if (!message.destinationMessageId) return { ok: true };
+        committed = true;
+        return { ok: true, data: { committed: true, conversationId: chatA, commandId } };
+      },
+      activity: () => ({ ok: true, data: { entries: [], stream: [], userAnchors: [],
+        ...(committed ? { sessionId: 'resumed-session', bootstrap: 'resume' } : {}) } })
     }, (document, dom) => {
       document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
         clicks++;
@@ -1283,6 +1291,7 @@ describe('desktop input delivery and helper ownership', () => {
     await settle();
     expect(clicks).toBe(1);
     expect(live.sent.filter(message => message.type === 'ack' && message.status === 'sent')).toEqual([]);
+    live.advance(delay);
     live.hook.observe();
     await settle();
     await bindFiberTurns([{ section: user, turn: { turnId: 'delayed-resume-user', conversationId: chatA,
@@ -1293,6 +1302,10 @@ describe('desktop input delivery and helper ownership', () => {
       expect.objectContaining({ id: commandId, conversationId: chatA })
     ]);
     expect(clicks).toBe(1);
+    await live.hook.pullActivity();
+    live.hook.observe();
+    await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(1);
   });
 
   it('reads canonical Markdown for a pending fresh send even when native generation already ended', async () => {
@@ -1894,7 +1907,7 @@ async function replyFiber(
     );
     window.dispatchEvent(
       new window.MessageEvent('message', {
-        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken, v: 12, scanOk: true, rows, turns: indexedTurns },
+        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken, v: 13, scanOk: true, rows, turns: indexedTurns },
         source: window
       })
     );
@@ -3570,7 +3583,7 @@ describe('the app-owned chronological stream', () => {
         section.querySelector(`[data-message-id="${id}"] .markdown`)?.setAttribute('data-clf-fiber-message', `${scanToken}:0:${id}`);
       }
       live!.window.dispatchEvent(new live!.window.MessageEvent('message', {
-        data: { source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 12, scanOk: true, rows: [], turns: [{
+        data: { source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 13, scanOk: true, rows: [], turns: [{
           index: 0, turnId: 'idle-history-page', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
           calls: [{ messageId: 'idle-history-tool', requestId, tool: 'exec_command', order: 0, answered: true }],
           messages: [
@@ -3627,7 +3640,7 @@ describe('the app-owned chronological stream', () => {
       const scanToken = event.data.nonce;
       section.setAttribute('data-clf-fiber-turn', `${scanToken}:0`);
       live!.window.dispatchEvent(new live!.window.MessageEvent('message', { source: live!.window as unknown as Window, data: {
-        source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 12, scanOk: true, rows: [], turns: [{
+        source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 13, scanOk: true, rows: [], turns: [{
           index: 0, turnId: 'idle-resume-answer', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
           calls: [], activities: [], endMessageId: 'idle-resume-final-raw', messages: [
             { role: 'user', messageId: 'idle-resume-user', rawMessageId: 'idle-resume-user-raw', stable: true,
@@ -3834,7 +3847,7 @@ describe('the app-owned chronological stream', () => {
       ({ messageId, rawMessageId: messageId, stable: true, rawText, renderedHtml: '' }));
     section.setAttribute('data-clf-fiber-turn', '0');
     await replyFiber([{
-      v: 12, index: 0, messageId: 'interim-native-X', tool: 'read', app: 'Chat On Steroids Core', answered: true,
+      v: 13, index: 0, messageId: 'interim-native-X', tool: 'read', app: 'Chat On Steroids Core', answered: true,
       conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     }], [{ turnId: 'interrupted-fold-page', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', messages,
       calls: [{ messageId: 'interim-native-X', requestId, tool: 'read', order: 0, answered: true }], activities: [],
@@ -3843,8 +3856,8 @@ describe('the app-owned chronological stream', () => {
     expect(section.textContent?.match(/First interim/g)).toHaveLength(1);
     expect(section.textContent?.match(/Second interim/g)).toHaveLength(1);
     expect(overwriteText(section)).toContain('Checking the implementation');
-    expect(section.querySelectorAll('.clf-stream-page_tool')).toHaveLength(mode === 'unmounted' ? 1 : 0);
-    expect(thought.closest('[data-clf-native-hidden]') !== null).toBe(mode === 'unmounted');
+    expect(section.querySelectorAll('.clf-stream-page_tool')).toHaveLength(0);
+    expect(thought.closest('[data-clf-native-hidden]')).not.toBeNull();
     expect(section.querySelectorAll('[data-clf-call="interim-X"]')).toHaveLength(1);
     expect(tool.closest('[data-clf-native-hidden]')).not.toBeNull();
     expect(button.getAttribute('data-clf-activity-part')).toBe('header');
@@ -3903,13 +3916,12 @@ describe('the app-owned chronological stream', () => {
     }
   });
 
-  it('hides duplicate exact typed thought notifications only for a mounted public update, then restores on proof loss, Off and navigation', async () => {
+  it('hides duplicate exact typed thought notifications beside recorded calls without a recorded status copy, then restores on proof loss, Off and navigation', async () => {
     const owner = 'typed-thought-owner';
     const thoughtId = 'thought-11111111-2222-4333-8444-555555555555-7';
     const requestId = 'wfr-typed-thought';
     live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [], stream: [
       { seq: 1, time: 100, kind: 'turn_start', turnId: owner },
-      { seq: 2, time: 105, kind: 'page_tool', turnId: owner, messageId: thoughtId, label: '任意の実行通知' },
       { seq: 3, time: 110, kind: 'tool_call', turnId: owner, callId: 'typed-call', requestId,
         tool: 'exec_command', outcome: 'ok', summary: { title: 'Exact local call' } },
       { seq: 4, time: 120, kind: 'assistant_message', turnId: owner, messageId: 'typed-final', text: 'Native final', final: true },
@@ -3960,6 +3972,7 @@ describe('the app-owned chronological stream', () => {
       expect(node.closest('[data-clf-native-hidden]')).toBeNull();
     }
     expect(section.textContent).toContain('Native final');
+    expect(section.querySelectorAll('.clf-stream-page_tool')).toHaveLength(0);
 
     const disconnectedSecond = second.layout;
     const remountedLayout = second.layout.cloneNode(true) as HTMLDivElement;
@@ -3993,7 +4006,7 @@ describe('the app-owned chronological stream', () => {
     expect(section.querySelectorAll('[data-clf-native-hidden]')).toHaveLength(0);
   });
 
-  it.each(['owned', 'no-local-call', 'foreign-owner'])('hides plain native status captions without thought metadata only beside mounted owned calls (%s)', async mode => {
+  it.each(['owned', 'no-local-call', 'foreign-owner'])('hides plain native status captions for the current native response without requiring local calls (%s)', async mode => {
     const requestId = 'wfr-plain-native-caption';
     live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [], stream: [
       { seq: 1, time: 100, kind: 'turn_start', turnId: 'plain-caption-owner' },
@@ -4024,7 +4037,7 @@ describe('the app-owned chronological stream', () => {
       messages: [{ messageId: 'plain-caption-final', rawMessageId: 'plain-caption-final', stable: true, rawText: 'Actual answer', renderedHtml: '' }]
     } }]);
     await live.hook.pullActivity(); live.hook.renderStreams();
-    expect(caption.closest('[data-clf-native-hidden]') !== null).toBe(mode === 'owned');
+    expect(caption.closest('[data-clf-native-hidden]') !== null).toBe(mode !== 'foreign-owner');
     expect(action.closest('[data-clf-native-hidden]')).toBeNull();
     expect(interactive.closest('[data-clf-native-hidden]')).toBeNull();
     expect(linkedCaption.closest('[data-clf-native-hidden]')).toBeNull();
@@ -4033,15 +4046,15 @@ describe('the app-owned chronological stream', () => {
     live.hook.setRenderStream(false); live.hook.renderStreams();
     expect(caption.closest('[data-clf-native-hidden]')).toBeNull();
     live.hook.setRenderStream(true); live.hook.renderStreams();
-    expect(caption.closest('[data-clf-native-hidden]') !== null).toBe(mode === 'owned');
+    expect(caption.closest('[data-clf-native-hidden]') !== null).toBe(mode !== 'foreign-owner');
     live.dom.reconfigure({ url: 'https://chatgpt.com/c/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb' });
     live.hook.observe();
     expect(caption.closest('[data-clf-native-hidden]')).toBeNull();
   });
 
-  it.each(['no-local-call', 'foreign-owner'])('keeps typed native thought notifications when suppression authority is absent (%s)', async mode => {
+  it.each(['unrecorded', 'no-local-call', 'foreign-owner'])('uses current native identity to hide thought notifications independently of recorded calls (%s)', async mode => {
     const thoughtId = 'thought-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-2';
-    live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [], stream: [
+    live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [], stream: mode === 'unrecorded' ? [] : [
       { seq: 1, time: 100, kind: 'turn_start', turnId: 'typed-negative-owner' },
       ...(mode === 'no-local-call' ? [] : [{ seq: 2, time: 110, kind: 'tool_call', turnId: 'typed-negative-owner',
         callId: 'typed-negative-call', requestId: 'wfr-typed-negative', tool: 'read_file', outcome: 'ok', summary: { title: 'Local call' } }]),
@@ -4057,11 +4070,92 @@ describe('the app-owned chronological stream', () => {
       thoughtNotifications: [{ messageId: thoughtId, kind: 'thought_notification' }]
     } }]);
     await live.hook.pullActivity(); live.hook.renderStreams();
-    expect(row.closest('[data-clf-native-hidden]')).toBeNull();
+    expect(row.closest('[data-clf-native-hidden]') !== null).toBe(mode !== 'foreign-owner');
     expect(row.isConnected).toBe(true);
+    expect(overwriteStream(section)).toBeNull();
+    live.hook.setRenderStream(false); live.hook.renderStreams();
+    expect(row.closest('[data-clf-native-hidden]')).toBeNull();
+    live.hook.setRenderStream(true); live.hook.renderStreams();
+    expect(row.closest('[data-clf-native-hidden]') !== null).toBe(mode !== 'foreign-owner');
   });
 
-  it('keeps typed native notifications when the response local call has no mounted canonical call row', async () => {
+  it('paints new live thought notifications on the accepted scan without waiting for the activity poll', async () => {
+    live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [], stream: [] } }) });
+    renderingOn();
+    userTurn(live.document, 'live-notifications-user', 'Inspect the implementation.');
+    startGenerating(live.document, { send: false });
+    const section = assistantTurn(live.document, 'live-notifications-answer', []);
+    const thoughtId = 'thought-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-9';
+    let row = toolBlock(live.document, 'Remembering');
+    row.setAttribute('data-clf-fiber-thought', `0:${thoughtId}`);
+    section.append(row);
+    prose(live.document, section, 'live-notifications-interim', 'I am checking the source.');
+    const frame = () => [{ section, turn: { turnId: 'live-notifications-answer',
+      messages: [{ messageId: 'live-notifications-interim', rawMessageId: 'live-notifications-interim',
+        role: 'assistant', stable: true, rawText: 'I am checking the source.' }],
+      thoughtNotifications: [{ messageId: thoughtId, kind: 'thought_notification' }] } }];
+    await bindFiberTurns(frame(), true);
+    expect(row.closest('[data-clf-native-hidden]')).not.toBeNull();
+    expect(section.querySelector('.markdown')!.closest('[data-clf-native-hidden]')).toBeNull();
+    const replacement = toolBlock(live.document, 'Reviewed the implementation');
+    replacement.setAttribute('data-clf-fiber-thought', `0:${thoughtId}`);
+    row.replaceWith(replacement); row = replacement;
+    await bindFiberTurns(frame());
+    expect(row.closest('[data-clf-native-hidden]')).not.toBeNull();
+    expect((await live.runtimeMessage({ type: 'clf-page-status' }) as any).generating).toBe(true);
+    expect(section.querySelectorAll('.clf-stream-page_tool')).toHaveLength(0);
+  });
+
+  it('retains presentation while MAIN has restamped a pending scan, then applies its exact result', async () => {
+    live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [], stream: [] } }) });
+    renderingOn();
+    const section = assistantTurn(live.document, 'pending-stamp-answer', []);
+    const thoughtId = 'thought-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee-10';
+    const row = toolBlock(live.document, 'Reviewed source');
+    row.setAttribute('data-clf-fiber-thought', `0:${thoughtId}`); section.append(row);
+    await bindFiberTurns([{ section, turn: { turnId: 'pending-stamp-answer',
+      thoughtNotifications: [{ messageId: thoughtId, kind: 'thought_notification' }] } }]);
+    live.hook.renderStreams();
+    expect(row.closest('[data-clf-native-hidden]')).not.toBeNull();
+    const window = live.window as any;
+    const previousTimeout = window.setTimeout;
+    window.setTimeout = (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms);
+    let answer!: () => void;
+    const stamped = new Promise<void>(resolve => {
+      const receive = (event: any) => {
+        if (event.data?.source !== 'clf-fiber-ask') return;
+        window.removeEventListener('message', receive);
+        const scanToken = event.data.nonce;
+        section.setAttribute('data-clf-fiber-turn', `${scanToken}:0`);
+        row.setAttribute('data-clf-fiber-thought', `${scanToken}:0:${thoughtId}`);
+        answer = () => window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
+          source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 13, scanOk: true, rows: [],
+          turns: [{ index: 0, turnId: 'pending-stamp-answer', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+            calls: [], messages: [], thoughtNotifications: [{ messageId: thoughtId, kind: 'thought_notification' }] }]
+        } }));
+        resolve();
+      };
+      window.addEventListener('message', receive);
+    });
+    try {
+      const refresh = live.hook.refreshFiber(null, true);
+      await stamped;
+      live.hook.renderStreams();
+      expect(row.closest('[data-clf-native-hidden]')).not.toBeNull();
+      live.hook.setRenderStream(false); live.hook.renderStreams();
+      expect(row.closest('[data-clf-native-hidden]')).toBeNull();
+      live.hook.setRenderStream(true);
+      answer(); await refresh;
+      live.hook.renderStreams();
+      expect(row.closest('[data-clf-native-hidden]')).not.toBeNull();
+      await bindFiberTurns([{ section, turn: { turnId: 'pending-stamp-answer',
+        thoughtNotifications: [] } }]);
+      live.hook.renderStreams();
+      expect(row.closest('[data-clf-native-hidden]')).toBeNull();
+    } finally { window.setTimeout = previousTimeout; }
+  });
+
+  it('hides typed native notifications even when the response local call has no mounted canonical call row', async () => {
     const thoughtId = 'thought-bbbbbbbb-cccc-4ddd-8eee-ffffffffffff-4';
     const requestId = 'wfr-unplaced-caption-call';
     live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [], stream: [
@@ -4089,7 +4183,7 @@ describe('the app-owned chronological stream', () => {
     await live.hook.pullActivity(); live.hook.renderStreams();
     expect(overwriteStream(section)?.textContent).toContain('Mounted progress');
     expect(section.querySelector('[data-clf-call="unplaced-caption-call"]')).toBeNull();
-    expect(row.closest('[data-clf-native-hidden]')).toBeNull();
+    expect(row.closest('[data-clf-native-hidden]')).not.toBeNull();
   });
 
   const turnId = 'turn-app-stream';
@@ -5101,9 +5195,9 @@ describe('the app-owned chronological stream', () => {
     blocks[0]!.setAttribute('data-clf-fiber', '0');
     blocks[1]!.setAttribute('data-clf-fiber', '1');
     const rows = (secondAnswered: boolean) => [
-      { v: 12, index: 0, messageId: 'fiber-one', tool: 'read_file', path: '/Chat On Steroids Core/read_file',
+      { v: 13, index: 0, messageId: 'fiber-one', tool: 'read_file', path: '/Chat On Steroids Core/read_file',
         app: 'Chat On Steroids Core', answered: true, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' },
-      { v: 12, index: 1, messageId: 'fiber-two', tool: 'exec_command', path: '/Chat On Steroids Core/exec_command',
+      { v: 13, index: 1, messageId: 'fiber-two', tool: 'exec_command', path: '/Chat On Steroids Core/exec_command',
         app: 'Chat On Steroids Core', answered: secondAnswered, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }
     ];
     const turn = (secondAnswered: boolean) => ({
@@ -5143,7 +5237,7 @@ describe('the app-owned chronological stream', () => {
     userTurn(live.document, 'exact-block-owner', 'Read the exact file', { sent: false });
     const section = assistantTurn(live.document, 'exact-block-page', ['Native connector row']);
     const block = blocksOf(section)[0]!; section.setAttribute('data-clf-fiber-turn', '0'); block.setAttribute('data-clf-fiber', '0');
-    await replyFiber([{ v: 12, index: 0, messageId: 'fiber-exact-block', tool: 'read_file',
+    await replyFiber([{ v: 13, index: 0, messageId: 'fiber-exact-block', tool: 'read_file',
       path: `/${app}/read_file`, app, answered: true, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }], [{
       turnId: 'exact-block-page', calls: [{ messageId: 'fiber-exact-block', tool: 'read_file', order: 0,
         answered: true, requestId: 'wfr-exact-block' }]
@@ -5169,7 +5263,7 @@ describe('the app-owned chronological stream', () => {
     const blocks = blocksOf(section); section.setAttribute('data-clf-fiber-turn', '0');
     blocks.forEach((block, index) => block.setAttribute('data-clf-fiber', String(index)));
     const calls = ['read', secondTool].map((tool, index) => ({ messageId: `result-provider-${index}`, tool, order: index, requestId, answered: true }));
-    await replyFiber(calls.map((call, index) => ({ v: 12, index, ...call, path: null,
+    await replyFiber(calls.map((call, index) => ({ v: 13, index, ...call, path: null,
       app: 'Chat On Steroids Core', resource: `/asdk_app_fixture/link_fixture/${call.tool}`,
       conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' })), [{ turnId: 'result-only-page', calls }]);
     await live.hook.pullActivity(); live.hook.renderStreams();
@@ -5757,6 +5851,51 @@ describe('the app-owned chronological stream', () => {
     expect(overwriteText(second)).not.toContain('Read first response part');
   });
 
+  it('keeps both document fragments before their native final as response proof arrives incrementally', async () => {
+    const requestId = 'wfr-response-fragments';
+    const stream: any[] = [
+      { seq: 2, time: 100, kind: 'turn_start', turnId: 'document-a', turnOrigin: 2 },
+      { seq: 3, time: 110, kind: 'tool_call', turnId: 'document-a', turnOrigin: 2,
+        requestId, callId: 'fragment-first', tool: 'read', outcome: 'ok', durationMs: 1,
+        summary: { kind: 'read', tone: 'neutral', title: 'Read first file' } },
+      { seq: 4, time: 120, kind: 'turn_start', turnId: 'document-b', turnOrigin: 4 },
+      { seq: 5, time: 125, kind: 'assistant_message', turnId: 'document-b', turnOrigin: 4,
+        messageId: 'fragment-interim', text: 'Checking the second file.', final: false }
+    ];
+    let fresh = false;
+    const delta: any[] = [
+      { seq: 6, time: 130, kind: 'tool_call', turnId: 'document-b', turnOrigin: 2,
+        requestId, callId: 'fragment-last', tool: 'read', outcome: 'ok', durationMs: 1,
+        summary: { kind: 'read', tone: 'neutral', title: 'Read last file' } },
+      { seq: 7, time: 140, kind: 'assistant_message', turnId: 'document-a', turnOrigin: 2,
+        messageId: 'fragment-final', text: 'The review is complete.', state: 'final', final: true },
+      { seq: 8, time: 150, kind: 'turn_end', turnId: 'document-a', turnOrigin: 2, outcome: 'completed' },
+      { seq: 9, time: 160, kind: 'turn_end', turnId: 'document-b', turnOrigin: 2, outcome: 'completed' }
+    ];
+    live = await harness(undefined, { activity: () => ({ ok: true, data: { entries: [],
+      userAnchors: [{ seq: 1, time: 90, messageId: 'm-fragment-question' }], stream: fresh ? delta : stream } }) });
+    renderingOn();
+    userTurn(live.document, 'fragment-question', 'Review both files.', { sent: false });
+    const section = assistantTurn(live.document, 'native-response', []);
+    prose(live.document, section, 'fragment-interim', 'Checking the second file.');
+    prose(live.document, section, 'fragment-final', 'The review is complete.');
+    const final = section.querySelector('[data-message-id="fragment-final"]')!;
+    await bindRenderedFiberTurns([{ section, turn: { turnId: 'native-response', endMessageId: 'fragment-final',
+      calls: [{ messageId: 'native-call', tool: 'read', requestId, order: 0, answered: true }],
+      messages: [
+        { messageId: 'fragment-interim', stable: true, rawText: 'Checking the second file.', renderedHtml: '' },
+        { messageId: 'fragment-final', stable: true, rawText: 'The review is complete.', renderedHtml: '' }
+      ] } }]);
+    fresh = true;
+    await live.hook.pullActivity(); live.hook.renderStreams();
+    const calls = overwriteRows(section, '.clf-stream-tool-disclosure');
+    expect(calls).toHaveLength(2);
+    for (const call of calls) expect(call.compareDocumentPosition(final) & live.window.Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const order = live.hook.chronological([...stream, ...delta]);
+    expect(order.findIndex(row => row.seq === 5)).toBeLessThan(order.findIndex(row => row.seq === 6));
+    expect(final.isConnected).toBe(true);
+  });
+
   it('keeps the recorded text user-message anchor when the same turn also contains an image attachment id', async () => {
     const sharedRequest = 'wfr-image-anchor-shared';
     const anchoredActivity = () => ({
@@ -6070,7 +6209,7 @@ describe('the app-owned chronological stream', () => {
     section.setAttribute('data-clf-fiber-turn', '0');
     block.setAttribute('data-clf-fiber', '0');
     const bind = async (answered: boolean) => replyFiber([{
-      v: 12, index: 0, messageId: 'fiber-moved-call', tool: 'read_file',
+      v: 13, index: 0, messageId: 'fiber-moved-call', tool: 'read_file',
       path: '/Chat On Steroids Core/read_file', app: 'Chat On Steroids Core', answered,
       conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
     }], [{ turnId, calls: [{ messageId: 'fiber-moved-call', tool: 'read_file', order: 0,
@@ -7215,7 +7354,7 @@ describe('a stop button that goes missing while the turn is still running', () =
           source: 'clf-fiber-reply',
           nonce: event.data.nonce,
           scanToken: event.data.nonce,
-          v: 12,
+          v: 13,
           scanOk: true,
           rows: [],
           turns: [{
@@ -8059,6 +8198,130 @@ describe('a content script reloaded into a turn already in flight', () => {
     const order = live.sent.map((message) => message.type);
     expect(order.indexOf('bind')).toBeGreaterThanOrEqual(0);
     expect(order.indexOf('bind')).toBeLessThan(order.indexOf('events'));
+  });
+
+  it.each([true, false])('binds a separate final section only within the exact adopted question (same question: %s)', async sameQuestion => {
+    const source = 'g-split-final-source';
+    live = await harness(undefined, {
+      activity: () => activity({ activeTurnId: source, recordedTurnId: source,
+        recordedQuestionId: 'm-turn-live-user',
+        userAnchors: [{ seq: 1, time: 1700000000000, messageId: 'm-turn-live-user' }] })
+    }, midTurn);
+    live.hook.observe(); await settle();
+    const interim = live.document.querySelector<HTMLElement>('[data-turn-id="turn-live"]')!;
+    const partial = { turnId: 'turn-live', messages: [{ messageId: 'split-interim', rawMessageId: 'split-interim',
+      stable: true, rawText: 'Checking the implementation.', renderedHtml: '' }] };
+    await bindFiberTurns([{ section: interim, turn: partial }]);
+
+    if (!sameQuestion) userTurn(live.document, 'different-question', 'Answer a new question.');
+    const final = assistantTurn(live.document, 'separate-final-section', []);
+    prose(live.document, final, 'split-terminal', 'The requested work is complete.');
+    stopGenerating(live.document);
+    if (sameQuestion) { live.hook.observe(); await settle(); }
+    await bindFiberTurns([{ section: interim, turn: partial }, { section: final, turn: {
+      turnId: 'separate-final-section', endMessageId: 'split-terminal',
+      messages: [{ messageId: 'split-terminal', rawMessageId: 'split-terminal', stable: true,
+        rawText: 'The requested work is complete.', renderedHtml: '' }]
+    } }]);
+    await live.hook.flush();
+    const answer = emitted(live.sent, 'assistant_message').at(-1)?.event;
+    expect(answer).toMatchObject({
+      providerMessageId: 'split-terminal', final: true
+    });
+    if (sameQuestion) {
+      expect(answer?.turnId).toBe(source);
+      expect(emitted(live.sent, 'turn_end').map(row => row.event)).toEqual([
+        expect.objectContaining({ turnId: source, outcome: 'completed' })
+      ]);
+      expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    } else {
+      const next = emitted(live.sent, 'turn_start').at(-1)?.event.turnId;
+      expect(next).toBeTypeOf('string');
+      expect(next).not.toBe(source);
+      expect(answer?.turnId).toBe(next);
+    }
+  });
+
+  it.each(['empty', 'refused'])('adopts exact recorded ownership arriving after an initially %s activity response', async initial => {
+    const source = 'g-late-adopted-final';
+    live = await harness(undefined, {
+      activity: () => initial === 'refused' ? { ok: false, error: 'no_such_session' }
+        : activity({ activeTurnId: null, recordedTurnId: null,
+          userAnchors: [{ seq: 1, time: 1700000000000, messageId: 'm-late-question' }] })
+    }, document => {
+      userTurn(document, 'late-question', 'Complete this task.', { sent: false });
+      const final = assistantTurn(document, 'late-final-section', []);
+      prose(document, final, 'late-terminal', 'The work is complete.');
+    });
+    const final = live.document.querySelector<HTMLElement>('[data-turn-id="late-final-section"]')!;
+    const terminal = { turnId: 'late-final-section', endMessageId: 'late-terminal', messages: [{
+      messageId: 'late-terminal', rawMessageId: 'late-terminal', stable: true,
+      rawText: 'The work is complete.', renderedHtml: ''
+    }] };
+    await bindFiberTurns([{ section: final, turn: terminal }]); await live.hook.flush();
+    live.reply.set('activity', () => activity({ activeTurnId: null, recordedTurnId: source,
+      recordedQuestionId: 'm-late-question',
+      userAnchors: [{ seq: 1, time: 1700000000000, messageId: 'm-late-question' }] }));
+    await live.hook.pullActivity();
+    await bindFiberTurns([{ section: final, turn: terminal }]); await live.hook.flush();
+    expect(emitted(live.sent, 'assistant_message').at(-1)?.event).toMatchObject({ turnId: source, final: true });
+    expect(emitted(live.sent, 'turn_end').map(row => row.event)).toEqual([
+      expect.objectContaining({ turnId: source, outcome: 'completed' })
+    ]);
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    expect(composerText(live.document)).toBe('');
+    // A stale activity reply after this document closed the turn cannot adopt it again.
+    await live.hook.pullActivity();
+    await bindFiberTurns([{ section: final, turn: terminal }]); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(1);
+    expect((await live.runtimeMessage({ type: 'clf-page-status' }) as any).generating).toBe(false);
+  });
+
+  it.each(['missing', 'different', 'stopped'])('refuses late adoption without a current eligible question (%s)', async variant => {
+    live = await harness(undefined, {
+      activity: () => activity({ activeTurnId: null, recordedTurnId: null })
+    }, document => {
+      userTurn(document, 'current-question', 'The current task.', { sent: false });
+      assistantTurn(document, 'current-answer', []);
+      if (variant === 'stopped') startGenerating(document, { send: false });
+    });
+    if (variant === 'stopped') {
+      live.document.querySelector<HTMLButtonElement>('[data-testid="stop-button"]')!.click();
+      stopGenerating(live.document);
+    }
+    live.reply.set('activity', () => activity({ activeTurnId: 'g-unproven-old-turn',
+      recordedTurnId: 'g-unproven-old-turn',
+      recordedQuestionId: variant === 'missing' ? null : variant === 'different' ? 'm-other-question' : 'm-current-question' }));
+    await live.hook.pullActivity();
+    const final = live.document.querySelector<HTMLElement>('[data-turn-id="current-answer"]')!;
+    await bindFiberTurns([{ section: final, turn: { turnId: 'current-answer', endMessageId: 'unowned-terminal',
+      messages: [{ messageId: 'unowned-terminal', rawMessageId: 'unowned-terminal', stable: true,
+        rawText: 'Historical answer.', renderedHtml: '' }] } }]);
+    await live.hook.flush();
+    expect(emitted(live.sent, 'assistant_message').at(-1)?.event.turnId).toBeUndefined();
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+  });
+
+  it('waits for the existing response identity when New Chat navigates to a running chat', async () => {
+    let answer: ((value: unknown) => void) | undefined;
+    live = await harness('https://chatgpt.com/', {
+      activity: () => new Promise(resolve => { answer = resolve; })
+    });
+    userTurn(live.document, 'already-asked-question', 'Review the existing work', { sent: false });
+    assistantTurn(live.document, 'running-answer', ['Reading the existing work']);
+    startGenerating(live.document, { send: false });
+    live.dom.reconfigure({ url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' });
+    live.hook.observe(); await settle();
+    live.advance(live.hook.TURN_SETTLE_MS * 3);
+    live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
+    expect(answer).toBeTypeOf('function');
+    answer!(activity({ activeTurnId: 'g-original-document-0-1', recordedTurnId: 'g-original-document-0-1',
+      recordedQuestionId: 'm-already-asked-question',
+      userAnchors: [{ seq: 1, time: 1700000000000, messageId: 'm-already-asked-question' }] }));
+    await settle(); live.hook.observe(); await settle(); await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(0);
   });
 
   it.each(['native', 'interim'].flatMap(kind => [true, false].map(named => ({ kind, named }))))(
@@ -9437,7 +9700,7 @@ describe('a page leaving the screen', () => {
  */
 describe('evidence from the page context', () => {
   const GOOD = {
-    v: 12,
+    v: 13,
     index: 0,
     tool: 'agent_status',
     path: '/TobisComputer/mcp/agent_status',
@@ -10560,7 +10823,7 @@ describe('evidence from the page context', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken: event.data.nonce,
-            v: 12,
+            v: 13,
             scanOk: true,
             rows: [],
             turns: [
@@ -10667,7 +10930,7 @@ describe('evidence from the page context', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken: event.data.nonce,
-            v: 12,
+            v: 13,
             scanOk: true,
             rows: [{ ...GOOD, tool: 'read' }],
             turns: []
@@ -12535,7 +12798,11 @@ describe('truthful quiet operation status', () => {
     const view = (workers: unknown) => live!.hook.stageView({ now: 10000, changedAt: 0, progress: { workers } });
     expect(view({ active: 1, finished: 2, failed: 0, names: ['Repository audit'] })).toMatchObject({ stage: 'Worker still running: Repository audit', detail: '2 finished · 1 running' });
     expect(view({ active: 2, finished: 1, failed: 1 })).toMatchObject({ stage: '2 workers still running', detail: '1 finished · 2 running · 1 failed' });
-    expect(view({ active: 0, finished: 2, failed: 1 })).toMatchObject({ stage: 'A worker needs attention' });
+    expect(view({ active: 0, finished: 2, failed: 1 })).toBeNull();
+    expect(live.hook.stageView({ now: 10000, changedAt: 0, generating: true,
+      progress: { workers: { active: 0, finished: 2, failed: 1 } } })).toMatchObject({
+      stage: 'Still waiting for the current operation to complete'
+    });
     expect(view({ active: 0, finished: 3, failed: 0 })).toBeNull(); // no invented consolidation
   });
   it('waits through short pauses and clears the status when real output resumes', async () => {
@@ -14191,6 +14458,10 @@ describe('the context meter and automatic compaction', () => {
     });
     live.hook.injectControl();
     startGenerating(live.document);
+    // Upstream's receipt barrier requires the source turn's native tool results to be
+    // acknowledged before an automatic Stop; give it one answered call so this test still
+    // reaches the late-Stop path it exercises.
+    compactionFiber(assistantTurn(live.document, 'late-stop-source', []), () => [compactionCall(true)]);
     const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
     stop.addEventListener('click', (event) => event.preventDefault());
     const sends = watchSend(live.document);
@@ -14246,6 +14517,173 @@ describe('the context meter and automatic compaction', () => {
     expect(cancelled).toBe(1);
     expect(live.sent.some((message) => message.type === 'compact' && message.cancel === true)).toBe(true);
     expect(live.sent.some((message) => message.type === 'focus_tab')).toBe(false);
+  });
+
+  /** Keep a native frame available while the compaction barrier polls it. */
+  function compactionFiber(section: HTMLElement, calls: () => unknown[] | null,
+    siblings: () => Array<{ section: HTMLElement; calls: unknown[] }> = () => [],
+    requests: () => unknown[] = () => [], codeModeCalls: () => unknown[] = () => []) {
+    const window = live!.window as any;
+    const instant = window.setTimeout;
+    window.setTimeout = (fn: () => void, ms: number) => ms === 1500
+      ? globalThis.setTimeout(fn, ms) : instant(fn, ms);
+    const post = window.postMessage.bind(window);
+    window.postMessage = (message: any, origin: string) => {
+      if (message?.source !== 'clf-fiber-ask') return post(message, origin);
+      void Promise.resolve().then(() => {
+        const currentCalls = calls();
+        const scanToken = message.nonce;
+        const bindings = currentCalls === null ? [] : [{ section, calls: currentCalls }, ...siblings()];
+        const turns = bindings.map((binding, index) => {
+          binding.section.setAttribute('data-clf-fiber-turn', `${scanToken}:${index}`);
+          return { index, turnId: binding.section.getAttribute('data-turn-id'),
+            conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+            calls: binding.calls, codeModeCalls: codeModeCalls(), requests: index === 0 ? requests() : [], messages: [], activities: [] };
+        });
+        window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
+          source: 'clf-fiber-reply', nonce: scanToken, scanToken, v: 13,
+          scanOk: currentCalls !== null, rows: [], turns
+        } }));
+      });
+    };
+  }
+
+  const compactionCall = (answered: boolean) => ({
+    messageId: 'native-result-in-flight', requestId: 'wfr-native-result-in-flight',
+    tool: 'exec', order: 0, answered
+  });
+
+  it.each([false, true])('waits for native receipt before stopping an automatic source even when local tools are finished (pre-row: %s)', async preRow => {
+    live = await harness(undefined, {
+      activity: () => withContext(205_000, settings({ auto: true }), { pendingTools: 0 }),
+      compact: () => ({ ok: true, data: { token: 'receipt-token', prompt: 'Write the brief.',
+        ...automaticTicket('not-attempted') } })
+    });
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'receipt-source', []);
+    let received = false;
+    compactionFiber(section, () => preRow && !received ? [] : [compactionCall(received)], () => [],
+      () => preRow ? [{ requestId: compactionCall(false).requestId, messageId: 'pre-row-request' }] : []);
+    const stop = live.document.querySelector('[data-testid="stop-button"]')!;
+    const stopped = vi.fn(() => stopGenerating(live!.document));
+    stop.addEventListener('click', stopped);
+    const sends = watchSend(live.document);
+
+    const compacting = live.hook.startCompact(true);
+    await settle();
+    expect(stopped).not.toHaveBeenCalled();
+    expect(startedCompactions(live)).toEqual([]);
+    expect(sends()).toBe(0);
+
+    received = true;
+    await compacting;
+    expect(stopped).toHaveBeenCalledTimes(1);
+    expect(startedCompactions(live)).toHaveLength(1);
+    expect(sends()).toBe(1);
+  });
+
+  it.each(['distinct-pre-row', 'same-request-running', 'same-request-code-pending'])('waits for another outstanding call beside an answered native call (%s)', async mode => {
+    let received = false;
+    live = await harness(undefined, {
+      activity: () => withContext(205_000, settings({ auto: true }), {
+        pendingTools: mode === 'same-request-running' && !received ? 1 : 0
+      }),
+      compact: () => ({ ok: true, data: { token: 'receipt-token', prompt: 'Write the brief.',
+        ...automaticTicket('not-attempted') } })
+    });
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'mixed-receipt-source', []);
+    const prior = { ...compactionCall(true), messageId: 'already-received-call',
+      requestId: mode.startsWith('same-request') ? compactionCall(true).requestId : 'wfr-prior-request' };
+    compactionFiber(section, () => [prior, ...(received ? [compactionCall(true)] : [])], () => [],
+      () => [{ requestId: compactionCall(false).requestId, messageId: 'pre-row-request' }],
+      () => mode === 'same-request-code-pending'
+        ? [{ messageId: 'native-code-parent', requestId: prior.requestId, answered: received }] : []);
+    const stopped = vi.fn(() => stopGenerating(live!.document));
+    live.document.querySelector('[data-testid="stop-button"]')!.addEventListener('click', stopped);
+    const sends = watchSend(live.document);
+    const compacting = live.hook.startCompact(true);
+    await settle();
+    expect(stopped).not.toHaveBeenCalled();
+    expect(sends()).toBe(0);
+    received = true;
+    await compacting;
+    expect(stopped).toHaveBeenCalledTimes(1);
+    expect(sends()).toBe(1);
+  });
+
+  it.each(['unanswered', 'missing', 'vanished', 'different-tool', 'different-request', 'duplicate', 'shared-request'])('keeps an automatic ticket unsent when native receipt is %s', async failure => {
+    live = await harness(undefined, {
+      activity: () => withContext(205_000, settings({ auto: true }), { pendingTools: 0 }),
+      compact: () => ({ ok: true, data: { token: 'receipt-token', prompt: 'Write the brief.',
+        ...automaticTicket('not-attempted') } })
+    });
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'receipt-source', []);
+    let changed = false;
+    compactionFiber(section, () => {
+      if (failure === 'missing') return null;
+      if (failure === 'vanished' && changed) return [{ ...compactionCall(true), messageId: 'different-answered-call' }];
+      if (failure === 'different-tool' && changed) return [{ ...compactionCall(true), tool: 'read' }];
+      if (failure === 'different-request' && changed) return [{ ...compactionCall(true), requestId: 'wfr-other-request' }];
+      if (failure === 'duplicate' && changed) return [compactionCall(true), compactionCall(true)];
+      if (failure === 'shared-request') return [compactionCall(false), { ...compactionCall(true), messageId: 'different-answered-call' }];
+      return [compactionCall(false)];
+    });
+    const stopped = vi.fn();
+    live.document.querySelector('[data-testid="stop-button"]')!.addEventListener('click', stopped);
+    const compacting = live.hook.startCompact(true);
+    await settle();
+    expect(stopped).not.toHaveBeenCalled();
+    changed = true;
+    await compacting;
+    expect(stopped).not.toHaveBeenCalled();
+    expect(startedCompactions(live)).toEqual([]);
+    expect(live.sent.some(message => message.type === 'compact' && (message.sourceDispatch || message.sourceLost))).toBe(false);
+  });
+
+  it('does not stop a newer question while an automatic source waits for native receipt', async () => {
+    live = await harness(undefined, {
+      activity: () => withContext(205_000, settings({ auto: true }), { pendingTools: 0 }),
+      compact: () => ({ ok: true, data: { token: 'receipt-token', ...automaticTicket('not-attempted') } })
+    });
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'receipt-source', []);
+    compactionFiber(section, () => [compactionCall(false)]);
+    const stopped = vi.fn();
+    live.document.querySelector('[data-testid="stop-button"]')!.addEventListener('click', stopped);
+    const compacting = live.hook.startCompact(true);
+    await settle();
+    userTurn(live.document, 'new-user-question', 'Work on this newer task.');
+    await compacting;
+    expect(stopped).not.toHaveBeenCalled();
+    expect(startedCompactions(live)).toEqual([]);
+  });
+
+  it('receives the original call after the same response moves into a sibling section', async () => {
+    live = await harness(undefined, {
+      activity: () => withContext(205_000, settings({ auto: true }), { pendingTools: 0 }),
+      compact: () => ({ ok: true, data: { token: 'receipt-token', prompt: 'Write the brief.',
+        ...automaticTicket('not-attempted') } })
+    });
+    startGenerating(live.document);
+    const original = assistantTurn(live.document, 'original-result-section', []);
+    let received = false;
+    const siblings: Array<{ section: HTMLElement; calls: unknown[] }> = [];
+    compactionFiber(original, () => [compactionCall(received)], () => siblings);
+    const stopped = vi.fn(() => stopGenerating(live!.document));
+    live.document.querySelector('[data-testid="stop-button"]')!.addEventListener('click', stopped);
+    const compacting = live.hook.startCompact(true);
+    await settle();
+    expect(stopped).not.toHaveBeenCalled();
+
+    siblings.push({ section: assistantTurn(live.document, 'later-response-section', []),
+      calls: [{ ...compactionCall(true), messageId: 'later-answered-call' }] });
+    received = true;
+    live.hook.observe();
+    await compacting;
+    expect(stopped).toHaveBeenCalledTimes(1);
+    expect(startedCompactions(live)).toHaveLength(1);
   });
 
   it.each(['dispatched-unresolved', 'sent'])('does not stop a handoff when a stale pickup reaches a fresh %s ticket', async state => {
@@ -14345,6 +14783,7 @@ describe('the context meter and automatic compaction', () => {
     });
     live.hook.injectControl();
     startGenerating(live.document);
+    compactionFiber(assistantTurn(live.document, 'automatic-source', []), () => [compactionCall(true)]);
     filed = true;
     const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
     let stopped = false;
@@ -14412,6 +14851,7 @@ describe('the context meter and automatic compaction', () => {
     });
     live.hook.injectControl();
     startGenerating(live.document);
+    compactionFiber(assistantTurn(live.document, 'running-tool-source', []), () => [compactionCall(true)]);
     filed = true;
     const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
     stop.addEventListener('click', () => stopGenerating(live!.document));
@@ -15215,7 +15655,7 @@ describe('the goal loop', () => {
       const nonce = event.data.nonce;
       live!.document.querySelector('[data-turn-id="finished-answer"]')!.setAttribute('data-clf-fiber-turn', `${nonce}:0`);
       win.dispatchEvent(new win.MessageEvent('message', { source: win, data: {
-        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: 12, scanOk: true, rows: [], turns: [{
+        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: 13, scanOk: true, rows: [], turns: [{
           index: 0, conversationId: CHAT, turnId: 'finished-answer', endMessageId: 'finished-final', calls: [], activities: [],
           messages: [{ messageId: 'finished-final', rawMessageId: 'finished-final', stable: true, rawText: 'Completed answer.' }]
         }]
@@ -15622,6 +16062,7 @@ describe('the goal loop', () => {
     const token = 'iNHBs_C0p8fcQ9y7sG-I-A';
     const typed = `[[CLF-RESUME:${token}]]\n\n${brief}`;
     const asRendered = typed.replace('CLF-RESUME:', 'CLF-RESUME\\:').replace('iNHBs_C0', 'iNHBs\\_C0');
+    let committed = false;
     live = await harness(
       `https://chatgpt.com/?clf=${commandId}`,
       {
@@ -15633,10 +16074,11 @@ describe('the goal loop', () => {
           if (message.destinationLost) return { ok: true, data: { released: true } };
           return { ok: false, error: 'unexpected_compact_shape' };
         },
-        ack: () => ({ ok: true }),
+        ack: () => { committed = true; return { ok: true }; },
         activity: () => ({
           ok: true,
-          data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null, bootstrap: 'resume' }
+          data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null,
+            ...(committed ? { sessionId: 'resumed-session', bootstrap: 'resume' } : {}) }
         })
       },
       (document, dom) => {
@@ -15644,7 +16086,7 @@ describe('the goal loop', () => {
           document.querySelector('#prompt-textarea')!.textContent = '';
           dom.reconfigure({ url: `https://chatgpt.com/c/${CHAT}` });
           // Exactly what the composer sends back: the same message, escaped.
-          userTurn(document, 'resume-user', asRendered);
+          userTurn(document, 'resume-user', asRendered, { sent: false });
         });
       }
     );
@@ -15654,6 +16096,33 @@ describe('the goal loop', () => {
     const acks = live.sent.filter((message) => message.type === 'ack' && message.id === commandId);
     expect(acks.map((message) => message.conversationId)).toContain(CHAT);
     expect(live.sent.filter((message) => message.type === 'compact' && message.destinationLost === true)).toEqual([]);
+    await live.hook.pullActivity();
+    live.hook.observe();
+    await live.hook.flush();
+    // Rendering a provider bubble is not a second Send. The bootstrap's accepted
+    // receipt must also own its local generation, even when readback is escaped.
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(1);
+    // The transcript may have been captured before the accepted send promoted
+    // its local lifecycle. That promotion must not publish a duplicate user row.
+    expect(emitted(live.sent, 'user_message').filter(row => row.event.messageId === 'm-resume-user')).toHaveLength(1);
+    const ownedTurn = emitted(live.sent, 'turn_start')[0]!.event.turnId;
+    const answer = assistantTurn(live.document, 'bootstrap-answer', []);
+    prose(live.document, answer, 'bootstrap-final', 'The next part remains to be completed.');
+    await bindFiberTurns([{ section: answer, turn: {
+      turnId: 'bootstrap-answer', endMessageId: 'bootstrap-final', calls: [],
+      messages: [{ messageId: 'bootstrap-final', rawMessageId: 'bootstrap-final', role: 'assistant',
+        stable: true, rawText: 'The next part remains to be completed.' }]
+    } }]);
+    await live.hook.flush();
+    expect(emitted(live.sent, 'assistant_message')).toContainEqual(expect.objectContaining({
+      event: expect.objectContaining({ turnId: ownedTurn, final: true, goalEligible: true })
+    }));
+    expect(emitted(live.sent, 'turn_end')).toContainEqual(expect.objectContaining({
+      event: expect.objectContaining({ turnId: ownedTurn, outcome: 'completed' })
+    }));
+    live.hook.observe();
+    await live.hook.flush();
+    expect(emitted(live.sent, 'turn_start')).toHaveLength(1);
   });
 
   it('keeps the resume conversation when it gets an id despite a visible failure', async () => {
@@ -17283,7 +17752,7 @@ describe('the goal loop', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken,
-            v: 12,
+            v: 13,
             scanOk: true,
             rows: [],
             turns: [{
@@ -17366,7 +17835,7 @@ describe('the goal loop', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             scanToken,
-            v: 12,
+            v: 13,
             scanOk: true,
             rows: [],
             turns: [{
@@ -18516,7 +18985,7 @@ describe('app Stop command uses current native turn proof', () => {
       if (event.data?.source !== 'clf-fiber-ask') return;
       section.setAttribute('data-clf-fiber-turn', `${event.data.nonce}:0`);
       window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
-        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: 12, scanOk: true, rows: [],
+        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: 13, scanOk: true, rows: [],
         turns: [{ ...terminal, index: 0, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', messages: [{
           messageId: 'late-final-message', stable: true, rawText: 'First words and the complete final answer.', renderedHtml: '<p>First words and the complete final answer.</p>'
         }] }]
@@ -18555,7 +19024,7 @@ describe('app Stop command uses current native turn proof', () => {
       }
       section.setAttribute('data-clf-fiber-turn', `${event.data.nonce}:0`);
       window.dispatchEvent(new window.MessageEvent('message', { source: window, data: {
-        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: 12, scanOk: true, rows: [],
+        source: 'clf-fiber-reply', nonce: event.data.nonce, scanToken: event.data.nonce, v: 13, scanOk: true, rows: [],
         turns: [{ ...terminal, index: 0, conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', endMessageId: next === 'retry' ? null : terminal.endMessageId }]
       } }));
     };
@@ -18730,7 +19199,7 @@ describe('ordinary Continue native recovery', () => {
       const nonce = event.data.nonce;
       section.setAttribute('data-clf-fiber-turn', `${nonce}:0`);
       win.dispatchEvent(new win.MessageEvent('message', { source: win, data: {
-        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: 12, scanOk: true, rows: [], turns: [{
+        source: 'clf-fiber-reply', nonce, scanToken: nonce, v: 13, scanOk: true, rows: [], turns: [{
           index: 0, conversationId: chat, turnId: 'native-answer', endMessageId: terminal ? 'native-terminal' : null,
           calls: [], activities: [], messages: terminal ? [{ role: 'assistant', messageId: 'native-terminal',
             rawMessageId: 'native-terminal', stable: true, rawText: scenario === 'image-only' ? '' : 'Finished the task.' }] : [progress]

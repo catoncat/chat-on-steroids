@@ -23,7 +23,7 @@ import { communicationTitle, foldAgentCommunication } from './agent-communicatio
 import { initContextMeter, paintContextMeter } from './context-meter.js';
 import { isAstraModel, isProModel } from '../shared/chat-models.js';
 import type { InputImage, InputAttachment, InputAutomation } from '../shared/input.js';
-import { injectableAttachments } from '../shared/input.js';
+import { injectableAttachments, queuedFollowup, MAX_INPUT_IMAGES } from '../shared/input.js';
 import type { InputArgs, InputEntry } from '../main/session/input.js';
 import type { LocalProject } from '../shared/projects.js';
 import type { TaskProgress } from '../shared/task-progress.js';
@@ -866,7 +866,14 @@ function paintGoalProgress(): void {
   const mode = $<HTMLSelectElement>('chatAutomation').value === 'loop' ? t('Loop') : t('Goal');
   labels.settling = `${mode} · ${wait?.reason === 'native-busy' ? t('ChatGPT resumed work · waiting before retry') : wait?.reason === 'silence' ? t('Waiting before recovery reload') : wait?.reason === 'quiet' ? t('Waiting for tool inactivity') :
     wait?.reason === 'tools' ? t('Waiting for running tools') : wait?.reason === 'listening' ? t('Waiting for activity after recovery') : t('Answer settling')}`;
-  row.hidden = !phase; if (!phase) return;
+  // The dock already describes this same silence/listening deadline. Keep the
+  // Loop/Goal task controls, but do not present its shared wait as another action.
+  const sharedRecoveryWait = phase === 'settling' && wait?.until !== undefined &&
+    ['silence', 'listening', 'native-busy', 'quiet'].includes(wait.reason) && controlledRecovery.some(countdown =>
+      ['silence', 'post-reload', 'native-busy', 'thinking-failed'].includes(countdown.kind) &&
+      countdown.deadline === wait.until && (countdown.visibleAt ?? 0) <= Date.now());
+  row.hidden = !phase || sharedRecoveryWait;
+  if (row.hidden) { row.replaceChildren(); row.setAttribute('aria-busy', 'false'); return; }
   const busy = ['settling', 'saving', 'preparing', 'generating', 'retrying', 'sending', 'answering', 'browser', 'queued', 'ready'].includes(phase) && !error;
   row.setAttribute('aria-busy', String(busy));
   const marker = el('span', busy ? 'session-status is-working' : 'session-status');
@@ -880,7 +887,6 @@ function paintGoalProgress(): void {
   }
 }
 const cancelledStarts = new Set<string>();
-const queuedFollowup = (entry: InputEntry): boolean => !entry.opening && (entry.mode === 'finish' || (entry.mode === 'after-turn' && !!entry.sessionId && entry.purpose !== 'decision'));
 function pendingComposerInput(): InputEntry | undefined {
   return [...startingInputs.values(), ...pendingComposerInputs].find(entry => (!queuedFollowup(entry) || entry.state === 'browser') && ['queued', 'browser'].includes(entry.state) &&
     (selectedId ? (entry.sessionId ?? entry.deliveredSessionId) === selectedId :
@@ -1763,7 +1769,7 @@ function retainedInputImages(event: Extract<SessionEvent, { kind: 'user_message'
   const companion = root.companionInputId ? pendingComposerInputs.find(entry => entry.id === root.companionInputId &&
     (entry.sessionId ?? entry.deliveredSessionId) === sessionId && entry.messageId === root.messageId) : undefined;
   // Match combinedInput's canonical image order for asset-index fallback.
-  return [...root.images ?? [], ...companion?.images ?? [], ...root.toolImages ?? []].slice(0, 4);
+  return [...root.images ?? [], ...companion?.images ?? [], ...root.toolImages ?? []].slice(0, MAX_INPUT_IMAGES);
 }
 
 function paintMessageReaction(box: HTMLElement, value: unknown): void {
@@ -1788,7 +1794,7 @@ function eventBody(event: SessionEvent, context?: { id: string; current: () => b
       box.append(el('b', '', () => t("You")));
       const attachments = el('div', 'message-attachments');
       if (event.attachments?.length) attachments.append(...event.attachments.map(file => attachmentCard(file)));
-      const assets = event.assets?.filter(asset => asset.mimeType === 'image/webp').slice(0, 4) ?? [];
+      const assets = event.assets?.filter(asset => asset.mimeType === 'image/webp').slice(0, MAX_INPUT_IMAGES) ?? [];
       const retained = retainedInputImages(event, context?.id ?? selectedId);
       const preview = (data: string, retainedOnly = false, slot?: HTMLElement) => {
         const image = document.createElement('img');
@@ -2658,7 +2664,12 @@ function paintRecoveryStatus(): boolean {
   const recovery = detailFor === selectedId ? [...events].reverse().find(event => event.source === 'app' && event.kind === 'progress' && event.progressId?.startsWith('browser-repair:')) : undefined;
   const sessionId = selectedId;
   const revision = recovery?.kind === 'progress' ? JSON.stringify([recovery.progressId, recovery.time, recovery.message.text]) : '';
-  host.hidden = !recovery || Date.now() - recovery.time > 120000 || (!!sessionId && dismissedRecoveryNotices.get(sessionId) === revision);
+  // Once the next question/turn is recorded, the old reload remains history.
+  // Removing the live Continue countdown must not revive its earlier receipt.
+  const advanced = recovery && events.some(event => positionOf(event) > positionOf(recovery) &&
+    ((event.kind === 'turn_start' && event.turnId !== recovery.turnId) ||
+      (event.kind === 'user_message' && event.source === 'extension')));
+  host.hidden = !recovery || !!advanced || Date.now() - recovery.time > 120000 || (!!sessionId && dismissedRecoveryNotices.get(sessionId) === revision);
   host.replaceChildren();
   if (!host.hidden && recovery?.kind === 'progress') {
     const row = el('div', 'recovery-notice');
@@ -3371,7 +3382,8 @@ function scheduleReload(): void {
 
 /** Retired automatic drafts belong to their creation time, never the live composer queue. */
 function historicalAutomaticInput(entry: InputEntry): boolean {
-  return !!entry.finishOwner && !entry.finishOwner.userRequested && entry.state === 'cancelled' && !!entry.error;
+  return (!!entry.recovery || (!!entry.finishOwner && !entry.finishOwner.userRequested)) &&
+    entry.state === 'cancelled' && !!entry.error;
 }
 
 function inputMessageRow(entry: InputEntry, notice: boolean): HTMLElement {
@@ -3511,6 +3523,7 @@ async function refreshInputQueue(): Promise<void> {
   paintDeliveryControls();
   const accepted = pendingNewInput && all.find(entry => entry.id === pendingNewInput!.id);
   if (accepted && await adoptAcceptedOpening(accepted)) return;
+  if (selection !== selectionGeneration || request !== inputQueueGeneration) return;
   const belongsToSelection = (entry: { id: string; sessionId: string | null; deliveredSessionId?: string | null }): boolean => selectedId === null
     ? pendingNewInput?.generation === selectionGeneration && entry.id === pendingNewInput.id
     : (entry.sessionId ?? entry.deliveredSessionId) === selectedId;
@@ -3527,7 +3540,7 @@ async function refreshInputQueue(): Promise<void> {
   const queueSession = selectedId;
   const reorder = async (from: string, to: string, after: boolean) => {
     if (!queueSession || selectedId !== queueSession) return;
-    const ids = queuedTasks.filter(row => row.state === 'queued').map(row => row.id);
+    const ids = queuedTasks.filter(row => row.state === 'queued' && !row.recovery).map(row => row.id);
     if (from === to || !ids.includes(from) || !ids.includes(to)) return;
     ids.splice(ids.indexOf(from), 1);
     ids.splice(ids.indexOf(to) + Number(after), 0, from);
@@ -3544,10 +3557,29 @@ async function refreshInputQueue(): Promise<void> {
     if (entry.state === 'queued' && existing?.classList.contains('is-editing')) return existing;
     const card = el('div', 'queued-input'); card.dataset.inputId = entry.id;
     if (projectedIds.has(entry.id)) ui(card, 'aria-label', () => t("Plan stage · waiting for the first message to be sent"));
-    const label = el('span', 'queue-label', entry.text); ui(label, 'title', () => `${entry.state === 'queued' ? (entry.mode === 'after-turn' ? t("After the next completed answer") : t("At Session finish or after a completed answer")) : t("Awaiting receipt")} · ${entry.text}`);
+    if (entry.recovery) ui(card, 'aria-label', () => t('Automatic Continue'));
+    const label = el('span', 'queue-label', entry.recovery ? () => `${t('Automatic Continue')} · ${entry.text}` : entry.text);
+    ui(label, 'title', () => `${entry.recovery
+      ? t('Resumes without a final answer. If ChatGPT is still generating, the silent turn is stopped before Continue is sent.')
+      : entry.state === 'queued' ? (entry.mode === 'after-turn' ? t("After the next completed answer") : t("At Session finish or after a completed answer")) : t("Awaiting receipt")} · ${entry.text}`);
     label.dir = 'auto';
-    card.append(icon('i-clock'), label);
+    card.append(icon(entry.recovery ? 'i-pulse' : 'i-clock'), label);
     if (entry.state === 'queued') {
+      const retireCard = () => { card.remove(); taskList.hidden = taskList.childElementCount === 0; };
+      const cancel = dockAction(() => entry.recovery ? t('Cancel automatic Continue') : t("Remove queued task"), 'i-trash', () => {});
+      cancel.onclick = async () => {
+        if (cancel.disabled || !card.isConnected || selection !== selectionGeneration) return;
+        cancel.disabled = true;
+        const removed = await run(api.cancelInput(entry.id));
+        if (!card.isConnected || selection !== selectionGeneration) return;
+        if (removed === true || removed === false) {
+          inputQueueGeneration++;
+          if (removed) pendingComposerInputs = pendingComposerInputs.filter(row => row.id !== entry.id);
+          retireCard();
+          void refreshInputQueue();
+        } else cancel.disabled = false;
+      };
+      if (entry.recovery) { card.append(cancel); return card; }
       const queueSessionSummary = sessions.find(row => row.id === selectedId);
       const modelSelection = queueSessionSummary?.selectedModel;
       if (entry.mode === 'finish' && modelSelection?.conversationId === queueSessionSummary?.conversationId && isAstraModel(modelSelection?.model, modelSelection?.reasoningEffort)) {
@@ -3586,19 +3618,21 @@ async function refreshInputQueue(): Promise<void> {
       label.onkeydown = event => {
         if (!event.altKey || !['ArrowUp', 'ArrowDown'].includes(event.key)) return;
         event.preventDefault();
-        const ids = queuedTasks.filter(row => row.state === 'queued').map(row => row.id);
+        const ids = queuedTasks.filter(row => row.state === 'queued' && !row.recovery).map(row => row.id);
         const next = ids[ids.indexOf(entry.id) + (event.key === 'ArrowDown' ? 1 : -1)];
         if (next) void reorder(entry.id, next, event.key === 'ArrowDown');
       };
       const edit = dockAction(() => t("Edit queued task"), 'i-pencil', () => {});
       edit.onclick = () => {
+        if (!card.isConnected || selection !== selectionGeneration) return;
         const field = document.createElement('textarea'); field.dir = 'auto'; field.value = entry.text; ui(field, 'aria-label', () => t("Queued task"));
         const contents = [...card.childNodes];
         const save = el('button', 'btn', () => t("Save")) as HTMLButtonElement; save.type = 'button';
         save.onclick = async () => {
-          if (save.disabled) return;
+          if (save.disabled || cancel.disabled || !card.isConnected || selection !== selectionGeneration) return;
           const value = field.value;
-          save.disabled = true; ui(save, 'textContent', () => t("Saving…")); field.readOnly = true;
+          if (!value.trim()) { cancel.click(); return; }
+          save.disabled = true; cancel.disabled = true; ui(save, 'textContent', () => t("Saving…")); field.readOnly = true;
           try {
             const saved = await run(api.editQueuedInput(entry.id, value));
             if (!card.isConnected || selection !== selectionGeneration) return;
@@ -3607,14 +3641,20 @@ async function refreshInputQueue(): Promise<void> {
               // queue refresh. Refreshes preserve drafts; they do not own Save completion.
               entry.text = value.trim(); label.textContent = entry.text;
               card.classList.remove('is-editing'); card.replaceChildren(...contents);
+              inputQueueGeneration++;
               void refreshInputQueue();
-            } else if (saved === false) toast(t("This task is no longer queued and could not be edited."));
+            } else if (saved === false) {
+              // A claimed or removed row no longer owns an editor. Refresh projects
+              // its actual delivery state; it must never preserve this stale draft.
+              inputQueueGeneration++;
+              retireCard();
+              void refreshInputQueue();
+            }
           } catch (error) { toast(error instanceof Error ? error.message : t("Could not save this task.")); }
-          finally { save.disabled = false; ui(save, 'textContent', () => t("Save")); field.readOnly = false; }
+          finally { save.disabled = false; cancel.disabled = false; ui(save, 'textContent', () => t("Save")); field.readOnly = false; }
         };
-        card.classList.add('is-editing'); card.replaceChildren(field, save); field.focus();
+        card.classList.add('is-editing'); card.replaceChildren(field, save, cancel); field.focus();
       };
-      const cancel = dockAction(() => t("Remove queued task"), 'i-trash', () => {}); cancel.onclick = async () => { await run(api.cancelInput(entry.id)); void refreshInputQueue(); };
       card.append(edit, cancel);
     }
     return card;
@@ -3817,6 +3857,8 @@ function selectSession(id: string): void {
   const ownerChanged = id !== selectedId;
   rememberDraft();
   selectionGeneration++; replaceComposerDraft();
+  inputQueueGeneration++;
+  $('finishQueue').replaceChildren(); $('finishQueue').hidden = true;
   newChatSelected = false;
   selectedId = id;
   const selected = sessions.find(row => row.id === id);
@@ -3853,6 +3895,8 @@ function selectSession(id: string): void {
 
 function selectNewChat(projectId: string | null = null): void {
   rememberDraft(); selectionGeneration++; replaceComposerDraft(); pendingNewInput = null;
+  inputQueueGeneration++;
+  $('finishQueue').replaceChildren(); $('finishQueue').hidden = true;
   newChatSelected = true; selectedId = null; selectedProjectId = projectId; detailFor = null; detailCursor = null;
   if (projectId) expandedProjects.add(projectId);
   applyComposerSessionModel(null, null);

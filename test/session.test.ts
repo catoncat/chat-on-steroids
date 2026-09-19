@@ -46,6 +46,7 @@ import {
   pruneSessions,
   readAsset,
   readEvents,
+  readActivityEvents,
   readRecentEvents,
   readLatestUserMessage,
   turnHasMcpCall,
@@ -403,8 +404,11 @@ describe('session store', () => {
 
   it('finds an attachment beyond the 5,000-session maintenance scan cap', async () => {
     const seed = await createSession({ title: 'catalog seed', conversationId: null });
-    const seedSummary = await getSession(seed.id);
-    expect(seedSummary).not.toBeNull();
+    await flushSessions();
+    // Clone an actual persisted checkpoint, including its private version/watermark
+    // fields. A public summary is a legacy fixture and causes 5,001 real migrations.
+    const seedSummary = JSON.parse(await fs.readFile(path.join(sessionsRoot(), seed.id, 'meta.json'), 'utf8'));
+    const seedStat = await fs.stat(path.join(sessionsRoot(), seed.id, 'meta.json'));
     // Force the next lookup to rebuild from the durable catalog rather than the live seed.
     resetSessionStoreForTests();
 
@@ -413,7 +417,23 @@ describe('session store', () => {
     const targetId = names[names.length - 1] as string;
     const realReaddir = fs.readdir.bind(fs);
     const realReadFile = fs.readFile.bind(fs);
+    const realStat = fs.stat.bind(fs);
     const rootPath = sessionsRoot();
+    const virtualNames = new Set(names);
+    const virtualId = (file: string): string | null => {
+      const parts = path.relative(rootPath, file).split(path.sep);
+      return parts.length === 2 && virtualNames.has(parts[0]!) ? parts[0]! : null;
+    };
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(
+      (async (target: Parameters<typeof fs.stat>[0], ...args: unknown[]) => {
+        const file = String(target);
+        if (virtualId(file)) {
+          if (path.basename(file) === 'meta.json') return seedStat;
+          throw Object.assign(new Error('synthetic catalog has no message history'), { code: 'ENOENT' });
+        }
+        return (realStat as (...callArgs: unknown[]) => ReturnType<typeof fs.stat>)(target, ...args);
+      }) as typeof fs.stat
+    );
     const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(
       (async (target: Parameters<typeof fs.readdir>[0], ...args: unknown[]) => {
         if (String(target) === rootPath) return names;
@@ -423,8 +443,8 @@ describe('session store', () => {
     const readSpy = vi.spyOn(fs, 'readFile').mockImplementation(
       (async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
         const file = String(target);
-        const id = path.basename(path.dirname(file));
-        if (file.endsWith('meta.json') && id.startsWith('catalog-')) {
+        const id = virtualId(file);
+        if (path.basename(file) === 'meta.json' && id) {
           return JSON.stringify({
             ...seedSummary,
             id,
@@ -439,9 +459,13 @@ describe('session store', () => {
 
     try {
       expect((await findSessionByConversation(conversationId, { requireUnique: true }))?.id).toBe(targetId);
+      expect((await realReaddir(rootPath)).some(name => virtualNames.has(name))).toBe(false);
     } finally {
       readSpy.mockRestore();
       readdirSpy.mockRestore();
+      statSpy.mockRestore();
+      resetSessionStoreForTests();
+      await deleteSession(seed.id);
     }
   }, 90_000);
 
@@ -539,8 +563,49 @@ describe('session store', () => {
       expect(older.map(event => event.seq)).toEqual(full.filter(event => keys.has(event.seq)).map(event => event.seq));
     }
     expect((await getSession(session.id))?.activeTurnId).toBeNull();
-    expect((await getSession(session.id))?.timelineTurns?.first).toEqual({ origin: start.seq, time: 100, endTime: 180 });
+    expect((await getSession(session.id))?.timelineTurns?.first).toEqual({ origin: start.seq, time: 100,
+      endTime: 180, endOrigin: 4, questionId: 'first-question' });
     expect(await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8')).toBe(journal);
+  });
+
+  it.each([false, true])('keeps reloaded interim prose before later tools across every read path and restart (%s)', async restart => {
+    const session = await createSession({ title: 'native interim ordering', conversationId: 'interim-order' });
+    const working = '11111111-1111-4111-8111-111111111111';
+    const exchange = '22222222-2222-4222-8222-222222222222';
+    const parent = '33333333-3333-4333-8333-333333333333';
+    const text = (value: string) => ({ text: value, chars: value.length, truncated: false });
+    const start = await appendEvent(session.id, { kind: 'turn_start', source: 'extension', time: 100, turnId: 'working' });
+    await upsertMessageEvent(session.id, { kind: 'assistant_message', source: 'extension', time: 110,
+      messageId: `assistant:${parent}:${working}:${exchange}`, turnId: 'working', message: text('First update'), final: false });
+    const later = await appendEvent(session.id, { kind: 'tool_call', source: 'mcp', time: 150, turnId: 'working',
+      call: { callId: 'later-tool', tool: 'read', requestId: 'interim-request', conversationId: 'interim-order',
+        attribution: 'request_id', attributionMethod: 'request_id', args: text('{}'), result: text('ok'), outcome: 'ok', durationMs: 1,
+        summary: { kind: 'read', title: 'Later tool', tone: 'neutral' } } });
+    const interim = await upsertMessageEvent(session.id, { kind: 'assistant_message', source: 'extension', time: 140,
+      messageId: `assistant:${exchange}:${working}:${exchange}`, message: text('Second update'), final: false });
+    await flushSessions();
+    const folder = path.join(sessionsRoot(), session.id);
+    const journal = await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8');
+    const shardName = createHash('sha256').update(`assistant_message\u0000${interim.event.messageId}`).digest('hex') + '.json';
+    const shard = await fs.readFile(path.join(folder, 'messages', shardName), 'utf8');
+    if (restart) resetSessionStoreForTests();
+    const full = await readEvents(session.id);
+    expect(full.map(row => row.seq)).toEqual([start.seq, 2, interim.event.seq, later.seq]);
+    for (const page of [
+      await readRecentEvents(session.id, 2, { orderByOrigin: true }),
+      await readRecentEvents(session.id, 2, { after: 2, orderByOrigin: true }),
+      await readEvents(session.id, { from: 3, limit: 2 }),
+      (await readActivityEvents(session.id, 3, 2)).events
+    ]) {
+      expect(page.map(row => row.seq)).toEqual([interim.event.seq, later.seq]);
+      expect(page[0]).toMatchObject({ origin: interim.event.origin, time: 140, turnOrigin: start.seq });
+      expect(page[0]?.turnId).toBeUndefined();
+    }
+    const summary = await getSession(session.id);
+    expect(summary?.activeTurnId).toBe('working');
+    expect(summary?.lastAssistantFinalAt).toBeNull();
+    expect(await fs.readFile(path.join(folder, 'events.jsonl'), 'utf8')).toBe(journal);
+    expect(await fs.readFile(path.join(folder, 'messages', shardName), 'utf8')).toBe(shard);
   });
 
   it('preserves the legacy authored position when a reload changes the provider timestamp for the same UUID', async () => {
@@ -1819,8 +1884,9 @@ describe('handoff storage', () => {
 
   it('finds the newest handoff even when its session is beyond the 5,000-folder maintenance cap', async () => {
     const seed = await createSession({ title: 'handoff catalog seed' });
-    const seedSummary = await getSession(seed.id);
-    expect(seedSummary).not.toBeNull();
+    await flushSessions();
+    const seedSummary = JSON.parse(await fs.readFile(path.join(sessionsRoot(), seed.id, 'meta.json'), 'utf8'));
+    const seedStat = await fs.stat(path.join(sessionsRoot(), seed.id, 'meta.json'));
     resetSessionStoreForTests();
 
     const names = Array.from({ length: 5001 }, (_, index) => `handoff-${String(index).padStart(5, '0')}`);
@@ -1828,7 +1894,23 @@ describe('handoff storage', () => {
     const handoffId = '2026-08-24-deadbeef';
     const realReaddir = fs.readdir.bind(fs);
     const realReadFile = fs.readFile.bind(fs);
+    const realStat = fs.stat.bind(fs);
     const rootPath = sessionsRoot();
+    const virtualNames = new Set(names);
+    const virtualId = (file: string): string | null => {
+      const parts = path.relative(rootPath, file).split(path.sep);
+      return parts.length === 2 && virtualNames.has(parts[0]!) ? parts[0]! : null;
+    };
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(
+      (async (target: Parameters<typeof fs.stat>[0], ...args: unknown[]) => {
+        const file = String(target);
+        if (virtualId(file)) {
+          if (path.basename(file) === 'meta.json') return seedStat;
+          throw Object.assign(new Error('synthetic catalog has no message history'), { code: 'ENOENT' });
+        }
+        return (realStat as (...callArgs: unknown[]) => ReturnType<typeof fs.stat>)(target, ...args);
+      }) as typeof fs.stat
+    );
     const readdirSpy = vi.spyOn(fs, 'readdir').mockImplementation(
       (async (target: Parameters<typeof fs.readdir>[0], ...args: unknown[]) => {
         if (String(target) === rootPath) return names;
@@ -1838,8 +1920,8 @@ describe('handoff storage', () => {
     const readSpy = vi.spyOn(fs, 'readFile').mockImplementation(
       (async (target: Parameters<typeof fs.readFile>[0], ...args: unknown[]) => {
         const file = String(target);
-        const id = path.basename(path.dirname(file));
-        if (file.endsWith('meta.json') && id.startsWith('handoff-')) {
+        const id = virtualId(file);
+        if (path.basename(file) === 'meta.json' && id) {
           return JSON.stringify({
             ...seedSummary,
             id,
@@ -1849,7 +1931,7 @@ describe('handoff storage', () => {
             lastHandoffAt: id === targetId ? 20_000 : null
           });
         }
-        if (file.endsWith(`${path.sep}handoffs${path.sep}${handoffId}.json`)) {
+        if (file === path.join(rootPath, targetId, 'handoffs', `${handoffId}.json`)) {
           return JSON.stringify(handoff(targetId, handoffId, 20_000));
         }
         return (realReadFile as (...callArgs: unknown[]) => ReturnType<typeof fs.readFile>)(target, ...args);
@@ -1858,9 +1940,12 @@ describe('handoff storage', () => {
 
     try {
       expect((await latestHandoff())?.id).toBe(handoffId);
+      expect((await realReaddir(rootPath)).some(name => virtualNames.has(name))).toBe(false);
     } finally {
       readdirSpy.mockRestore();
       readSpy.mockRestore();
+      statSpy.mockRestore();
+      resetSessionStoreForTests();
       await deleteSession(seed.id);
     }
   }, 90_000);

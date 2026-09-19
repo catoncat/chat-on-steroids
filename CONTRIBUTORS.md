@@ -70,7 +70,41 @@ escapes before letters or digits. Recovery handout/result logging from
 blind-reload detector and request-based attempt counter are not. This is an adapted source
 integration, not a claim that those seven PR branches were merged unchanged.
 
+The follow-up review on September 18 also adapts [@Maximapple](https://github.com/Maximapple)'s
+compaction for an oversized chat whose page no longer reports a turn
+([#295](https://github.com/totec448-spec/chat-on-steroids/pull/295)) and the fifteen-second
+health-reporting grace in [#284](https://github.com/totec448-spec/chat-on-steroids/pull/284).
+Compaction uses the existing exactly attributed MCP activity grant and rechecks it after
+storage reads. Health observations share one bounded map, including unannounced first sightings.
+The stacked blind-page reload subsystem from #280 is not added.
+
+The September 19 review adapts [@Maximapple](https://github.com/Maximapple)'s
+departed-chat Continue diagnosis ([#298](https://github.com/totec448-spec/chat-on-steroids/pull/298)),
+historical worker wait-caption fix ([#299](https://github.com/totec448-spec/chat-on-steroids/pull/299)),
+and wake expiry diagnostics and delivery allowance ([#305](https://github.com/totec448-spec/chat-on-steroids/pull/305)).
+The outbox repair retains exact late receipts and authored queue entries; it does not release
+uncertain sends by age. Waiting captions use live workers without changing historical counts.
+Timer and maintenance expiry share one diagnostic and a bounded, non-replaying wake attempt.
+
+[@okayamajwcc-coder](https://github.com/okayamajwcc-coder) / Masatoshi Shisaka contributed the
+Windows target-thread focus repair ([#308](https://github.com/totec448-spec/chat-on-steroids/pull/308)).
+It is adapted with cleanup covering attachment exceptions and the existing actual foreground
+checks. The separate macOS input-validation proposal in #309 is not incorporated by this review.
+
+The September 19 backlog integration also adapts [@Maximapple](https://github.com/Maximapple)'s
+reporting-gap correction in [#284](https://github.com/totec448-spec/chat-on-steroids/pull/284),
+missing-tab worker wake and parked-prime recovery in [#314](https://github.com/totec448-spec/chat-on-steroids/pull/314),
+and marked-continuation diagnostics in [#315](https://github.com/totec448-spec/chat-on-steroids/pull/315).
+The wake adaptation rechecks command ownership, live message debt and cancellation after storage reads;
+marker diagnostics report commitment only after settlement. These adaptations retain the existing
+browser recovery and continuation owners.
+
 ## Reports, review and proposed work
+
+[@TomerGamerTV](https://github.com/TomerGamerTV)'s slow observation-journal report in
+[#301](https://github.com/totec448-spec/chat-on-steroids/issues/301) led to the independently
+implemented per-delivery timeout correction and durable retry regressions. General request
+deadlines and server request-body/header limits were not increased.
 
 [@raxy24](https://github.com/raxy24)'s report in
 [#262](https://github.com/totec448-spec/chat-on-steroids/issues/262) led to the independently
