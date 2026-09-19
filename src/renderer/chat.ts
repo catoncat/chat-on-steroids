@@ -2912,8 +2912,6 @@ export function chatSettingsPatch(current: Config): {
       loopBackend: $<HTMLSelectElement>('loopBackend').value as Config['goal']['loopBackend'],
       helperModel: $<HTMLSelectElement>('helperModel').value || current.goal.helperModel || 'gpt-5.6-sol',
       helperReasoning: ($<HTMLSelectElement>('helperReasoning').value || current.goal.helperReasoning || 'high') as Config['goal']['helperReasoning'],
-      plannerModel: $<HTMLSelectElement>('plannerModel').value || current.goal.plannerModel || 'gpt-5.6-sol',
-      plannerReasoning: ($<HTMLSelectElement>('plannerReasoning').value || current.goal.plannerReasoning || 'high') as Config['goal']['plannerReasoning'],
       provider: {
         kind: ($<HTMLSelectElement>('goalProvider').value || current.goal.provider?.kind || 'openrouter') as Config['goal']['provider']['kind'],
         baseUrl: $<HTMLInputElement>('goalBaseUrl').value
@@ -3273,7 +3271,7 @@ const CHAT_INPUTS = [
   'finishTool', 'finishLeadMinutes', 'workerModel', 'workerReasoning', 'backgroundChats', 'browserOnly', 'autoRefreshPlugins',
   'goalBackend',
   'loopBackend',
-  'helperModel', 'helperReasoning', 'plannerModel', 'plannerReasoning',
+  'helperModel', 'helperReasoning',
   'autoCompact',
   'autoCompactTokens',
   'maWorkers',
@@ -3322,8 +3320,6 @@ export function chatApply(state: AppState, previous?: Config): void {
   applyChatValue($<HTMLSelectElement>('loopBackend'), config.goal.loopBackend ?? 'chatgpt', previous?.goal.loopBackend);
   applyChatValue($<HTMLSelectElement>('helperModel'), config.goal.helperModel ?? 'gpt-5.6-sol', previous?.goal.helperModel);
   applyChatValue($<HTMLSelectElement>('helperReasoning'), config.goal.helperReasoning ?? 'high', previous?.goal.helperReasoning);
-  applyChatValue($<HTMLSelectElement>('plannerModel'), config.goal.plannerModel ?? 'gpt-5.6-sol', previous?.goal.plannerModel);
-  applyChatValue($<HTMLSelectElement>('plannerReasoning'), config.goal.plannerReasoning ?? 'high', previous?.goal.plannerReasoning);
   applyGoal(state, previous);
 
   // Extension bridge. Connecting is automatic, so this reports rather than asks.

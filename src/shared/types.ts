@@ -247,12 +247,8 @@ export interface GoalSettings {
   impulseMinutes?: number;
   /** Include tool details in handoff briefs only; Goal/Loop always use authored conversation text. */
   includeToolCalls?: boolean;
-  /** ChatGPT selection for high-frequency Goal/Loop continuation decisions. */
   helperModel?: string;
   helperReasoning?: ReasoningEffort;
-  /** ChatGPT selection for explicit staged-plan generation. Independent from Goal/Loop. */
-  plannerModel?: string;
-  plannerReasoning?: ReasoningEffort;
   backend?: GoalBackend;
   loopBackend?: 'api' | 'chatgpt';
   enabled: boolean;

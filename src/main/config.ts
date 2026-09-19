@@ -134,8 +134,6 @@ const DEFAULT_GOAL: GoalSettings = {
   includeToolCalls: false,
   helperModel: 'gpt-5.6-sol',
   helperReasoning: 'high',
-  plannerModel: 'gpt-5.6-sol',
-  plannerReasoning: 'high',
   enabled: false,
   // The mode a fresh install runs the moment somebody flips the switch. Goal, because it is
   // the one that can end by itself: a loop that never stops is a deliberate choice, not a
@@ -226,24 +224,6 @@ function migrateCapabilities(value: unknown): unknown {
   delete caps['powershell'];
   delete caps['deleteFolder'];
   return caps;
-}
-
-/**
- * Local 2.0.6 Goal-provider configs stored `provider` as `'openrouter' | 'custom'` plus
- * `customBaseUrl`. 2.0.7 nested that as `{ kind, baseUrl }`. Without this rewrite a still-valid
- * folder/tunnel file fails the whole schema and conservative recovery wipes every root.
- */
-function migrateGoalProvider(value: unknown): unknown {
-  if (value === null || typeof value !== 'object') return value;
-  const goal = { ...(value as Record<string, unknown>) };
-  const provider = goal.provider;
-  if (typeof provider === 'string' && (GOAL_PROVIDERS as readonly string[]).includes(provider)) {
-    const baseUrl = typeof goal.customBaseUrl === 'string' ? goal.customBaseUrl : '';
-    goal.provider = { kind: provider, baseUrl };
-  }
-  delete goal.customBaseUrl;
-  delete goal.customAuth;
-  return goal;
 }
 
 // Missing capability keys are filled from safe defaults so adding a new optional
@@ -370,9 +350,8 @@ const configSchema = z.object({
   // An empty model id is repaired rather than rejected: the id is free text from a
   // provider listing that changes weekly, and a config that lost it must still load with
   // every root and permission in it intact.
-  goal: z.preprocess(
-    migrateGoalProvider,
-    z.object({
+  goal: z
+    .object({
       impulseMinutes: z.number().int().min(0).max(60).optional().default(0).catch(0),
       includeToolCalls: z.boolean().optional().default(false),
       enabled: z.boolean().optional().default(DEFAULT_GOAL.enabled),
@@ -380,8 +359,6 @@ const configSchema = z.object({
       loopBackend: z.enum(['api', 'chatgpt']).optional().default('chatgpt'),
       helperModel: z.string().trim().min(1).max(80).optional().default('gpt-5.6-sol').catch('gpt-5.6-sol'),
       helperReasoning: z.enum(REASONING_EFFORTS).optional().default('high').catch('high'),
-      plannerModel: z.string().trim().min(1).max(80).optional().default('gpt-5.6-sol').catch('gpt-5.6-sol'),
-      plannerReasoning: z.enum(REASONING_EFFORTS).optional().default('high').catch('high'),
       // Repaired rather than rejected for the same reason `reasoning` below is: a config
       // written by a version that knows one more mode than this one must not send every root
       // and permission in the file through conservative recovery over a single word.
@@ -397,8 +374,7 @@ const configSchema = z.object({
           baseUrl: z.string().max(2048).optional().default('')
         })
         .optional()
-        .default({ ...DEFAULT_GOAL.provider })
-        .catch({ ...DEFAULT_GOAL.provider }),
+        .default({ ...DEFAULT_GOAL.provider }),
       model: z
         .string()
         .max(160)
@@ -448,8 +424,7 @@ const configSchema = z.object({
         .catch(DEFAULT_GOAL.loopPrompt)
     })
     .optional()
-    .default({ ...DEFAULT_GOAL, backend: 'chatgpt', loopBackend: 'chatgpt', impulseMinutes: 0, includeToolCalls: false, helperModel: 'gpt-5.6-sol', helperReasoning: 'high', plannerModel: 'gpt-5.6-sol', plannerReasoning: 'high' })
-    .catch({ ...DEFAULT_GOAL, backend: 'chatgpt', loopBackend: 'chatgpt', impulseMinutes: 0, includeToolCalls: false, helperModel: 'gpt-5.6-sol', helperReasoning: 'high', plannerModel: 'gpt-5.6-sol', plannerReasoning: 'high' })),
+    .default({ ...DEFAULT_GOAL, backend: 'chatgpt', loopBackend: 'chatgpt', impulseMinutes: 0, includeToolCalls: false, helperModel: 'gpt-5.6-sol', helperReasoning: 'high' }),
   mcp: z
     .object({
       // Repaired rather than rejected, like the Goal prompts above: this is free text a person

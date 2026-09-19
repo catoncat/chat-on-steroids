@@ -156,43 +156,6 @@ describe('settings migration', () => {
     expect(loaded.tunnel.desktopTunnelId).toBe('');
   });
 
-  it('migrates a string Goal provider plus customBaseUrl without resetting roots', async () => {
-    // Local 2.0.6 stored provider as a string. 2.0.7 nested it. Rejecting that shape used to
-    // conservative-recover the whole file and drop every approved folder.
-    const previous = defaultConfig();
-    const roots = [{ name: 'work', path: dir }];
-    await fs.writeFile(
-      path.join(dir, 'config.json'),
-      JSON.stringify({
-        ...previous,
-        roots,
-        readOnly: false,
-        tunnel: {
-          kind: 'openai',
-          tunnelId: 'tunnel_0123456789abcdef0123456789abcdef',
-          desktopTunnelId: '',
-          pluginsTunnelId: '',
-          binaryPath: ''
-        },
-        sessions: { ...previous.sessions, record: true },
-        goal: {
-          ...previous.goal,
-          enabled: true,
-          provider: 'custom',
-          customBaseUrl: 'https://apiproxy.fly.dev/v1',
-          customAuth: 'bearer'
-        }
-      }),
-      'utf8'
-    );
-    const loaded = await loadConfig();
-    expect(loaded.roots).toEqual(roots);
-    expect(loaded.readOnly).toBe(false);
-    expect(loaded.tunnel.tunnelId).toBe('tunnel_0123456789abcdef0123456789abcdef');
-    expect(loaded.goal.enabled).toBe(true);
-    expect(loaded.goal.provider).toEqual({ kind: 'custom', baseUrl: 'https://apiproxy.fly.dev/v1' });
-  });
-
   it('folds a PowerShell-only permission into the single command permission', async () => {
     // `powershell` and `command` were one tool each and are now the single exec_command.
     // A user who had granted only PowerShell keeps the ability they chose; the dead key
@@ -569,8 +532,6 @@ describe('the goal loop settings', () => {
       impulseMinutes: 0,
       helperModel: 'gpt-5.6-sol',
       helperReasoning: 'high',
-      plannerModel: 'gpt-5.6-sol',
-      plannerReasoning: 'high',
       enabled: true,
       mode: 'loop',
       provider: { kind: 'openrouter', baseUrl: '' },
@@ -718,8 +679,6 @@ describe('the goal loop settings', () => {
       impulseMinutes: 0,
       helperModel: 'gpt-5.6-sol',
       helperReasoning: 'high',
-      plannerModel: 'gpt-5.6-sol',
-      plannerReasoning: 'high',
       enabled: false,
       mode: 'goal',
       provider: { kind: 'openrouter', baseUrl: '' },

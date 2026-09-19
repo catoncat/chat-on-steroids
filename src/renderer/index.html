@@ -753,10 +753,8 @@
                   </label>
                   <div class="setting"><span class="setting-text"><b>Goal response source</b><em>API is the most reliable. Offline uses completion markers and 200 prepared messages.</em></span><select id="goalBackend"><option value="chatgpt">Separate ChatGPT chat</option><option value="api">API key · Most reliable</option><option value="templates">Offline · No API cost</option></select></div>
                   <div class="setting"><span class="setting-text"><b>Loop response source</b><em>Loop keeps going until you switch it off.</em></span><select id="loopBackend"><option value="api">API key · Most reliable</option><option value="chatgpt">Separate ChatGPT chat</option></select></div>
-                  <div class="setting"><span class="setting-text"><b>Goal and Loop model</b><em>Model for high-frequency ChatGPT continuation decisions.</em></span><select id="helperModel" aria-label="Goal and Loop model"></select></div>
-                  <div class="setting"><span class="setting-text"><b>Goal and Loop reasoning</b><em>Reasoning for continuation decisions; independent from API reasoning.</em></span><select id="helperReasoning" aria-label="Goal and Loop reasoning"></select></div>
-                  <div class="setting"><span class="setting-text"><b>Plan model</b><em>Model for explicit staged workflow generation.</em></span><select id="plannerModel" aria-label="Plan model"></select></div>
-                  <div class="setting"><span class="setting-text"><b>Plan reasoning</b><em>Use a stronger, slower model here without slowing every Goal or Loop decision.</em></span><select id="plannerReasoning" aria-label="Plan reasoning"></select></div>
+                  <div class="setting"><span class="setting-text"><b>Goal, Loop and Plan model</b><em>Model for ChatGPT-generated messages and plans. Select GPT-5.6 and High below for planning.</em></span><select id="helperModel" aria-label="Goal, Loop and Plan model"></select></div>
+                  <div class="setting"><span class="setting-text"><b>Goal, Loop and Plan reasoning</b><em>Used with the ChatGPT model above; independent from API reasoning.</em></span><select id="helperReasoning" aria-label="Goal, Loop and Plan reasoning"></select></div>
                   <label class="setting"><span class="setting-text"><b>Include tool details in handoffs</b><em>Handoff briefs retain tool details. Goal and Loop use user messages and assistant updates and answers.</em></span><input id="goalIncludeToolCalls" type="checkbox" /></label>
                   </div>
                 <h2 class="settings-section-title">ChatGPT models</h2>
@@ -799,7 +797,7 @@
                 </div>
                 <h2 class="settings-section-title">Keep the turn open</h2>
                 <div class="pane">
-                  <label class="setting"><span class="setting-text"><b>Plan generation</b><em>Create staged tasks. ChatGPT uses the Plan model above; API uses the model and reasoning in API provider settings.</em></span><select id="planBackend"><option value="chatgpt">ChatGPT</option><option value="api">API provider</option></select></label>
+                  <label class="setting"><span class="setting-text"><b>Plan generation</b><em>Create staged tasks. ChatGPT uses the Goal, Loop and Plan model above; API uses the model and reasoning in API provider settings.</em></span><select id="planBackend"><option value="chatgpt">ChatGPT</option><option value="api">API provider</option></select></label>
                   <label class="setting"><span class="setting-text"><b>Session finish</b><em>Ask Astra to keep the turn open for your next instruction. With Automatic plugin refresh enabled, tool changes refresh the connector after 20 seconds.</em></span><input id="finishTool" type="checkbox" /></label>
                   <div class="setting"><span class="setting-text"><b>When ChatGPT is wrapping up</b><em>When Goal or Loop is enabled for this chat, finishing generates a follow-up using your Loop instructions and source. When Off, you receive a notification.</em></span></div>
                   <div class="setting"><span class="setting-text"><b>Requested notice</b><em>A request to the model, not a guaranteed countdown.</em></span><select id="finishLeadMinutes"><option value="3">3 minutes</option><option value="5">5 minutes</option></select></div>

@@ -482,8 +482,6 @@ it('generates a validated staged plan through the existing browser helper withou
 });
 
 it('publishes readable partial plan stages while final validation remains authoritative', async () => {
-  const config = defaultConfig();
-  await saveConfig({ ...config, goal: { ...config.goal, plannerModel: '6', plannerReasoning: 'pro' } });
   const progress = vi.fn();
   const raw = JSON.stringify({ action: 'continue', reply: JSON.stringify({ stages: ['Build the feature', 'Verify acceptance'] }) });
   browser.request.mockImplementationOnce(async (_prompt, _signal, options) => {
@@ -492,7 +490,7 @@ it('publishes readable partial plan stages while final validation remains author
     return raw;
   });
   expect(await goal.draftTaskPlan('Build it', 'chatgpt', progress)).toEqual(['Build the feature', 'Verify acceptance']);
-  expect(browser.request.mock.calls[0]?.[2]).toMatchObject({ model: '6', reasoningEffort: 'pro' });
+  expect(browser.request.mock.calls[0]?.[2]).toMatchObject({ model: 'gpt-5.6-sol', reasoningEffort: 'high' });
   expect(progress).toHaveBeenCalledWith({ phase: 'generating', text: '1. Build the fea' });
   expect(progress).toHaveBeenCalledWith({ phase: 'generating', text: '1. Build the feature\n\n2. Verify acceptance' });
 
