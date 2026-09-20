@@ -1050,7 +1050,8 @@ export async function attachSummary(token: string, text: string): Promise<Handof
   return capture(token, brief, async (entry) =>
     prepareHandoff({
       sessionId: entry.sessionId,
-      text: brief
+      text: brief,
+      continuationToken: entry.token
     })
   );
 }
