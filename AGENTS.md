@@ -491,6 +491,11 @@ two simultaneous clones and 16 request ids per stream; only server metadata is a
 The native WebSocket `conversation-turn-stream` handoff uses the same complete-event parser,
 requiring its outer conversation to match the inner event. It observes existing messages on
 ChatGPT secure sockets without sending, subscribing or polling; envelopes and frames are bounded.
+Native v1 delta headers may omit repeated channel/path/operation fields. The observer retains
+only those bounded format fields per HTTP response, or per linked conversation/turn socket
+stream. Missing predecessors, malformed/unknown encoding and retired streams discard that
+state. Identity still requires both ids in one complete root value; partial values, message
+text and cached answer branches never supply the join.
 A 64-pair document cache deduplicates both transports and replays IDs at content readiness.
 Content requires the matching route and document epoch, retaining one-shot stream proof through
 temporary ACK failures for at most 15 minutes using the existing observer/backoff. Missing stream
@@ -1251,6 +1256,9 @@ advances only for final text/state changes; HTML, timestamps and other metadata 
 old final into a new completion. Legacy rows retain their first anchor until fresh final content.
 That content revision must follow the latest recorded work boundary, with no running local tool
 or newer user/turn overriding it, independently of observation order within a browser batch.
+The recorder's final-derived activity verdict uses that same `readCompletedFinal` check after
+the complete batch. A reload can mark a historical request-owned final `activeNow` while revising
+its HTML; that hint must neither consume the current work grant nor cancel or renew recovery.
 Replay lifecycle boundaries in publication sequence; display chronology must not erase an
 app-authored reopen after an earlier completed end. Restore the current generation by that
 same replay: a new start replaces the active turn, and its exact end clears it. An older
@@ -1407,13 +1415,22 @@ adapter; do not make each feature guess a different composer or terminal message
 lightweight debugger focus-emulation leases, plus exact still-pending input openings and the
 elected model-catalog operation. At most 64 ChatGPT tabs receive rendering protection. No
 Runtime/Network capture, synthetic input, global Chrome flags or selected-tab/OS focus change
-is involved. Idle/personal tabs and pins alone earn no lease. Navigation, policy retirement,
-failed status, unpair or wake-socket loss release it through existing lifecycle events;
+is involved. Idle/personal tabs and pins alone earn no lease. Input election refreshes this same
+policy before native preparation and its offer. A reused page retains its exact document,
+navigation epoch and starting URL while preparing, including its one authorized New Chat
+transition; it cannot depend on an input marker that preparation has not written yet.
+Chrome can emit loading+URL for a same-document history change. The background owner uses a
+bounded, document-targeted scripting read of the new location and Chrome's InjectionResult
+document/frame identity before preserving that route. The existing policy must still approve
+it. Unknown/replaced documents lose their lease, and a late proof cannot retire a replacement.
+Confirmed document navigation, policy retirement, failed status, unpair or wake-socket loss
+release it through existing lifecycle events;
 ordinary idle/reuse/close policy remains unchanged. Session storage retains attachment cleanup
 custody and cancellation, never activity authority. Chrome/user debugger cancellation is not
 retried until that activity scope ends. Browser tools cannot borrow these attachments.
-`test/active-tabs.test.ts` covers custody/races; `scripts/verify-active-tabs.mjs` verifies native
-background animation pause/resume and release in isolated Chromium without observing the target
+`test/active-tabs.test.ts` and `test/desktop-input-maintenance.test.ts` cover custody, election,
+document proof and races; `scripts/verify-active-tabs.mjs` verifies native background animation
+pause/resume, same-document handoff and reload/release in isolated Chromium without observing the target
 through a debugger. This fixture is not signed-in ChatGPT or installed-runtime acceptance.
 
 ### Direct background browser control
@@ -1602,20 +1619,63 @@ proof for other features. All continuation paths still require their exact sourc
 Direct Chrome selection is observed even with the picker closed. The existing MAIN scan reads
 the current native picker state, including September's retained `dropdownContent.props`, then
 stamps exact model/effort and document/route for the isolated reader. The older closed-trigger
-model/effort join remains supported. Ambiguous triggers and unrecognized state remain unknown.
+model/effort join remains supported. The reported `data-codex-intelligence-trigger` and
+`data-composer-navigation-target="reasoning"` anchors also require native model-owner proof;
+`data-selected-reasoning-effort` supplies a machine effort without reading translated captions.
+The alternate shell uses an id-less editable textbox under `form[data-chatgpt-composer]` and
+`data-model-picker-view` for its portal. Its evaluated `powerSelections`, current selection and
+version options normalize into the same bounded picker snapshot. Mixed-version powers retain
+their execution ids rather than merging unrelated models into a synthetic Latest family.
+Ambiguous triggers and unrecognized state remain unknown. MAIN helper replacement removes the
+previous listener across protocol versions, because the picker/plugin reply protocols are shared.
+The matched recorder/MAIN helper version is 18. Shell exchanges are read only under the native
+main/thread anchors. Their `entry.turn.items` supply actual user/assistant ids, public text and
+per-call completion; DOM slot keys only join those exact items to the current scan. Missing ids
+do not become invented messages. Only a completed final item in a successfully completed turn
+can end it; cancellation or an unknown turn status never acknowledges unfinished tool calls.
+The shell's exact completed final message retains stable identity for handoff capture even
+without the classic thought-parent/timestamp tuple. The native terminal item and nonconflicting
+conversation must agree; streaming and cancelled items never gain that proof.
+The bounded query-cache read supplies the exact local/server conversation pair and request metadata
+only for message ids explicitly named by the mounted exchange in its exact conversation cache.
+It never follows child links or imports cached prose/completion. Duplicate/conflicting caches
+abstain, and an unavailable optional cache leaves mounted messages readable. Typed connector names
+accept the provider's exact underscore recipient spelling as well as the original app name.
+Only the latest exchange's running hint describes the composer; unfinished historical exchanges
+cannot block a completed current answer. UUID workflow ids and complete root-add stream envelopes
+feed the existing request-origin owner. The shell's Markdown editor receives prepared text through
+its native literalPaste mark in the same single HTML edit, preserving punctuation and line breaks.
+Classic editor insertion is unchanged. Shell prompt presentation requires the current exact
+message stamp and the same strict context-frame parser, retaining original recording bytes.
+The shell keeps its native activity/answer presentation; no alternate Overwrite or upload owner is added.
 The closed snapshot describes only the selected native version's buckets; it is selection
 evidence, never a complete catalog. Discovery elects an idle composer, reads the account-evaluated
 choices once per enabled native version, and restores the original model/effort before publication.
-Busy or drafting pages defer discovery without publishing a partial catalog or opening a replacement
-tab. Passive selection observation continues during generation and preserves drafts. OS wake is dispatch, not
+Busy or drafting pages are never used for discovery. Explicit Refresh may open one separately
+owned helper when every existing user page positively reports generation, a protected draft or
+attachments, another input operation, or a hidden composer. Missing recorder replies, hydration,
+an existing helper or an already spent tab election grant no additional opening. Passive discovery
+never opens this helper. Discovery never clears text, including restored helper drafts. A loaded
+elected helper wakes the existing maintenance owner; no new poller is added.
+Passive selection observation continues during generation and preserves drafts. OS wake is dispatch, not
 discovery completion: the IPC request returns pending and the bounded observation deadline owns
 the result, so a stalled launch cannot hold Refresh/Send indefinitely.
 
 Successful catalogs retain their observation time and persist across restart. Discovery is a
-bounded nonce-scoped operation (120 seconds, at most 20 accepted models); failed refresh leaves
+bounded nonce-scoped operation (120 seconds, at most 20 accepted models). First explicit promotion
+of a passive request renews its budget once without replacing the nonce; repeated Refresh clicks
+cannot extend it. The same deadline retains the exact browser result route through a slow scan,
+instead of discarding its custody after 35 seconds. Bounded waiting reasons never count as model
+evidence and preserve the last concrete problem at timeout. A failed refresh leaves
 the last successful catalog visibly distinguishable from a fresh observation. Cached metadata
 is useful selection UI, not fresh send authorization. Model and reasoning selection must both
 be confirmed after relevant native changes; navigation invalidates that confirmation.
+Saved worker/helper execution aliases remain exact, including their requested effort: a family's
+effort union cannot authorize rewriting an alias into another lane. Selecting a family explicitly
+enables its observed effort choices. Display-name matching retains Unicode letters and numbers,
+requires a nonempty unique name, and cannot shadow exact provider ids or treat effort captions
+as model identities. Localized/spaced native version ids remain navigation metadata; unsupported
+execution-id characters use the observed execution slug rather than producing an invalid catalog.
 Selection and discovery also await the native picker and its owned dialog closing within the
 existing three-second observer bound. Escape targets that picker focus trap; dispatch alone
 is not closure. A stuck picker refuses success before strict composer focus/insertion checks.
@@ -1627,6 +1687,9 @@ Picker access first waits for native hydration and prepares the owned Chat surfa
 the shared DOM adapter, including direct worker startup. A remembered Work surface must not
 be mistaken for unavailable Chat models and fail before prompt insertion. Startup failure
 reports tell the prime to resolve the cause before requesting a replacement worker.
+The existing readiness observer refreshes MAIN ownership proof as the account picker hydrates.
+A first empty snapshot must not leave an otherwise ready shell waiting for a stamp that only
+another snapshot can create. Cancellation and the same document/draft checks remain required.
 
 Discovery elects an existing visible composer. An explicitly authorized helper may transfer
 its still-empty document and opening authority to the first user input, rather than opening a
@@ -1754,7 +1817,10 @@ say to ignore them. Unsent eligible tickets survive restart. A never-authorized 
 browser preparation releases the same ticket, without replaying a possibly consumed Stop.
 Authorized ambiguous sends retain their exact receipt custody and are never automatically
 resent. Native user Stop stays distinct from automation Stop. New work, final, question/input,
-changed binding, running tools, block or compaction revokes obsolete recovery. Turning ordinary
+changed binding, block or compaction revokes obsolete recovery. Running or settling tools hold
+Stop/Send admission without cancelling the frozen ticket: an unassigned call can belong to
+another chat. Recheck that temporary hold across asynchronous validation; recorded work in
+the source chat still retires its obsolete ticket. Turning ordinary
 Continue off revokes it only if neither Goal nor Loop independently enables recovery. Drafts,
 attachments and exact document/epoch are checked before Stop and Send. Countdown presentation
 projects the existing waiting/pickup deadline; it owns no timer or delivery authority.
@@ -1927,6 +1993,10 @@ empty may mean loading, and neither creates a reload grant. An absent/empty stat
 for fifteen seconds before it is logged; recovery is logged only after an announced degradation.
 Ninety seconds without a report, or a clock moving behind the last observation, restarts that
 grace. Elapsed time without a page report is not continued evidence of degradation.
+On-demand helper repair refreshes the DOM adapter, MAIN reader and matching isolated recorder
+through the existing restoration path, pinned to the requesting Chrome document. The recorder's
+version guard retains an equal healthy instance. Repairing only MAIN can strand a cached recorder
+on an older protocol after unpacked-extension edits; no new page reload or timer is authorized.
 First sightings and announced states share one bounded map, reset with the bridge. Repeated no-tab/stalled refusals
 are logged once per chat/cause/minute; handout logs and confirmed browser-action logs remain distinct.
 Assistant-error repairs retain their three-minute cooldown. Attribution, silence, Goal,
@@ -2565,9 +2635,15 @@ names render as plain chips; unresolved file citations do not gain invented loca
 Tool result rendering preserves structured text/image/resource distinctions within bounds.
 App-owned external/local links cross their validated main-process route.
 
-English, Spanish and Simplified Chinese are explicit UI translations (`i18n.ts`, `locales/{es,zh-CN}.json`),
-with the selected locale in `cos.ui.language`. Changing language repaints owned labels while
-retaining drafts/selections; never translate authored messages, provider text or file paths.
+English, Spanish, Simplified Chinese, Traditional Chinese and Japanese use the existing UI
+catalogs (`i18n.ts`, `locales/{es,zh-CN,zh-TW,ja}.json`), with the selected locale in
+`cos.ui.language`. Setup uses SVG flags only, with native language names in tooltips and
+accessible labels; Appearance retains the named language dropdown. Both controls share the
+same persisted preference. `translate="no"` protects text and attributes, including native
+language names. Japanese has its own system-font fallbacks and CJK wrapping. Changing language
+repaints owned labels while retaining drafts/selections; never translate authored messages,
+provider text or file paths. Catalog checks cover all source keys and numbered placeholders;
+`scripts/verify-setup-guide.cjs` exercises narrow/zoomed layouts and native keyboard selection.
 Bindings live only in a WeakMap keyed by their DOM node. Language changes walk the current
 document, including hidden panels and bound text nodes. Never retain or periodically dereference
 an index of every past label: WeakRef sweeps keep detached trees alive during allocation-heavy
