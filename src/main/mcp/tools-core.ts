@@ -71,7 +71,7 @@ import {
   DEFAULT_TTY,
   DEFAULT_WRITE_STDIN_YIELD_TIME_MS
 } from '../codex/unified-exec-constants.js';
-import { defaultUserShell, deriveExecArgs, getShellByModelProvidedPath, shlexJoin } from '../codex/shell.js';
+import { defaultUserShell, deriveExecArgs, getShellByModelProvidedPath, shlexJoin, withPosixPathPrefix } from '../codex/shell.js';
 import {
   APPLY_PATCH_ARGUMENT_DESCRIPTION,
   APPLY_PATCH_DESCRIPTION,
@@ -806,13 +806,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             // id cannot briefly authorize its previous chat before this call publishes the new owner.
             forgetExecOwner(processId);
 
-            // POSIX startup files can replace childEnv's PATH (macOS path_helper does).
-            // Restore the shipped runtime after profiles, preserving their other PATH entries
-            // and explicit executable paths. Do this only after apply_patch interception: the
-            // parser must see the user's script, not an injected export statement.
-            const launchScript = ripgrep && ['zsh', 'bash', 'sh'].includes(shell.shellType)
-              ? `export PATH=${shlexJoin([nodePath.dirname(ripgrep)])}:"$PATH"\n${boundCommand}`
-              : boundCommand;
+            const executionCommand = deriveExecArgs(shell,
+              withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
             const output = await unifiedExecManager.execCommand({
               classifyExit: (exitCode, rawOutput) => {
                 if (!batch) return nonZeroExitIsBenign(boundCommand, exitCode, rawOutput);
@@ -822,7 +817,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
                   nonzero.every(section => nonZeroExitIsBenign(boundCommands[section.index - 1] ?? '', section.exitCode, section.text));
               },
               batchMarker: batch?.marker,
-              command: deriveExecArgs(shell, launchScript, useLoginShell),
+              command: executionCommand,
               shellType: shell.shellType,
               hookCommand: commandDetail,
               processId,

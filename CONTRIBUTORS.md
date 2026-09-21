@@ -91,7 +91,8 @@ Timer and maintenance expiry share one diagnostic and a bounded, non-replaying w
 [@okayamajwcc-coder](https://github.com/okayamajwcc-coder) / Masatoshi Shisaka contributed the
 Windows target-thread focus repair ([#308](https://github.com/totec448-spec/chat-on-steroids/pull/308)).
 It is adapted with cleanup covering attachment exceptions and the existing actual foreground
-checks. The separate macOS input-validation proposal in #309 is not incorporated by this review.
+checks. The September 19 review left the separate macOS input-validation proposal in #309 open;
+the September 20 review below incorporates only its contradictory-window-ID correction.
 
 The September 19 backlog integration also adapts [@Maximapple](https://github.com/Maximapple)'s
 reporting-gap correction in [#284](https://github.com/totec448-spec/chat-on-steroids/pull/284),
@@ -101,7 +102,40 @@ The wake adaptation rechecks command ownership, live message debt and cancellati
 marker diagnostics report commitment only after settlement. These adaptations retain the existing
 browser recovery and continuation owners.
 
+The September 20 selective review incorporates [@cXSHoz](https://github.com/cXSHoz)'s
+catalogued IPC-error toast translation from [#331](https://github.com/totec448-spec/chat-on-steroids/pull/331).
+It adapts [@Maximapple](https://github.com/Maximapple)'s stalled-connect shutdown diagnosis and
+drain protection from [#324](https://github.com/totec448-spec/chat-on-steroids/pull/324), using
+one shared teardown without the proposed grace timer or optional-connector policy change.
+It also incorporates [@okayamajwcc-coder](https://github.com/okayamajwcc-coder) / Masatoshi Shisaka's
+contradictory AX window-ID guard from [#309](https://github.com/totec448-spec/chat-on-steroids/pull/309).
+The larger off-Space/focus change remains unincorporated. Exact source revisions, validation,
+and public GitHub co-author trailers are recorded in
+[`docs/worklog-2026-09-20-selective-pr-review.md`](docs/worklog-2026-09-20-selective-pr-review.md).
+
 ## Reports, review and proposed work
+
+The September 20 connection and Skills integration incorporates
+[@K4viar](https://github.com/K4viar) / Lucas Pazini Pinha's approved, package-bounded Skills
+links from [#334](https://github.com/totec448-spec/chat-on-steroids/pull/334),
+[@Akilaydin](https://github.com/Akilaydin) / Artem Ovchinnikov's transactional browser bridge
+port selection from [#337](https://github.com/totec448-spec/chat-on-steroids/pull/337), and
+[@Kenmege](https://github.com/Kenmege) / Dr Kennedy Umege's concurrent browser pairing,
+compaction hydration and shell/tunnel identity corrections from
+[#340](https://github.com/totec448-spec/chat-on-steroids/pull/340).
+
+
+[@okayamajwcc-coder](https://github.com/okayamajwcc-coder) / Masatoshi Shisaka proposed
+Japanese support and offered to provide the translation in
+[#320](https://github.com/totec448-spec/chat-on-steroids/issues/320). Japanese is now available
+in Appearance. This acknowledges the proposal and offer without attributing translation code
+that was implemented separately.
+
+[@Maximapple](https://github.com/Maximapple)'s exit-hang report in
+[#325](https://github.com/totec448-spec/chat-on-steroids/pull/325) prompted an Electron 44.3.0
+source and isolated-process check. Its immediate `SIGKILL` chain is not incorporated:
+Electron maps `process.exit()` back to `app.exit()`, and returning from that call can precede
+a successful normal process exit. This credits the report without attributing an adopted fix.
 
 [@TomerGamerTV](https://github.com/TomerGamerTV)'s slow observation-journal report in
 [#301](https://github.com/totec448-spec/chat-on-steroids/issues/301) led to the independently

@@ -82,9 +82,9 @@ describe('cross-platform tunnel executable discovery', () => {
       await chmod(allowed, 0o755);
       resetTunnelLocatorCacheForTests();
 
-      // A non-executable explicit path is never honored: the fallback bundle wins.
-      expect(locateBinary('tunnel-client', blocked)).toBe(bundled);
-      expect(locateBinary('tunnel-client', blocked)).not.toBe(blocked);
+      // A non-executable explicit path is never honored or silently replaced by
+      // another executable identity, even when a valid bundled copy is available.
+      expect(locateBinary('tunnel-client', blocked)).toBeNull();
       // A valid explicit executable still overrides any bundle.
       expect(locateBinary('tunnel-client', allowed)).toBe(allowed);
     } finally {
