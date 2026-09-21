@@ -3104,6 +3104,16 @@ both ends of every changed protocol: app↔extension, content↔MAIN, main↔pre
 schema↔handler↔recorder and durable write↔restore. Run the nearest suites, adjacent boundary
 tests and `npm run verify` for production edits. Build/package when that layer can differ.
 
+**Upstream sync is the routine exception.** In this repository, a request such as “更新上游”,
+“合并上游” or equivalent normally means fetch the current upstream `main`, merge it into the
+local `main`, preserve local customizations, resolve conflicts, commit the integration and
+sync the user's fork when that is part of the established workflow. Do not run the full Vitest
+suite, `npm run verify`, `verify:ci` or other repository-wide validation for an upstream sync
+unless the user explicitly asks for it. Validate only the conflict/integration surfaces that
+actually changed, plus cheap structural checks such as `git diff --check`; run typecheck or a
+small targeted test set only when the resolved code makes those checks relevant. A broad
+upstream diff by itself is not a reason to escalate to full-suite testing.
+
 ```sh
 npm run dev
 npm run typecheck
