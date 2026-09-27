@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 const wake = vi.hoisted(() => vi.fn());
 vi.mock('../src/main/browser-wake.js', () => ({ wakeBrowserWork: wake }));
 import { initDurableStore, resetDurableForTests, readDurable, writeDurableNow } from '../src/main/durable.js';
-import { claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh, pendingPluginRefreshes, pluginRefreshPublications, publishPluginSurface, resetPluginRefreshForTests, unpublishPluginSurface } from '../src/main/plugin-refresh.js';
+import { PLUGIN_REFRESH_FAILURE_LIMIT, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh, pendingPluginRefreshes, pluginRefreshPublications, publishPluginSurface, rearmPluginRefresh, resetPluginRefreshForTests, unpublishPluginSurface } from '../src/main/plugin-refresh.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 import { buildServer } from '../src/main/mcp/tools.js';
 import { defaultConfig } from '../src/main/config.js';
@@ -49,6 +49,54 @@ it('wakes a settled publication restored after its deadline elapsed while discon
   expect(wake).toHaveBeenCalledTimes(2);
   expect((await pendingPluginRefreshes())[0]?.tools).toEqual(changed);
 });
+it('persists one explicit retry with a fresh id while retaining the exact pending schema', async () => {
+  publishPlugins(tools);
+  const first = (await pendingPluginRefreshes())[0]!;
+  await failPluginRefresh({ id: first.id, error: 'Helper was closed before discovery' });
+  expect(await rearmPluginRefresh('plugins')).toBe(true);
+  const next = (await pendingPluginRefreshes())[0]!;
+  expect(next.id).not.toBe(first.id);
+  expect(next.schemaId).toBe(first.schemaId);
+  expect(wake).toHaveBeenCalledTimes(2);
+  const proof = { appId, connectorName: 'Chat On Steroids Plugins', tools: [{ ...tools[0]!, description: 'Older declaration' }] };
+  expect(await claimPluginRefresh({ ...proof, id: first.id })).toBe(false);
+  resetPluginRefreshForTests();
+  publishPlugins(tools);
+  expect((await pendingPluginRefreshes())[0]?.id).toBe(next.id);
+  expect((await readDurable('plugin-refresh') as any[])[0].error).toBeUndefined();
+  expect(await claimPluginRefresh({ ...proof, id: next.id })).toBe(true);
+  expect(await rearmPluginRefresh('plugins')).toBe(false);
+});
+
+it.each(['missing', 'unpublished', 'changed', 'claimed', 'manual', 'completed'])('does not rearm %s refresh work', async state => {
+  if (state === 'missing') { expect(await rearmPluginRefresh('plugins')).toBe(false); return; }
+  publishPlugins(tools);
+  const request = (await pendingPluginRefreshes())[0]!;
+  const proof = { ...request, appId, connectorName: 'Chat On Steroids Plugins', tools: [{ ...tools[0]!, description: 'Older declaration' }] };
+  if (state === 'unpublished') unpublishPluginSurface('plugins');
+  if (state === 'changed') publishPlugins([{ ...tools[0]!, description: 'Changed publication' }]);
+  if (state === 'claimed' || state === 'completed') await claimPluginRefresh(proof);
+  if (state === 'manual') await requireManualPluginRefresh({ ...proof, error: 'Manual recreation required' });
+  if (state === 'completed') await completePluginRefresh({ ...request, appId, tools });
+  const before = await readDurable('plugin-refresh');
+  const wakes = wake.mock.calls.length;
+  expect(await rearmPluginRefresh('plugins')).toBe(false);
+  expect(await readDurable('plugin-refresh')).toEqual(before);
+  expect(wake).toHaveBeenCalledTimes(wakes);
+});
+
+it.each([false, true])('serializes explicit retry with the irreversible claim (retry first=%s)', async retryFirst => {
+  publish();
+  const first = (await pendingPluginRefreshes())[0]!;
+  const results = retryFirst
+    ? await Promise.all([rearmPluginRefresh('core'), claim(first)])
+    : await Promise.all([claim(first), rearmPluginRefresh('core')]);
+  expect(results).toEqual([true, false]);
+  const stored = (await readDurable('plugin-refresh') as any[])[0];
+  expect(stored.attempted).toBe(!retryFirst);
+  expect(stored.id === first.id).toBe(!retryFirst);
+});
+
 it('wakes existing browser transport once per changed publication, not unchanged settings', () => {
   publish(); expect(wake).toHaveBeenCalledTimes(1);
   publish(); publish(); expect(wake).toHaveBeenCalledTimes(1);
@@ -226,4 +274,21 @@ it('captures actual registered object schemas without executing handlers', async
   expect(observed.every(tool => tool.inputSchema.type === 'object')).toBe(true);
   expect(observed.some(tool => tool.name === 'computer')).toBe(false);
   await server.close();
+});
+it('parks a schema whose page keeps failing before any claim, until Restart', async () => {
+  // Measured 2026-09-26: on the newer ChatGPT shell every pre-claim attempt fails the same way,
+  // and an unbounded retry kept reopening the settings page for one request all day.
+  publishPlugins(tools);
+  let request = (await pendingPluginRefreshes())[0]!;
+  for (let attempt = 1; attempt < PLUGIN_REFRESH_FAILURE_LIMIT; attempt++) {
+    await failPluginRefresh({ id: request.id, error: 'The connector settings card could not be read' });
+    expect(await pendingPluginRefreshes()).toHaveLength(1);
+  }
+  await failPluginRefresh({ id: request.id, error: 'The connector settings card could not be read' });
+  expect(await pendingPluginRefreshes()).toEqual([]);
+  expect((await readDurable('plugin-refresh') as any[])[0]).toMatchObject({ parked: true, error: 'The connector settings card could not be read' });
+  expect(await rearmPluginRefresh('plugins')).toBe(true);
+  request = (await pendingPluginRefreshes())[0]!;
+  expect(request).toBeDefined();
+  expect((await readDurable('plugin-refresh') as any[])[0].failures).toBeUndefined();
 });

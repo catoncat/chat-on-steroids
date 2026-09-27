@@ -9,11 +9,21 @@ import type { PluginPublication, PluginRefreshRequest, PluginSurface, PluginTool
 
 const app = z.string().regex(/^asdk_app_[a-zA-Z0-9_-]{1,160}$/);
 const LEGACY_PLUGIN_MAX_TOOLS = 64;
-const rowSchema = z.object({ surface: z.enum(['core', 'desktop', 'plugins']), schemaId: z.string(), id: z.string().uuid(), appId: app.nullable(), completedSchemaId: z.string().nullable(), attempted: z.boolean(), manual: z.boolean().optional().default(false), error: z.string().max(200).optional(), versionId: z.string().max(200).optional() });
+const rowSchema = z.object({ surface: z.enum(['core', 'desktop', 'plugins']), schemaId: z.string(), id: z.string().uuid(), appId: app.nullable(), completedSchemaId: z.string().nullable(), attempted: z.boolean(), manual: z.boolean().optional().default(false), error: z.string().max(200).optional(), versionId: z.string().max(200).optional(), failures: z.number().int().nonnegative().optional(), parked: z.boolean().optional() });
 type Row = z.infer<typeof rowSchema>;
 const publications = new Map<PluginSurface, PluginPublication>();
 const settling = new Map<PluginSurface, { schemaId: string; readyAt: number; timer?: ReturnType<typeof setTimeout> }>();
 export const PLUGIN_REFRESH_DEBOUNCE_MS = 20_000;
+/**
+ * Pre-claim failures one schema may spend before automatic browser maintenance stops.
+ *
+ * A failure before the claim was treated as free to repeat, and on the newer ChatGPT shell it
+ * always repeats: the settings page has no card this build can read. Measured 2026-09-26, one
+ * request pending since 07:24 kept its helper page coming back, and every lost owner record
+ * (extension restart, reload that dropped the marker) opened another tab. Parking keeps the
+ * reason visible; a new schema or an explicit Restart tries again.
+ */
+export const PLUGIN_REFRESH_FAILURE_LIMIT = 3;
 let chain: Promise<unknown> = Promise.resolve();
 function serial<T>(work: () => Promise<T>): Promise<T> { const result = chain.then(work, work); chain = result.catch(() => undefined); return result; }
 async function rows(): Promise<Row[]> {
@@ -97,6 +107,22 @@ export function publishPluginSurface(surface: PluginSurface, connectorName: stri
 }
 export function unpublishPluginSurface(surface: PluginSurface): void { publications.delete(surface); }
 export function pluginRefreshPublications(): PluginPublication[] { return structuredClone([...publications.values()]); }
+/** One fresh browser attempt after an explicit Restart, only before any Refresh claim. */
+export function rearmPluginRefresh(surface: PluginSurface): Promise<boolean> {
+  return serial(async () => {
+    const current = await rows();
+    const publication = publications.get(surface);
+    const row = current.find(candidate => candidate.surface === surface);
+    if (!publication || !row || row.schemaId !== publication.schemaId || row.attempted || row.manual || row.completedSchemaId === row.schemaId) return false;
+    row.id = randomUUID();
+    delete row.error;
+    delete row.failures;
+    delete row.parked;
+    await writeDurableNow('plugin-refresh', current);
+    wakeBrowserWork();
+    return true;
+  });
+}
 /** App IDs are stable connector identities. The browser must prove current installation. */
 export function pendingPluginRefreshes(): Promise<PluginRefreshRequest[]> {
   return serial(async () => {
@@ -115,7 +141,7 @@ export function pendingPluginRefreshes(): Promise<PluginRefreshRequest[]> {
     }
     return current.flatMap(row => {
       const publication = publications.get(row.surface);
-      return publication && (settling.get(row.surface)?.readyAt ?? 0) <= Date.now() && publication.schemaId === row.schemaId && !row.attempted && !row.manual && row.completedSchemaId !== row.schemaId
+      return publication && (settling.get(row.surface)?.readyAt ?? 0) <= Date.now() && publication.schemaId === row.schemaId && !row.attempted && !row.manual && !row.parked && row.completedSchemaId !== row.schemaId
         ? [{ ...structuredClone(publication), id: row.id, appId: row.appId }] : [];
     });
   });
@@ -184,7 +210,13 @@ export function failPluginRefresh(input: { id: string; error: string }): Promise
     // Only claimPluginRefresh records an attempted click. Pre-claim failures remain
     // diagnostic errors, distinct from an ambiguous post-click outcome. Existing
     // maintenance may reobserve the same owned page until a claim actually succeeds.
-    row.error = input.error.slice(0, 200); await writeDurableNow('plugin-refresh', current); return true;
+    row.error = input.error.slice(0, 200);
+    row.failures = (row.failures ?? 0) + 1;
+    if (row.failures >= PLUGIN_REFRESH_FAILURE_LIMIT && !row.parked) {
+      row.parked = true;
+      logWarn(`plugin refresh parked surface=${row.surface} after ${row.failures} failed attempts: ${row.error}`);
+    }
+    await writeDurableNow('plugin-refresh', current); return true;
   });
 }
 export function resetPluginRefreshForTests(): void { for (const row of settling.values()) if (row.timer) clearTimeout(row.timer); settling.clear(); publications.clear(); chain = Promise.resolve(); }
