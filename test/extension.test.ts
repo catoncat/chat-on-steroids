@@ -88,6 +88,14 @@ describe('extension release metadata', () => {
     expect(code).not.toMatch(/JSON\.stringify/);
   });
 
+  it('does not identify the provider Plugins panel by its localized tab label', async () => {
+    const source = await fs.readFile(path.join(process.cwd(), 'extension', 'fiber.js'), 'utf8');
+    expect(source).not.toContain('-trigger-Plugins');
+    expect(source).toContain("^#settings\\/Plugins\\/plugin_");
+    expect(source).toContain("document.querySelectorAll('[role=\"tabpanel\"]')");
+    expect(source).toContain("props.connector?.id !== route[1]");
+  });
+
   /**
    * The installed popup showed "Paired · port 8765" with a green dot and, underneath it,
    * a six-digit code field and a Pair button — a page contradicting itself about the one
@@ -612,6 +620,7 @@ function loadWorker(options: {
     clearTimeout,
     URL,
     TextEncoder,
+    crypto: globalThis.crypto,
     console
   }, { filename: 'background.js' });
   if (!listener) throw new Error('background.js did not register a message listener');
@@ -855,6 +864,29 @@ describe('accepted helper tab cleanup', () => {
       else expect(worker.tabsRemove).not.toHaveBeenCalled();
     });
   }
+});
+
+describe('browser identity', () => {
+  it('sends one stable random browser id with every app request', async () => {
+    const seen: string[] = [];
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const worker = loadWorker({
+      local, session: new FakeStorageArea(),
+      fetch: async (input, init = {}) => {
+        const headers = (init.headers ?? {}) as Record<string, string>;
+        if (new URL(input).pathname !== '/hello') seen.push(headers['x-extension-browser'] ?? '');
+        return new URL(input).pathname === '/hello'
+          ? response(200, { app: 'chat-on-steroids', paired: true })
+          : response(200, { ok: true });
+      }
+    });
+    await worker.fireAlarm();
+    await worker.fireAlarm();
+    expect(seen.length).toBeGreaterThanOrEqual(2);
+    expect(seen[0]).toMatch(/^[0-9a-f]{32}$/);
+    expect(new Set(seen).size).toBe(1);
+    expect((await local.get(['browserId'])).browserId).toBe(seen[0]);
+  });
 });
 
 describe('automatic Continue shares scheduled reload custody', () => {
@@ -1520,7 +1552,106 @@ describe('active agent tab discard protection', () => {
 });
 
 describe('app-owned retained tab pool', () => {
+  it('keeps a later manual close queued when an older automatic close response arrives', async () => {
+    const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-000000000071';
+    let release!: () => void;
+    const first = new Promise<void>(resolve => { release = resolve; });
+    const bodies: Array<{ manual: boolean }> = [];
+    const code = backgroundSource.slice(backgroundSource.indexOf('async function enqueueClose('),
+      backgroundSource.indexOf('\n/**\n * Removes one tab'));
+    const outbox = vm.runInNewContext(`${code}\n({enqueueClose, drainCloses})`, {
+      cleanConversationId: (id: string) => id, recoveryMonitoring: false,
+      closeOutbox: [], closing: false, token: 'paired',
+      load: async () => undefined, persistLive: async () => undefined,
+      scheduleRetry: () => undefined, clearRetryIfIdle: () => undefined,
+      conversationStillOpen: () => false,
+      call: async (_route: string, init: { body: string }) => {
+        bodies.push(JSON.parse(init.body));
+        if (bodies.length === 1) await first;
+        return { ok: true };
+      }
+    });
+    await outbox.enqueueClose(conversationId, true);
+    const draining = outbox.drainCloses();
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+    await outbox.enqueueClose(conversationId, false);
+    release();
+    expect(await draining).toMatchObject({ pending: 1 });
+    expect(await outbox.drainCloses()).toMatchObject({ pending: 0 });
+    expect(bodies).toEqual([{ conversationId, manual: false }, { conversationId, manual: true }]);
+  });
+
   const id = (n: number) => `aaaaaaaa-bbbb-4ccc-8ddd-${String(n).padStart(12, '0')}`;
+  it.each(['same-worker', 'restart', 'early-event', 'rejected', 'replacement', 'navigation', 'retry-close', 'duplicate', 'manual-after-reopen'])(
+    'preserves the proven origin of a pruned tab close: %s', async scenario => {
+      const conversationId = id(71);
+      const tab = { id: 71, windowId: 7, url: `https://chatgpt.com/c/${conversationId}`, active: false };
+      const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+      const session = new FakeStorageArea();
+      let exists = true, prune = true, closeOnline = !['retry-close', 'manual-after-reopen'].includes(scenario);
+      const closes: Array<{ conversationId: string; manual: boolean }> = [];
+      const options = { local, session,
+        fetch: async (input: string, init: Record<string, unknown> = {}) => {
+          const route = new URL(input).pathname;
+          if (route === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+          if (route === '/closed') {
+            closes.push(JSON.parse(String(init.body)));
+            return response(closeOnline ? 200 : 503, {});
+          }
+          return response(200, { ok: true, repairs: [], managedConversations: [conversationId],
+            closableConversations: prune ? [conversationId] : [] });
+        },
+        tabsQuery: async () => exists ? [tab] : [],
+        tabsGet: async () => { if (!exists) throw Error('Tab gone'); return tab; },
+        tabsSendMessage: async () => ({ safe: true, conversationId, navigationEpoch: 0 })
+      };
+      let worker = loadWorker(options);
+      await worker.send({ type: 'bind', conversationId }, 71);
+      worker.tabsRemove.mockImplementation(async () => {
+        if (scenario === 'rejected') throw Error('Removal refused');
+        exists = false;
+        if (scenario === 'early-event') await worker.closeTab(71);
+      });
+      await worker.fireAlarm();
+      expect(worker.tabsRemove).toHaveBeenCalledWith(71);
+      prune = false;
+      if (scenario === 'restart') worker = loadWorker(options);
+      if (scenario === 'replacement') {
+        exists = true;
+        await worker.registerTab(71, 'replacement-document');
+        await worker.send({ type: 'bind', conversationId }, 71, 'replacement-document');
+      }
+      if (scenario === 'navigation') {
+        exists = true;
+        await worker.send({ type: 'bind', conversationId, navigationEpoch: 1 }, 71);
+      }
+      if (scenario === 'duplicate') await worker.send({ type: 'bind', conversationId }, 72);
+      if (scenario !== 'early-event') { exists = false; await worker.closeTab(71); }
+      if (scenario === 'duplicate') {
+        expect(closes).toEqual([]);
+        await worker.closeTab(72); // The user's last remaining copy still owns the departure.
+      }
+      await vi.waitFor(() => expect(closes.length).toBeGreaterThan(0));
+      const manual = ['rejected', 'replacement', 'navigation', 'duplicate'].includes(scenario);
+      expect(closes[0]).toEqual({ conversationId, manual });
+      if (scenario === 'manual-after-reopen') {
+        exists = true;
+        await worker.send({ type: 'bind', conversationId }, 72);
+        closeOnline = true;
+        exists = false;
+        await worker.closeTab(72);
+        await vi.waitFor(() => expect(closes.at(-1)).toEqual({ conversationId, manual: true }));
+      }
+      if (scenario === 'retry-close') {
+        closeOnline = true;
+        worker = loadWorker(options);
+        await worker.fireAlarm();
+        expect(closes.at(-1)).toEqual({ conversationId, manual: false });
+        expect(session.data.closeOutbox).toEqual([]);
+      }
+      expect(worker.tabsCreate).not.toHaveBeenCalled();
+    });
+
   async function budget(options: { safe?: (tab: number) => boolean; changed?: number; keep?: number; recent?: number; protectDuplicate?: boolean; reverseActivity?: boolean; retired?: boolean; idle?: boolean; ordinary?: number; pinned?: number } = {}) {
     const tabs = [1, 2, 3, 4, 5, 6].map(n => ({ id: n, windowId: n === 5 ? 9 : 7, url: `https://chatgpt.com/c/${id(n === 4 ? 3 : n)}`, active: n === 5, pinned: n === options.pinned, lastAccessed: n === options.recent ? Date.now() : 0 }));
     const worker = loadWorker({
@@ -2098,9 +2229,11 @@ describe('extension command delivery', () => {
       url: ['https://chatgpt.com/*', 'https://chat.openai.com/*']
     });
     expect(worker.scriptingExecuteScript.mock.calls).toEqual([
+      [{ target: { tabId: 41 }, files: ['i18n.js'] }],
       [{ target: { tabId: 41 }, files: ['chatgpt-dom.js'] }],
       [{ target: { tabId: 41 }, world: 'MAIN', files: ['usage.js', 'fiber.js'] }],
       [{ target: { tabId: 41 }, files: ['content.js'] }],
+      [{ target: { tabId: 42 }, files: ['i18n.js'] }],
       [{ target: { tabId: 42 }, files: ['chatgpt-dom.js'] }],
       [{ target: { tabId: 42 }, world: 'MAIN', files: ['usage.js', 'fiber.js'] }],
       [{ target: { tabId: 42 }, files: ['content.js'] }]
@@ -2201,6 +2334,7 @@ describe('extension command delivery', () => {
     expect(repaired).toMatchObject({ ok: true });
     const target = { tabId: 73, documentIds: ['document-73-0'] };
     expect(worker.scriptingExecuteScript.mock.calls).toEqual([
+      [{ target, files: ['i18n.js'] }],
       [{ target, files: ['chatgpt-dom.js'] }],
       [{ target, world: 'MAIN', files: ['usage.js', 'fiber.js'] }],
       [{ target, files: ['content.js'] }]
@@ -2270,6 +2404,39 @@ describe('extension command delivery', () => {
     expect(seen.find((call) => call.path === '/commands/redeem')?.auth).toBe('Bearer fresh-token');
     // Nothing anywhere asked for a code.
     expect(fetch.mock.calls.some(([, init]) => String((init as any)?.body ?? '').includes('code'))).toBe(false);
+  });
+
+  it('pairs on its own after a fresh load, without the popup or a ChatGPT page (#568)', async () => {
+    // Remove + Load unpacked gives the extension a new id with empty storage. Nothing but the
+    // popup or page traffic used to reach /pair, so the worker sat idle and never connected.
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const paths: string[] = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      paths.push(url.pathname);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', bridge: 14, paired: true });
+      if (url.pathname === '/pair') return response(200, { token: 'fresh-start-token' });
+      return response(200, {});
+    });
+    loadWorker({ local, session, fetch });
+    await vi.waitFor(() => expect(local.data.token).toBe('fresh-start-token'), { timeout: 5_000 });
+    expect(paths).toContain('/pair');
+  });
+
+  it('does not pair on its own after the user disconnected it', async () => {
+    const local = new FakeStorageArea({ port: 8765, disconnected: true });
+    const session = new FakeStorageArea();
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', bridge: 14, paired: false });
+      if (url.pathname === '/pair') return response(200, { token: 'unwanted-token' });
+      return response(200, {});
+    });
+    loadWorker({ local, session, fetch });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(fetch.mock.calls.some(([input]) => new URL(String(input)).pathname === '/pair')).toBe(false);
+    expect(local.data.token).toBeUndefined();
   });
 
   it('re-provisions once when the app no longer recognises the stored token', async () => {
@@ -4082,11 +4249,15 @@ describe('extension connection', () => {
     const reply = await worker.send({
       type: 'correlate',
       conversationId,
+      agent: 'worker-3',
+      agentCommandId: 'command-worker-3',
       calls: [{ messageId: 'request-message', tool: 'exec_command', order: 0, answered: false, requestId }]
     });
 
     expect(body).toMatchObject({
       conversationId,
+      agent: 'worker-3',
+      agentCommandId: 'command-worker-3',
       calls: [expect.objectContaining({ requestId, messageId: 'request-message' })]
     });
     expect(reply).toMatchObject({
@@ -4423,7 +4594,7 @@ it.each(['matching', 'wrong-document', 'unsafe-draft', 'newer-navigation', 'pinn
   });
   const code = backgroundSource.slice(backgroundSource.indexOf('async function pruneManagedTabs('), backgroundSource.indexOf('\nfunction maintain(', backgroundSource.indexOf('async function pruneManagedTabs(')));
   const prune = vm.runInNewContext(`${code}\npruneManagedTabs`, {
-    setTimeout, clearTimeout, Promise,
+    serializeTab: (_id: number, run: () => Promise<unknown>) => run(), tabRemovals: {}, persistLive: async () => undefined,
     cleanConversationId: (id: string) => id, conversationForTab: () => conversationId,
     conversationFromUrl: (url: string) => url.split('/c/')[1], tabDocuments: { '71': scenario === 'wrong-document' ? 'replacement' : 'doc' },
     tabEpochs: { '71': 0 }, ownsDocument: () => true, journalCountForConversation: () => 0,
@@ -4468,6 +4639,7 @@ it.each(['idle', 'selected', 'selected-before-proof', 'selected-during-proof', '
   const code = backgroundSource.slice(backgroundSource.indexOf('async function pruneManagedTabs('), backgroundSource.indexOf('\nfunction maintain(', backgroundSource.indexOf('async function pruneManagedTabs(')));
   let probed = false;
   const prune = vm.runInNewContext(`${code}\npruneManagedTabs`, {
+    serializeTab: (_id: number, run: () => Promise<unknown>) => run(), tabRemovals: {}, persistLive: async () => undefined,
     cleanConversationId: (id: string) => id, conversationForTab: () => conversationId,
     conversationFromUrl: (url: string) => url.split('/c/')[1], tabDocuments: { '71': 'doc' },
     tabEpochs: { '71': 0 }, ownsDocument: () => true,
@@ -4512,6 +4684,7 @@ it.each([
   const code = backgroundSource.slice(backgroundSource.indexOf('async function pruneManagedTabs('),
     backgroundSource.indexOf('\nfunction maintain(', backgroundSource.indexOf('async function pruneManagedTabs(')));
   const prune = vm.runInNewContext(`${code}\npruneManagedTabs`, {
+    serializeTab: (_id: number, run: () => Promise<unknown>) => run(), tabRemovals: {}, persistLive: async () => undefined,
     Date: { now: () => now },
     cleanConversationId: (id: string) => id, conversationForTab: () => conversationId,
     conversationFromUrl: (url: string) => url.split('/c/')[1], tabDocuments: { '71': 'doc' },

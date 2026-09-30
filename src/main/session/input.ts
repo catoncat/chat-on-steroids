@@ -102,6 +102,13 @@ const STATE = 'session-input';
 const TOOL_INPUT_TEXT_BYTES = 128000;
 /** A confirmed send receipt lands in seconds. This only bounds one that is never reported. */
 const UNCERTAIN_SEND_MS = 15 * 60_000;
+/**
+ * The same bound for the sends the one above leaves in custody: an automatic Continue, a new
+ * chat's first message and a combined delivery. Their own paths normally settle them in seconds
+ * to minutes. Measured 2026-09-27, seven such rows had waited in `browser` for up to ten days;
+ * each kept its chat protected and told the extension an input was still in flight.
+ */
+const ABANDONED_SEND_MS = 6 * 60 * 60_000;
 export const TOOL_INPUT_HEADER = '\n--- New instructions from the user ---\n';
 export interface ToolInputBatch {
   messages: Array<{ text: string; images: InputImage[] }>;
@@ -234,6 +241,27 @@ let chain: Promise<unknown> = Promise.resolve();
 // available. Restart discards this evidence and repeats the stable message id.
 const offered = new Map<string, number>();
 const terminal = (row: InputEntry): boolean => ['sent', 'cancelled', 'failed'].includes(row.state);
+/** Native Send was never authorized: the row was not claimed, or its claim still awaited authorization. */
+const neverAuthorized = (row: InputEntry): boolean => row.sendAuthorizedAt === undefined &&
+  (row.offeredAt === undefined || row.requiresAuthorization === true);
+
+export type DeliveryProof = 'sent' | 'not_sent' | 'unconfirmed' | 'pending';
+/**
+ * What the row itself proves about delivery, and nothing more. `sent` needs the receipt
+ * (`deliveredAt`, which a late ACK can add to a row already cancelled). `not_sent` needs a
+ * terminal row whose Send was never authorized. Any other terminal row, and any claim whose
+ * Send was authorized or whose tool result was handed out, may have reached ChatGPT, so it is
+ * `unconfirmed` and is never resent. Turn ids on the row (`completedTurnId`, `queuedTurn`,
+ * `silenceBoundary`, `directTurn`) name the source turn, not the message, and prove nothing.
+ */
+export function deliveryProof(row: Readonly<InputEntry>): DeliveryProof {
+  if (row.deliveredAt !== undefined) return 'sent';
+  // `sent` says the page or the exact request confirmed it, so a row with that state and no
+  // receipt is a gap in the record, not proof that nothing was sent.
+  if (row.state === 'sent') return 'unconfirmed';
+  if (terminal(row)) return neverAuthorized(row) ? 'not_sent' : 'unconfirmed';
+  return row.state === 'queued' || (row.state === 'browser' && neverAuthorized(row)) ? 'pending' : 'unconfirmed';
+}
 const preparable = (row: InputEntry): boolean => row.state === 'queued' ||
   (row.state === 'browser' && row.requiresAuthorization === true && row.sendAuthorizedAt === undefined);
 const needsHistory = (row: InputEntry): boolean => row.purpose !== 'decision' && !row.historyRecorded &&
@@ -457,6 +485,8 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
     if (row.state === 'browser' && row.sendAuthorizedAt !== undefined && !row.recovery && !row.opening &&
         !row.companionInputId && manualInput(row) && Date.now() - row.sendAuthorizedAt >= UNCERTAIN_SEND_MS)
       return { ...row, state: 'cancelled', error: 'Stopped waiting for delivery confirmation. The message may already have been sent; it will not be resent.' };
+    if (row.state === 'browser' && row.sendAuthorizedAt !== undefined && Date.now() - row.sendAuthorizedAt >= ABANDONED_SEND_MS)
+      return { ...row, state: 'cancelled', error: 'Stopped waiting for delivery confirmation. The message may already have been sent; it will not be resent.' };
     return row;
   }));
   for (let i = 0; i < next.length; i++) {
@@ -621,8 +651,7 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     // An explicit reviewed resend may replace a proven pre-send failure in the same
     // local chat. An ambiguous native Send still owns its receipt; never replay it.
     const retryOpening = !!(input.sessionId && requestedSession?.origin?.kind === 'desktop' && !requestedSession.conversationId &&
-      previousOpening && terminal(previousOpening) && previousOpening.sendAuthorizedAt === undefined &&
-      (previousOpening.offeredAt === undefined || previousOpening.requiresAuthorization === true));
+      previousOpening && terminal(previousOpening) && neverAuthorized(previousOpening));
     const requestedMode = input.mode;
     let toolImages: InputImage[] | undefined;
     let injectionOwner: { conversationId: string; turnId: string } | undefined;
@@ -775,8 +804,7 @@ export function cancelInput(id: string): Promise<boolean> {
 async function removeWithdrawnOpening(row: InputEntry, current: InputEntry[]): Promise<void> {
   if (!row.opening || !row.sessionId || row.state !== 'cancelled' ||
       !(row.cancelledByUser || row.error === 'Not sent: this delivery was cancelled before Send was authorized.') ||
-      row.sendAuthorizedAt !== undefined || row.deliveredAt !== undefined || row.messageId || row.conversationId ||
-      (row.offeredAt !== undefined && row.requiresAuthorization !== true) ||
+      !neverAuthorized(row) || row.deliveredAt !== undefined || row.messageId || row.conversationId ||
       current.some(other => other.id !== row.id && other.sessionId === row.sessionId && !terminal(other))) return;
   const session = await getSession(row.sessionId);
   if (!session || session.origin?.kind !== 'desktop' || session.conversationId || session.chatIds?.length !== 0 || session.events !== 0) return;
@@ -1600,8 +1628,8 @@ export async function publishBrowserDecision(id: string, owner: string, conversa
 }
 export async function requestBrowserDecision(text: string, signal: AbortSignal, options: {
   lifetime?: 'temporary-planner';
-  sourceSessionId?: string; conversationId?: string | null; model?: string;
-  reasoningEffort?: InputArgs['reasoningEffort'];
+  sourceSessionId?: string; conversationId?: string | null; model?: string | null;
+  reasoningEffort?: InputArgs['reasoningEffort'] | null;
   publish?: (text: string) => void;
 } = {}): Promise<string> {
   if (!text.trim() || text.length > MAX_CHATGPT_MESSAGE_CHARS) throw new Error('goal_context_too_large');
@@ -1627,7 +1655,9 @@ export async function requestBrowserDecision(text: string, signal: AbortSignal, 
         throw new Error('goal_browser_send_unconfirmed');
       }
       const entry = entrySchema.parse({ id, sessionId: null, text, mode: 'after-turn', dueAt: Date.now(),
-        model: options.model ?? 'gpt-5.6-sol', reasoningEffort: options.reasoningEffort ?? 'high',
+        // null means ChatGPT's current selection; only an omitted value gets the historical default.
+        model: options.model === undefined ? 'gpt-5.6-sol' : options.model,
+        reasoningEffort: options.reasoningEffort === undefined ? 'high' : options.reasoningEffort,
         decisionSourceSessionId: options.sourceSessionId, lifetime: options.lifetime, purpose: 'decision', state: 'queued', owner: null,
         createdAt: Date.now(), conversationId: options.conversationId ?? null });
       await commit(append(current, entry));

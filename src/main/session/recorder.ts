@@ -69,6 +69,7 @@ import {
 } from './store.js';
 import {
   awaitRequestCorrelation,
+  commitRequestCorrelations,
   observeRequestCorrelations,
   requestCorrelation,
   resetCorrelationRegistryForTests,
@@ -130,6 +131,10 @@ interface ProgressRecord {
   contentSeq?: number;
 }
 
+/** Exact per-call edit review: at most this many files, each and all together bounded. */
+const MAX_REVIEW_FILES = 32;
+const MAX_REVIEW_BYTES = 512 * 1024;
+const MAX_REVIEW_CALL_BYTES = 2 * 1024 * 1024;
 const conversations = new Map<string, LiveConversation>();
 /** One full first-sight initialization per ChatGPT conversation at a time. */
 const sessionInitializations = new Map<string, Promise<string | null>>();
@@ -783,7 +788,7 @@ function noteCallEvidence(
   fiberConversationId: string | null | undefined,
   calls: readonly PageCallEvidence[],
   at: number
-): void {
+): boolean {
   if (fiberConversationId && fiberConversationId !== conversationId) {
     // Name the discarded ids. Without them this line says a batch was dropped but not
     // *which* calls it cost, so a chat whose every call lands in Unattributed activity
@@ -796,7 +801,7 @@ function noteCallEvidence(
         `with Fiber conversation ${fiberConversationId}. Later agreeing evidence can still prove these calls.` +
         (dropped.length > 0 ? ` Discarded request ids: ${dropped.join(', ')}.` : '')
     );
-    return;
+    return false;
   }
   const observedAt = Math.min(at, Date.now());
   const evidencedCalls = calls.filter((call): call is PageCallEvidence & { requestId: string } => !!call.requestId);
@@ -816,6 +821,7 @@ function noteCallEvidence(
     }))
   );
   const refusals = new Set<string>();
+  let stored = false;
   for (const [index, call] of evidencedCalls.entries()) {
     const result = results[index]!;
     if (result === 'refused') {
@@ -831,10 +837,12 @@ function noteCallEvidence(
         );
       }
     } else if (result === 'stored') {
+      stored = true;
       logInfo(`request attribution: ${call.requestId} -> conversation ${conversationId}`);
       scheduleAttributionRepair(call.requestId);
     }
   }
+  return stored;
 }
 
 /**
@@ -959,6 +967,7 @@ export async function repairDeterministicAttribution(affected?: ReadonlySet<stri
         for (const { event } of group) {
           if (event.call.args.assetId) assets.set(event.call.args.assetId, 'text/plain');
           if (event.call.result.assetId) assets.set(event.call.result.assetId, 'text/plain');
+          for (const change of event.call.changes ?? []) if (change.reviewAssetId) assets.set(change.reviewAssetId, 'text/plain');
           for (const asset of event.call.assets ?? []) assets.set(asset.id, asset.mimeType);
         }
         for (const [assetId, mimeType] of assets) {
@@ -1379,6 +1388,34 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       if (summary.tone !== 'bad') summary.tone = 'warn';
     }
 
+    // Review belongs to the exact applied operation, not HEAD or the file's later state.
+    // Keep source out of the JSONL row and cap retained snapshots at the recorder owner.
+    const changes = evidence.changes.map(change => ({ ...change }));
+    if (input.outcome === 'ok') {
+      let reviewBytes = 0;
+      evidence.reviews.forEach((review, position) => {
+        const change = changes[review.changeIndex];
+        if (change) change.reviewUnavailable = position < MAX_REVIEW_FILES ? undefined : 'not-kept';
+      });
+      for (const review of evidence.reviews.slice(0, MAX_REVIEW_FILES)) {
+        const change = changes[review.changeIndex];
+        if (!change) continue;
+        const bytes = Buffer.from(JSON.stringify({ before: review.before, after: review.after }), 'utf8');
+        if (bytes.length > MAX_REVIEW_BYTES) { change.reviewUnavailable = 'too-large'; continue; }
+        if (reviewBytes + bytes.length > MAX_REVIEW_CALL_BYTES) { change.reviewUnavailable = 'not-kept'; continue; }
+        try {
+          const asset = await writeAsset(sessionId, bytes, 'text/plain');
+          change.reviewAssetId = asset.id;
+          delete change.reviewUnavailable;
+          reviewBytes += bytes.length;
+        } catch {
+          // A recording quota must not turn a successful file edit into a failed tool call.
+          change.reviewUnavailable = 'not-kept';
+        }
+      }
+      for (const change of changes) if (change.reviewUnavailable === undefined) delete change.reviewUnavailable;
+    }
+
     const call: ToolCallRecord = {
       ...(input.nested === true ? { nested: true } : {}),
       ...(target.attribution === 'request_id' && target.conversationId && evidence.processCompletion && evidence.processSessionId && input.tool === 'exec_command'
@@ -1400,7 +1437,7 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       outcome: input.outcome,
       durationMs: input.durationMs,
       summary,
-      ...(evidence.changes.length > 0 ? { changes: evidence.changes } : {}),
+      ...(changes.length > 0 ? { changes } : {}),
       ...(assets.length > 0 ? { assets } : {}),
       ...(input.endsActivity === true ? { endsActivity: true as const } : {})
     };
@@ -1719,6 +1756,8 @@ export interface ChatObservation {
   messageId?: string;
   /** Raw public provider message UUID, retained as evidence, never used to guess ownership. */
   providerMessageId?: string;
+  /** Server-reported model of an assistant reply; see SessionEvent.resolvedModel. */
+  resolvedModel?: string;
   /** Exact non-secret provider asset id for a native generated image. */
   providerAssetId?: string;
   providerRole?: 'tool' | 'assistant';
@@ -1937,11 +1976,13 @@ export async function recordRequestEvidence(
   if (!sessionId) return null;
   // Proof identifies even a retired caller; kernel/recorder attachment checks then refuse it
   // as superseded. Never turn an exact historical owner into anonymous executable authority.
+  let storedOwner = false;
   for (const item of observations) {
     if (item.kind === 'tool_evidence' && item.calls?.length) {
-      noteCallEvidence(conversationId, sessionId, item.fiberConversationId, item.calls, item.time);
+      storedOwner = noteCallEvidence(conversationId, sessionId, item.fiberConversationId, item.calls, item.time) || storedOwner;
     }
   }
+  if (storedOwner) await commitRequestCorrelations();
   return sessionId;
 }
 
@@ -2027,6 +2068,7 @@ async function recordSupersededMessages(
           message: await storeText(sessionId, item.text ?? '', MAX_USER_MESSAGE_CHARS),
           ...(item.attachments?.length ? { attachments: item.attachments } : {}),
           ...(item.reaction !== undefined ? { reaction: item.reaction } : {}),
+          ...(item.model ? { model: item.model } : {}),
           messageId: item.messageId
         },
         { preferTime: item.authoredTime === true, work: false }
@@ -2045,6 +2087,7 @@ async function recordSupersededMessages(
           messageId: item.messageId,
           state,
           ...(item.providerMessageId ? { providerMessageId: item.providerMessageId } : {}),
+          ...(item.resolvedModel ? { resolvedModel: item.resolvedModel } : {}),
           final: state === 'final'
         },
         { preferTime: item.authoredTime === true }
@@ -2138,6 +2181,7 @@ async function recordChatObservationsNow(
           message: await storeText(sessionId, item.text ?? '', MAX_USER_MESSAGE_CHARS),
           ...(item.attachments?.length ? { attachments: item.attachments } : {}),
           ...(item.reaction !== undefined ? { reaction: item.reaction } : {}),
+          ...(item.model ? { model: item.model } : {}),
           messageId: item.messageId
         }, { preferTime: item.authoredTime === true, work: item.authoredNow === true });
         if (!written.changed) continue;
@@ -2191,6 +2235,7 @@ async function recordChatObservationsNow(
           state,
           final: state === 'final',
           ...(item.providerMessageId ? { providerMessageId: item.providerMessageId } : {}),
+          ...(item.resolvedModel ? { resolvedModel: item.resolvedModel } : {}),
           ...(goalEligible && state === 'final' ? { goalEligible: true } : {})
         }, { preferTime: item.authoredTime === true, work: item.activeNow === true });
         const canonicalTurn = written.event.turnId;
@@ -2366,6 +2411,7 @@ async function recordChatObservationsNow(
           ...base,
           kind: 'turn_end',
           outcome: item.outcome ?? 'unknown',
+          ...(item.outcome === 'completed' && item.providerMessageId ? { providerMessageId: item.providerMessageId } : {}),
           ...(item.outcome === 'failed' && item.reason === 'thinking_failed' ? { reason: item.reason } : {}),
           ...(item.detail ? { detail: item.detail } : {})
         });

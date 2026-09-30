@@ -27,6 +27,41 @@ afterAll(() => {
 });
 
 describe('captured ChatGPT rendered HTML', () => {
+  it('renders ChatGPT\'s writing block as a titled quote instead of its raw directive', () => {
+    const rendered = renderedMarkdown(':::writing{variant="standard" id="58321" title="Clear <rewrite>"}\nWe want the app to be **faster**.\n:::\n\nAfter the block.');
+    const quote = rendered.querySelector('blockquote')!;
+    expect(quote.querySelector('strong')?.textContent).toBe('Clear <rewrite>');
+    expect(quote.textContent).toContain('We want the app to be faster.');
+    expect(quote.querySelectorAll('strong')).toHaveLength(2);
+    expect(rendered.textContent).not.toContain(':::');
+    expect(rendered.textContent).toContain('After the block.');
+    // An unterminated directive is left as text rather than swallowing the rest of the message.
+    expect(renderedMarkdown(':::writing{title="x"}\nno end').textContent).toContain(':::writing');
+  });
+
+  it('shows the page\'s resolved content for a content-reference reply instead of the raw pointer (#574)', () => {
+    const pointer = '::chatgpt-content-reference{index="0" source_message_id="d2b82e00-509e-4a87-aa93-00bcde251680"}';
+    // The page resolved the pointer: its capture is this message's faithful presentation.
+    const resolved = renderedMarkdown(pointer, whole('<p>Hi! How can I help you today?</p>'));
+    expect(resolved.textContent?.trim()).toBe('Hi! How can I help you today?');
+    expect(resolved.textContent).not.toContain('chatgpt-content-reference');
+    // Without a usable capture the pointer is dropped, and an otherwise empty reply says why.
+    expect(renderedMarkdown(pointer).textContent?.trim()).toBe('This reply points to content from another message that was not recorded.');
+    expect(renderedMarkdown(pointer, whole(`<p>${pointer}</p>`)).textContent).not.toContain('chatgpt-content-reference');
+    expect(renderedMarkdown(`Before\n${pointer}\nAfter`).textContent).toMatch(/Before[\s\S]*After/);
+    expect(renderedMarkdown(`Before\n${pointer}\nAfter`).textContent).not.toContain('chatgpt-content-reference');
+    // Quoted inside code it is text, not a pointer.
+    expect(renderedMarkdown(`Use \`${pointer}\` in docs.`).textContent).toContain('chatgpt-content-reference');
+  });
+
+  it('never shows an unknown ChatGPT directive as raw text', () => {
+    const leaf = '::chatgpt-entity{type="place" id="42"}';
+    expect(renderedMarkdown(leaf, whole('<p>Berlin</p>')).textContent?.trim()).toBe('Berlin');
+    expect(renderedMarkdown(`Intro\n${leaf}`).textContent).not.toContain('::chatgpt-entity');
+    expect(renderedMarkdown(':::canvas{title="Plan"}\nStep one\n:::').textContent).toContain('Step one');
+    expect(renderedMarkdown(':::canvas{title="Plan"}\nStep one\n:::').textContent).not.toContain(':::');
+  });
+
   it('renders the recorded native URL token as its authored label and opens it through validated IPC', () => {
     const openLink = vi.fn(async () => ({ ok: true, data: true }));
     (dom.window as any).api.openLink = openLink;
@@ -70,6 +105,23 @@ describe('captured ChatGPT rendered HTML', () => {
     const stale = renderedMarkdown(source, whole(capture.text.replace('Evidence.', 'Different.')));
     expect(stale.querySelector('a')).toBeNull();
     expect(stale.textContent).toContain('[source link unavailable]');
+  });
+  it('recovers a later hydrated occurrence when the same citation marker appears twice', () => {
+    const marker = '\uE200cite\uE202turn-repeat-search0\uE201';
+    const firstPrefix = 'First claim. ';
+    const middle = ' Later claim. ';
+    const secondStart = [...firstPrefix + marker + middle].length;
+    const source = firstPrefix + marker + middle + marker;
+    const capture = whole(
+      `<p>${firstPrefix}<span data-content-reference-start="${[...firstPrefix].length}" data-content-reference-end="${[...firstPrefix].length + [...marker].length}"></span>` +
+      `${middle}<span data-content-reference-start="${secondStart}" data-content-reference-end="${secondStart + [...marker].length}">` +
+      '<a href="https://example.com/later">Later source</a></span></p>'
+    );
+    const rendered = renderedMarkdown(source, capture);
+    expect([...rendered.querySelectorAll('a')].map(anchor => anchor.getAttribute('href'))).toEqual([
+      'https://example.com/later',
+      'https://example.com/later'
+    ]);
   });
   it('shows exact uploaded-file citation names as text and omits missing or stale file references', () => {
     const marker = '\uE200filecite\uE202turn0file0\uE201';
@@ -193,8 +245,10 @@ describe('a capture that could not be carried whole', () => {
     // The prose either side of the block is prose, not part of the box.
     const paragraphs = [...rendered.querySelectorAll('p')].map((node) => node.textContent);
     expect(paragraphs).toEqual(['Run the suite before pushing.', 'Then open a pull request.']);
-    expect(rendered.querySelector('button')).toBeNull();
-    expect(rendered.textContent).not.toContain('Copy');
+    expect(rendered.querySelectorAll('button')).toHaveLength(1);
+    expect(rendered.querySelector('.markdown-code .tool-output-header')?.textContent).toContain('Code');
+    expect(rendered.querySelector('.markdown-code .tool-copy')?.textContent).toBe('Copy');
+    expect(rendered.textContent).not.toContain('Edit');
   });
 
   it('shows the whole message as markdown rather than a cut capture ending inside a code box', () => {

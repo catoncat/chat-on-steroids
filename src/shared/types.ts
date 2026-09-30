@@ -145,6 +145,8 @@ export interface UiPrefs {
   finishAction?: 'notify' | 'goal';
   finishLeadMinutes?: number;
   developerMode?: boolean;
+  /** Rotating joke words instead of "Working" in a chat's status line. Off by default. */
+  playfulStatus?: boolean;
   minimizeToTray: boolean;
   autoConnect: boolean;
   startAtLogin?: boolean;
@@ -321,6 +323,17 @@ export interface McpSettings {
   instructions: string;
 }
 
+/** The opt-in local control API for an agent watching this app (`src/main/control-api.ts`). */
+export interface ControlApiSettings {
+  /** Serve the loopback API and write its token to userData. Off unless the user turns it on. */
+  enabled: boolean;
+  /**
+   * Also let a caller with the token send and cancel messages through the outbox. Off unless the
+   * user turns it on, and never on while `enabled` is off: turning the API off revokes it.
+   */
+  allowActions: boolean;
+}
+
 export interface Config {
   /** Inactive setups only. Keys remain in encrypted secret slots addressed by profile ID. */
   setupProfiles?: Array<{ id: string; name: string; tunnelId: string; desktopTunnelId: string; pluginsTunnelId: string }>;
@@ -335,6 +348,7 @@ export interface Config {
   commandAllowlist: CommandAllowlistSettings;
   goal: GoalSettings;
   mcp: McpSettings;
+  controlApi: ControlApiSettings;
 }
 
 export type ConnectionState =
@@ -651,6 +665,12 @@ export function browserExtensionRequired(_config: Pick<Config, 'sessions' | 'mul
 export interface AppState {
   config: Config;
   status: ConnectionStatus;
+  /**
+   * Exact declaration fingerprints for connectors currently published by the local MCP server.
+   * Missing entries mean that surface is not published right now. These hashes describe the
+   * local contract only; they are not evidence that ChatGPT has refreshed its cached tools.
+   */
+  connectorSchemas: Partial<Record<SurfaceId, string>>;
   platform: PlatformInfo;
   /** Only packaged Windows builds may change the login item. */
   loginStartupAvailable?: boolean;

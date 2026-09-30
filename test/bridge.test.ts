@@ -61,6 +61,7 @@ const {
   pendingCommands,
   queueResume,
   resetBridgeForTests,
+  unattributedIncidentsSettledForTests,
   restoreCommands,
   resumeJobFor,
   setBrowserOpener,
@@ -105,6 +106,7 @@ const { completeProcessCall, createSession, deleteSession, findSessionByConversa
 );
 const sessionStoreModule = await import('../src/main/session/store.js');
 const { closeConversation, liveConversations, noteChatOrigin, recordChatObservations, recordProgress, recordToolCall, REQUEST_ID_GRACE_MS, resetRecorderForTests } = await import('../src/main/session/recorder.js');
+const { requestCorrelation, resetCorrelationRegistryForTests, restoreRequestCorrelations } = await import('../src/main/session/correlation.js');
 const { resetBlockedChatsForTests, setChatBlocked } = await import('../src/main/session/blocked-chats.js');
 const {
   CONTINUATIONS_STATE,
@@ -243,7 +245,7 @@ interface Reply {
 function request(
   method: string,
   path: string,
-  options: { body?: unknown; origin?: string | null; auth?: string | null; raw?: string; extensionVersion?: string; protocol?: number; extensionBuild?: string } = {}
+  options: { body?: unknown; origin?: string | null; auth?: string | null; raw?: string; extensionVersion?: string; protocol?: number; extensionBuild?: string; browser?: string } = {}
 ): Promise<Reply> {
   const url = new URL(path, base);
   const payload = options.raw ?? (options.body === undefined ? null : JSON.stringify(options.body));
@@ -254,6 +256,7 @@ function request(
   headers['x-extension-version'] = options.extensionVersion ?? APP_VERSION;
   headers['x-extension-protocol'] = String(options.protocol ?? BRIDGE_PROTOCOL);
   if (options.extensionBuild) headers['x-extension-build'] = options.extensionBuild;
+  if (options.browser) headers['x-extension-browser'] = options.browser;
   if (payload !== null) {
     headers['content-type'] = 'application/json';
     headers['content-length'] = String(Buffer.byteLength(payload));
@@ -487,6 +490,14 @@ describe('who is allowed to talk to it', () => {
     expect(await companionDiagnostics()).toBeNull();
   });
 
+  it('answers unknown rather than incompatible to a /hello without a protocol header (#568)', async () => {
+    // A plain curl in a bug report read "compatible": false and pointed everyone the wrong way.
+    const plain = await fetch(`${base}/hello`);
+    expect((await plain.json()).compatible).toBeNull();
+    const extension = await request('GET', '/hello', { auth: null });
+    expect(extension.body.compatible).toBe(true);
+  });
+
   it('pushes newly detected incompatible extension versions without granting browser presence', async () => {
     const changed = vi.fn();
     const unsubscribe = onBridgeChange(changed);
@@ -551,6 +562,7 @@ describe('who is allowed to talk to it', () => {
     expect(reply.status).toBe(204);
     expect(reply.headers['access-control-allow-origin']).toBe(EXTENSION_ORIGIN);
     expect(reply.headers['access-control-allow-private-network']).toBe('true');
+    expect(reply.headers['access-control-allow-headers']).toContain('x-extension-build');
   });
 
   it('refuses a preflight that arrives without an Origin', async () => {
@@ -1251,6 +1263,7 @@ describe('activity feed', () => {
       requestId,
       evidence: {
         changes: [],
+        reviews: [],
         assets: [],
         count: null,
         detail: null,
@@ -1271,6 +1284,40 @@ describe('activity feed', () => {
       attributionMethod: 'request_id'
     });
   });
+  it('hands a new chat to one browser only while that browser keeps polling', async () => {
+    // Live 2026-09-29: with the extension in two browsers, one opened the elected tab and left it
+    // blank while an idle tab in the other browser typed and sent the same opening message.
+    await pair();
+    const input = await import('../src/main/session/input.js');
+    input.resetInputForTests();
+    await writeDurableNow('session-input', []);
+    const first = 'a'.repeat(32), second = 'b'.repeat(32);
+    const id = randomUUID();
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      await input.enqueueInput({ id, sessionId: null, text: 'Open one chat', mode: 'auto', dueAt: now, model: null, reasoningEffort: null });
+      const offered = async (browser?: string) => ((await request('POST', '/status', { body: { openConversations: [] }, browser })).body.inputs as Array<{ id: string }>)
+        .some(row => row.id === id);
+      expect(await offered(first)).toBe(true);
+      expect(await offered(second)).toBe(false);
+      expect((await request('POST', '/input/claim', { body: { id, owner: '9:other-browser:0', conversationId: null }, browser: second })).body.input).toBeNull();
+      expect(await offered(first)).toBe(true);
+      // An older extension without an id is not told apart, as before.
+      expect(await offered()).toBe(true);
+      // The first browser went away: the other one may take the opening over.
+      now += 61_000;
+      expect(await offered(second)).toBe(true);
+      now += 1_000;
+      expect(await offered(first)).toBe(false);
+      expect((await request('POST', '/input/claim', { body: { id, owner: '9:other-browser:0', conversationId: null }, browser: second })).body.input)
+        .toMatchObject({ id });
+    } finally {
+      clock.mockRestore();
+      input.resetInputForTests();
+      await writeDurableNow('session-input', []);
+    }
+  });
+
   it('keeps bind, first correlation and ACK on the reserved opening session', async () => {
     await pair();
     const input = await import('../src/main/session/input.js');
@@ -1376,6 +1423,27 @@ describe('activity feed', () => {
     expect(mapped.body).toMatchObject({ ok: true, conversationId, confirmed: [requestId], complete: true });
   });
 
+  it('restores a stream origin with no native message id after an app restart', async () => {
+    await pair();
+    const conversationId = '19191919-4141-6363-8585-979797979797';
+    const requestId = '41111111-2222-4333-8444-555555555555';
+    const mapped = await request('POST', '/correlations', {
+      body: { conversationId, calls: [{ messageId: null, requestId, createTime: Date.now() / 1000 }] }
+    });
+    expect(mapped.status).toBe(200);
+    expect(mapped.body.confirmed).toContain(requestId);
+    await flushDurable();
+
+    resetCorrelationRegistryForTests();
+    expect(requestCorrelation(requestId)).toBeNull();
+    await restoreRequestCorrelations();
+
+    expect(requestCorrelation(requestId)).toMatchObject({
+      conversationId,
+      messageId: `stream:${requestId}`
+    });
+  });
+
   /**
    * Two stream origins in one batch are two ids, not one duplicate. Dedup keys on the message
    * when there is one and on the request id when there is not; keying both on an absent message
@@ -1443,6 +1511,7 @@ describe('activity feed', () => {
       requestId,
       evidence: {
         changes: [],
+        reviews: [],
         assets: [],
         count: null,
         detail: null,
@@ -1490,6 +1559,33 @@ describe('activity feed', () => {
     expect(messages.find((row: any) => row.providerMessageId === providers[1])).toMatchObject({ messageId: ids[1] });
   });
 
+  it('records the send-request model on a user message and drops a malformed one', async () => {
+    await pair();
+    const conversationId = '99999999-8888-7777-6666-555555555553';
+    const result = await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'user_message', messageId: 'user-a', time: Date.now(), text: 'A', model: 'gpt-5-6-thinking' },
+      { kind: 'user_message', messageId: 'user-b', time: Date.now(), text: 'B', model: 'gpt 6 <b>' }
+    ] } });
+    const users = await readEvents(result.body.sessionId, { kinds: ['user_message'] });
+    expect(Object.fromEntries(users.map(event => [event.kind === 'user_message' && event.messageId, event.model])))
+      .toEqual({ 'user-a': 'gpt-5-6-thinking', 'user-b': undefined });
+  });
+
+  it('records the server-resolved reply model, keeps it across sparse updates and drops malformed values', async () => {
+    await pair();
+    const conversationId = '99999999-8888-7777-6666-555555555552';
+    const result = await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'assistant_message', messageId: 'reply-a', time: Date.now(), text: 'A', state: 'streaming', resolvedModel: 'gpt-5-6-thinking' },
+      { kind: 'assistant_message', messageId: 'reply-b', time: Date.now(), text: 'B', state: 'streaming', resolvedModel: 'gpt-6 <b>pro</b>' }
+    ] } });
+    await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'assistant_message', messageId: 'reply-a', time: Date.now(), text: 'A final', state: 'final' }
+    ] } });
+    const replies = await readEvents(result.body.sessionId, { kinds: ['assistant_message'] });
+    const model = Object.fromEntries(replies.map(event => [event.kind === 'assistant_message' && event.messageId, event.kind === 'assistant_message' ? event.resolvedModel : null]));
+    expect(model).toEqual({ 'reply-a': 'gpt-5-6-thinking', 'reply-b': undefined });
+  });
+
   it('hands back an app-owned render stream plus legacy tool summaries, with no raw tool I/O', async () => {
     await pair();
     const conversationId = '99999999-8888-7777-6666-555555555555';
@@ -1513,6 +1609,7 @@ describe('activity feed', () => {
       conversationId,
       evidence: {
         changes: [{ path: '/project/src/main.ts', added: 18, removed: 4, approximate: false }],
+        reviews: [],
         assets: [],
         count: null,
         detail: null,
@@ -1727,7 +1824,7 @@ describe('activity feed', () => {
         tool: 'exec_command', args: { command: `fixture-${outcome}` },
         content: [{ type: 'text', text: `result-${outcome}` }], outcome, durationMs: 3,
         startedAt: Date.now(), requestId: `wfr_enum_${outcome}`, conversationId,
-        evidence: { changes: [], assets: [], count: null, detail: null,
+        evidence: { changes: [], reviews: [], assets: [], count: null, detail: null,
           exitCode: outcome === 'process_exit_nonzero' ? 4 : null, timedOut: false,
           durationMs: null, running: null, processSessionId: null }
       });
@@ -2355,6 +2452,41 @@ describe('automatic compaction', () => {
           if (scenario === 'blocked') setChatBlocked(conversationId, false);
         }
       });
+    });
+
+  it.each(['image-first', 'end-first', 'missing-proof', 'wrong-image', 'stopped', 'unfinished-image'] as const)(
+    'releases input only for the exact completed native image (%s)', async scenario => {
+      await pair();
+      const conversationId = randomUUID(), messageId = randomUUID();
+      const opened = await request('POST', '/events', { body: { conversationId, events: [
+        { kind: 'user_message', time: Date.now(), messageId: randomUUID(), text: 'Generate an image.' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'image-turn' }
+      ] } });
+      const sessionId = opened.body.sessionId;
+      const image = { kind: 'native_image', time: Date.now(), turnId: 'image-turn', messageId,
+        providerAssetId: 'file_1234567890abcdef', providerRole: 'tool', providerChannel: 'final',
+        providerStatus: scenario === 'unfinished-image' ? 'in_progress' : 'finished_successfully', previewStatus: 'pending' };
+      const end = { kind: 'turn_end', time: Date.now(), turnId: 'image-turn',
+        outcome: scenario === 'stopped' ? 'stopped' : 'completed',
+        ...(scenario !== 'missing-proof' ? { providerMessageId: scenario === 'wrong-image' ? randomUUID() : messageId } : {}) };
+      const batch = async (event: unknown) => request('POST', '/events', { body: { conversationId, events: [event] } });
+      await batch(scenario === 'end-first' ? end : image);
+      expect(await sessionStoreModule.readCompletedFinal(sessionId, conversationId)).toBeNull();
+      await batch(scenario === 'end-first' ? image : end);
+      const complete = scenario === 'image-first' || scenario === 'end-first';
+      expect(!!await sessionStoreModule.readCompletedFinal(sessionId, conversationId)).toBe(complete);
+      const { sessionInputActivity } = await import('../src/main/bridge.js');
+      const { sessionInputPolicy } = await import('../src/main/session/input.js');
+      if (complete) {
+        const activity = sessionInputActivity((await getSession(sessionId))!);
+        expect(activity).toMatchObject({ possible: false, exact: false });
+        expect(await sessionInputPolicy(sessionId, activity)).toMatchObject({ browserAllowed: true, settled: true });
+      }
+      await request('POST', '/events', { body: { conversationId, events: [
+        { kind: 'user_message', time: Date.now(), messageId: randomUUID(), text: 'New question.' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'new-turn' }
+      ] } });
+      expect(await sessionStoreModule.readCompletedFinal(sessionId, conversationId)).toBeNull();
     });
 
   it.each(['expired', 'clock-back', 'auto-off', 'rebound'] as const)(
@@ -3643,6 +3775,105 @@ describe('delivering a bootstrap', () => {
     expect(worker.conversationId).toBe(conversationId);
     expect(pendingCommands()).toEqual([]);
     expect(pendingWorkerSpawns()).toEqual([]);
+  });
+
+  it('binds a fresh worker from exact early request correlation before its delayed command acknowledgement', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'report through agents as soon as the first tool call begins' }], caller: { conversationId: PRIME_CHAT } });
+    const command = await redeem(undefined, 'early-correlation-worker-page');
+    const conversationId = 'acacacac-3456-7890-abcd-ef1234567890';
+    const correlate = (agentCommandId: string, requestId: string) => request('POST', '/correlations', {
+      body: {
+        conversationId,
+        agent: 'worker-1',
+        agentCommandId,
+        calls: [{ requestId, messageId: null, tool: 'exec_command', order: 0, answered: false }]
+      }
+    });
+
+    const stale = await correlate('not-the-leased-command', 'f0f00001-1111-4111-8111-111111111111');
+    expect(stale.status).toBe(200);
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'invited',
+      conversationId: null
+    });
+
+    const exact = await correlate(command.id, 'f0f00002-1111-4111-8111-111111111111');
+    expect(exact.status).toBe(200);
+    expect(exact.body).toMatchObject({ conversationId, confirmed: ['f0f00002-1111-4111-8111-111111111111'] });
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'active',
+      conversationId
+    });
+  });
+
+  it('recovers the exact leased worker command if a crash loses an early correlation binding before ACK', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'survive the early-correlation crash window' }], caller: { conversationId: PRIME_CHAT } });
+    const command = await redeem(undefined, 'early-correlation-crash-page');
+    const conversationId = 'abababab-3456-7890-abcd-ef1234567890';
+
+    // Model the durable state immediately before the new fast path: the worker invitation and
+    // exact claimed browser command are already on disk, but the worker conversation is not.
+    expect(await persistCriticalSwarmNow()).toBe(true);
+    const invitedSwarm = await readDurable<any>('swarm');
+    expect(invitedSwarm).not.toBeNull();
+    expect((await readDurable<any>('bridge-commands'))?.commands).toContainEqual(expect.objectContaining({
+      id: command.id,
+      phase: 'leased',
+      owner: 'early-correlation-crash-page'
+    }));
+
+    const first = await request('POST', '/correlations', {
+      body: {
+        conversationId,
+        agent: 'worker-1',
+        agentCommandId: command.id,
+        calls: [{ requestId: 'f0f00004-1111-4111-8111-111111111111', messageId: null }]
+      }
+    });
+    expect(first.status).toBe(200);
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'active',
+      conversationId
+    });
+
+    // Crash before the debounced swarm write. The safe side is the old invited snapshot plus
+    // the still-leased exact command; restart must therefore be able to bind the same slot again
+    // instead of needing a guessed run/worker fallback.
+    restoreSwarm(invitedSwarm);
+    resetBridgeForTests();
+    await restoreCommands();
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'invited',
+      conversationId: null
+    });
+    expect(pendingCommands()).toContainEqual(expect.objectContaining({ id: command.id }));
+
+    const retry = await request('POST', '/correlations', {
+      body: {
+        conversationId,
+        agent: 'worker-1',
+        agentCommandId: command.id,
+        calls: [{ requestId: 'f0f00005-1111-4111-8111-111111111111', messageId: null }]
+      }
+    });
+    expect(retry.status).toBe(200);
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      state: 'active',
+      conversationId
+    });
+
+    const ack = await request('POST', '/commands/ack', {
+      body: {
+        id: command.id,
+        status: 'sent',
+        conversationId,
+        client: 'early-correlation-crash-page'
+      }
+    });
+    expect(ack.status).toBe(200);
+    expect(pendingCommands().some((entry) => entry.id === command.id)).toBe(false);
   });
 
   it('keeps the worker command durable until the worker binding itself crosses its crash barrier', async () => {
@@ -6718,9 +6949,15 @@ describe('unattributed activity recovery', () => {
     } finally { await writeDurableNow('session-input', []); input.resetInputForTests(); vi.useRealTimers(); }
   });
 
-  /** A finished call whose request id the page never confirmed. Files under Unattributed. */
-  function unattributed(requestId?: string): Promise<unknown> {
-    return recordToolCall({
+  /**
+   * A finished call whose request id the page never confirmed. Files under Unattributed.
+   *
+   * Resolves only after the incident it opened has read its candidates from disk and armed its
+   * due timer. Fake-clock steps do not wait for that real read; on a slow runner the clock could
+   * otherwise pass the due time before the timer existed, and nothing would ever fire it.
+   */
+  async function unattributed(requestId?: string): Promise<unknown> {
+    const recorded = await recordToolCall({
       tool: 'read',
       args: { paths: ['/project/whoever.ts'] },
       content: [{ type: 'text', text: 'ok' }],
@@ -6729,6 +6966,8 @@ describe('unattributed activity recovery', () => {
       startedAt: Date.now(),
       ...(requestId ? { requestId } : {})
     });
+    await unattributedIncidentsSettledForTests();
+    return recorded;
   }
 
   /** An unattributed call that names its server turn: the recorder waits out the evidence grace first. */
@@ -7362,7 +7601,8 @@ describe('unattributed activity recovery', () => {
       await pair(); await events(PRIME, [openTurn(`claim-${kind}`)]);
       const id = `claim-request-${kind}`;
       await unattributedTurn(id); await vi.advanceTimersByTimeAsync(15_000);
-      const first = await maintenance(); expect(first?.reason).toBe('unattributed');
+      const first = await maintenance();
+      expect(first?.reason).toBe('unattributed');
       await vi.advanceTimersByTimeAsync(1);
       if (kind === 'mcp') await attributed(PRIME, false, Date.now());
       if (kind === 'completed' || kind === 'stopped') await events(PRIME, [endTurn(`claim-${kind}`, kind)]);
@@ -10594,17 +10834,17 @@ describe('unattributed activity recovery', () => {
     expect(await maintenance()).toMatchObject({ conversationId: SOLO, reason: 'no-tab' });
   });
 
-  it('reopens an ordinary chat that uses this connector the moment its last tab closes mid-turn', async () => {
+  it.each([undefined, false, true])('recovers an owned mid-turn departure only without manual dismissal (manual=%s)', async manual => {
     const SOLO = 'b2b2b2b2-1111-2222-3333-444444444444';
     await pair();
     await events(SOLO, [openTurn('turn-solo-closed')]);
     // One proved call is what makes this chat the app's business at all.
     await attributed(SOLO);
 
-    await request('POST', '/closed', { body: { conversationId: SOLO } });
+    await request('POST', '/closed', { body: { conversationId: SOLO, manual } });
 
     // Nothing is waited out: the close itself is the evidence.
-    expect(chatOf(await maintenance())).toBe(SOLO);
+    expect(chatOf(await maintenance())).toBe(manual === true ? null : SOLO);
   });
 
   /**
@@ -13084,6 +13324,7 @@ describe('the goal loop over the bridge', () => {
       expect(opened.body).toEqual({
         error: 'rate_limited: Provider returned error',
         message: 'The continuation provider is rate-limiting requests. Wait for the displayed retry, or choose another continuation model.',
+        messageKey: 'rate_limited',
         retryable: true
       });
     } finally {
@@ -13502,6 +13743,8 @@ describe('which extension build is running', () => {
     expect(said('b1b1b1b1b1b1') - before.a).toBe(1);
     expect(warned('b1b1b1b1b1b1') - before.w, 'the stale build is named once').toBe(1);
     expect(warned(SHIPPED), 'the shipped build is never called stale').toBe(0);
+    // Expected after every app update and followed by the self-update: information, not a problem.
+    expect(getLog().filter(entry => entry.message.includes('running extension build b1b1b1b1b1b1')).map(entry => entry.level)).toEqual(['info']);
   });
 
   it('refuses work to an out-of-date companion only while an up-to-date one is present', async () => {

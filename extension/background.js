@@ -178,6 +178,8 @@ const journalPreferences = new Set();
 let delivery = { at: 0, ok: null, events: 0, total: 0, conversationId: null, status: 0, error: null };
 /** Idempotent conversation-close deliveries awaiting an app ACK. */
 let closeOutbox = [];
+/** Successful managed removals awaiting onRemoved; exact document receipts survive MV3 sleep. */
+let tabRemovals = {};
 let closing = false;
 /**
  * Command acknowledgements accepted from a content script but not yet accepted by the app.
@@ -261,8 +263,15 @@ function load() {
 }
 
 async function loadOnce() {
-  const stored = await chrome.storage.local.get(['port', 'token', 'disconnected', 'deferredRevivals', 'commandAckOutbox', 'inputOpenings', 'desktopInputTabs', 'stopOpenings']);
+  const stored = await chrome.storage.local.get(['port', 'token', 'disconnected', 'deferredRevivals', 'commandAckOutbox', 'inputOpenings', 'desktopInputTabs', 'stopOpenings', 'browserId']);
   port = typeof stored.port === 'number' ? stored.port : null;
+  // Tells this browser apart from another one paired with the same app, so a new chat is opened
+  // and sent in one browser only. Random, local, and never tied to the profile or the user.
+  browserId = typeof stored.browserId === 'string' && /^[a-z0-9]{16,64}$/.test(stored.browserId) ? stored.browserId : '';
+  if (!browserId && typeof globalThis.crypto?.getRandomValues === 'function') {
+    browserId = [...globalThis.crypto.getRandomValues(new Uint8Array(16))].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    await chrome.storage.local.set({ browserId });
+  }
   token = typeof stored.token === 'string' ? stored.token : null;
   // Deliberately in `local` rather than `session`: a choice to disconnect that a browser
   // restart undoes is not a choice, it is a delay.
@@ -285,6 +294,7 @@ async function loadOnce() {
     'retiredDocuments',
     'terminalDocuments',
     'closeOutbox',
+    'tabRemovals',
     'commandAckOutbox',
     'recoveryMonitoring',
     'discardProtectedTabs',
@@ -303,6 +313,12 @@ async function loadOnce() {
   terminalDocuments =
     live.terminalDocuments && typeof live.terminalDocuments === 'object' ? { ...live.terminalDocuments } : {};
   closeOutbox = Array.isArray(live.closeOutbox) ? live.closeOutbox.slice(-200) : [];
+  tabRemovals = Object.fromEntries(Object.entries(
+    live.tabRemovals && typeof live.tabRemovals === 'object' && !Array.isArray(live.tabRemovals) ? live.tabRemovals : {}
+  ).filter(([key, row]) => row && String(row.tab) === key && Number.isInteger(row.tab) &&
+    typeof row.documentId === 'string' && row.documentId === tabDocuments[key] &&
+    Number.isSafeInteger(row.navigationEpoch) && row.navigationEpoch === tabEpochs[key] &&
+    cleanConversationId(row.conversationId) === tabConversations[key]).slice(-1000));
   // Browser-close durability: a send already accepted by ChatGPT is irreversible. Its final ACK
   // therefore has to survive storage.session being cleared on browser restart. Prefer the local
   // copy, while still accepting the old session copy as an upgrade migration path.
@@ -344,6 +360,7 @@ function persistLive() {
         retiredDocuments,
         terminalDocuments,
         closeOutbox: closeOutbox.slice(-200),
+        tabRemovals,
         commandAckOutbox: commandAckOutbox.slice(-200),
         recoveryMonitoring,
         discardProtectedTabs,
@@ -918,6 +935,9 @@ function retryWanted() {
   // prime sat unopened for good because nothing here thought it had a reason to ask.
   return (
     token !== null ||
+    // An unpaired worker has no other reason to wake up and ask. After a fresh Load unpacked
+    // (new extension id, empty storage) it used to sit idle until someone opened the popup (#568).
+    !disconnected ||
     journal.length > 0 ||
     closeOutbox.length > 0 ||
     commandAckOutbox.length > 0 ||
@@ -977,6 +997,7 @@ async function hello(candidate) {
  * fetch. A checkout that was never packaged has no stamp and sends no header.
  */
 let workerStampValue = '';
+let browserId = '';
 const workerStampReady = (async () => {
   try {
     const stamped = await (await fetch(chrome.runtime.getURL('build-stamp.txt'))).text();
@@ -997,7 +1018,8 @@ function versionHeaders() {
   return {
     'x-extension-version': version,
     'x-extension-protocol': String(BRIDGE_PROTOCOL),
-    ...(workerStampValue ? { 'x-extension-build': workerStampValue } : {})
+    ...(workerStampValue ? { 'x-extension-build': workerStampValue } : {}),
+    ...(browserId ? { 'x-extension-browser': browserId } : {})
   };
 }
 
@@ -1968,8 +1990,10 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
       try {
         const proof = await tabReply(tab.id, { type: 'clf-close-temporary-planner', id: input.id, owner: input.owner }, { documentId });
         const current = await chrome.tabs.get(tab.id);
-        if (proof?.safe === true && ownsDocument(source) && !current.pinned && !current.pendingUrl && new URL(current.url).searchParams.get('cos-input') === input.id &&
-            new URL(current.url).searchParams.get('temporary-chat') === 'true') await chrome.tabs.remove(tab.id);
+        const currentUrl = new URL(current.url);
+        const helperUrl = currentUrl.searchParams.get('temporary-chat') === 'true' &&
+          (currentUrl.searchParams.get('cos-input') === input.id || /^\/c\/[0-9a-f-]{36}$/i.test(currentUrl.pathname));
+        if (proof?.safe === true && ownsDocument(source) && !current.pinned && !current.pendingUrl && helperUrl) await chrome.tabs.remove(tab.id);
       } catch { /* only the exact still-owned temporary document may close */ }
       continue;
     }
@@ -2151,7 +2175,7 @@ async function releaseModelCatalogTarget(nonce) {
  */
 function pluginSettingsRoute(url) {
   return url.origin === 'https://chatgpt.com' && (
-    ((url.pathname === '/' || url.pathname === '/plugins') && /^#settings\/Plugins(?:\/plugin_asdk_app_[a-zA-Z0-9_-]+)?$/.test(url.hash)) ||
+    (url.pathname === '/' && /^#settings\/Plugins(?:\/plugin_asdk_app_[a-zA-Z0-9_-]+)?$/.test(url.hash)) ||
     /^\/(?:settings\/plugins-settings(?:\/plugin_asdk_app_[a-zA-Z0-9_-]+)?|plugins\/plugin_asdk_app_[a-zA-Z0-9_-]+)$/.test(url.pathname));
 }
 function pluginRefreshMarker(tab) {
@@ -2194,7 +2218,11 @@ function inspectRequestedPluginRefresh(publications, background, browserOnly = f
     if (!held) {
       if (browserOnly) return;
       try {
-        const tab = await createChatTab(`https://chatgpt.com/plugins?cos-plugin-refresh=${request.id}#settings/Plugins${request.appId ? `/plugin_${request.appId}` : ''}`, background);
+        const tab = await createChatTab(request.appId
+          // The old hash still redirects to the app's page on the newer shell; without an App Id
+          // it now lands on the home page, so the installed list is opened by its own path.
+          ? `https://chatgpt.com/?cos-plugin-refresh=${request.id}#settings/Plugins/plugin_${request.appId}`
+          : `https://chatgpt.com/settings/plugins-settings?cos-plugin-refresh=${request.id}`, background);
         await chrome.storage.session.set({ pluginRefreshOwner: { id: request.id, tab: tab.id } });
       }
       catch {
@@ -2421,8 +2449,6 @@ async function applyRequestedBrowserPreferences(request) {
 }
 
 /** Retire idle app-owned documents and redundant copies, preserving exact unsent drafts. */
-/** Tabs this extension removed itself, until their onRemoved reports the close. */
-const selfRemovedTabs = new Set();
 
 async function pruneManagedTabs(tabs, policy, protectedChats, closable) {
   const retired = new Set((Array.isArray(policy.retiredConversations) ? policy.retiredConversations : []).map(cleanConversationId).filter(Boolean));
@@ -2470,20 +2496,43 @@ async function pruneManagedTabs(tabs, policy, protectedChats, closable) {
       const proof = await tabReply(tab.id, { type: 'clf-tab-close-check', conversationId,
         ...(cancelledDecisions.length ? { cancelledDecisions } : {}) }, { documentId: source.documentId });
       if (proof?.safe !== true || proof.conversationId !== conversationId || proof.navigationEpoch !== source.navigationEpoch || !ownsDocument(source)) continue;
-      const latest = await chrome.tabs.get(tab.id);
-      if (latest.pinned || (idlePage && reading(latest)) || latest.pendingUrl || conversationFromUrl(latest.url) !== conversationId || !ownsDocument(source) || journalCountForConversation(conversationId) > 0) continue;
-
       // Tidying is this extension's decision, not the user's: report it as such, so the app does
       // not pause the chat's recovery as if its owner had closed it (2026-09-26: a stopped prime
       // was pruned four times and each close read as "closed deliberately", which blocked its
       // automatic restart for good).
-      const own = typeof selfRemovedTabs === 'undefined' ? null : selfRemovedTabs;
-      own?.add(tab.id);
-      try { await chrome.tabs.remove(tab.id); } catch (error) { own?.delete(tab.id); throw error; }
-      remaining = remaining.filter(other => other.id !== tab.id);
+      // Queue onRemoved behind the actual API result (the Internal host may emit it
+      // before remove resolves). An attempted/rejected removal is not origin proof.
+      const removed = await serializeTab(tab.id, async () => {
+        const latest = await chrome.tabs.get(tab.id);
+        if (latest.pinned || (idlePage && reading(latest)) || latest.pendingUrl || conversationFromUrl(latest.url) !== conversationId || !ownsDocument(source) || journalCountForConversation(conversationId) > 0) return false;
+        await chrome.tabs.remove(tab.id);
+        tabRemovals[String(tab.id)] = { ...source, conversationId };
+        tabRemovals = Object.fromEntries(Object.entries(tabRemovals).slice(-1000));
+        await persistLive();
+        return true;
+      });
+      if (removed) remaining = remaining.filter(other => other.id !== tab.id);
     } catch { /* Missing document, navigation or unreadable draft state is not close permission. */ }
   }
   return remaining;
+}
+
+/**
+ * Pairs a worker that has no token yet, unless the user disconnected it on purpose.
+ *
+ * Nothing else pairs on its own: `/pair` used to run only from the popup or from a request a
+ * ChatGPT page triggered. A freshly loaded extension (new id, empty storage) therefore stayed
+ * unpaired until someone opened the popup (#568). Once paired, the open ChatGPT pages get their
+ * recorders back, since they had nothing to report to until now.
+ */
+async function ensurePaired() {
+  if (token !== null || disconnected) return false;
+  const result = await provision();
+  if (!result || !result.ok) return false;
+  // Attach the wake channel now rather than on the next 30-second maintenance pass.
+  try { connectWakeSocket(); } catch { /* The next maintenance pass attaches it. */ }
+  await restoreOpenChatgptTabs().catch(() => undefined);
+  return true;
 }
 
 function maintain(woken = false) {
@@ -2496,10 +2545,51 @@ function maintain(woken = false) {
   return maintenanceFlight;
 }
 
+/**
+ * Reloads this extension into the newer build the app ships, when nothing would be cut off.
+ *
+ * Chrome keeps running the old service worker after the folder changes, so an app update used to
+ * leave every user on the old extension until they found Reload in chrome://extensions. The app
+ * now offers the newer build in `/status`; this waits until the app runs no tool call, no input
+ * or command is in flight and every ChatGPT page answers that it is idle, then has the app update
+ * the folder and reloads at once. `onInstalled` re-injects the open ChatGPT tabs afterwards.
+ * One attempt per (running build, offered build): an extension loaded from some other folder
+ * would come back as the same old build, and must not reload again and again.
+ */
+let extensionReloadPending = false;
+async function reloadForExtensionUpdate(offer, liveOpenings, liveCommands) {
+  if (extensionReloadPending || !offer || typeof offer.build !== 'string' || !/^[0-9a-f]{12}$/.test(offer.build)) return;
+  await workerStampReady;
+  if (!workerStampValue || workerStampValue === offer.build) return;
+  // A chat with an agent or an active Goal is usually just waiting; only running work counts.
+  if (offer.busy !== false || liveOpenings.size || liveCommands.size) return;
+  const attempt = `${workerStampValue}>${offer.build}`;
+  if ((await chrome.storage.local.get('extensionReloadAttempt')).extensionReloadAttempt === attempt) return;
+  for (const tab of await chrome.tabs.query({ url: CHATGPT_TAB_URLS })) {
+    if (!Number.isInteger(tab.id) || tab.discarded === true) continue;
+    const ping = await tabReply(tab.id, { type: 'clf-recorder-ping' }).catch(() => null);
+    // A page that cannot answer has nothing running here. One that answers without `busy` runs an
+    // older recorder that cannot say, so it is treated as busy.
+    if (ping && ping.busy !== false) return;
+  }
+  extensionReloadPending = true;
+  try {
+    const prepared = await call('/extension/update', { method: 'POST', body: '{}' });
+    if (!prepared.ok || prepared.data?.ready !== true || prepared.data.build !== offer.build) return;
+    await chrome.storage.local.set({ extensionReloadAttempt: attempt });
+    chrome.runtime.reload();
+  } finally {
+    extensionReloadPending = false;
+  }
+}
+
 async function maintainOnce() {
   // The app decides whether there is recovery work; a worker holding no tabs is not a worker
   // with nothing to do, it is the one that has to open the chat the app is owed.
-  if (token === null) { await activeTabs?.revoke(); return; }
+  if (token === null) {
+    await activeTabs?.revoke();
+    if (!(await ensurePaired().catch(() => false)) || token === null) return;
+  }
   const intent = connectionEpoch;
   let observedTabs = [];
   try { observedTabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS }); } catch { /* Status/recovery still runs; no unobserved tab is pruned. */ }
@@ -2519,6 +2609,7 @@ async function maintainOnce() {
   const liveChats = new Set(Array.isArray(reply.data.nonDiscardableConversations) ? reply.data.nonDiscardableConversations : []);
   const liveOpenings = new Set(Array.isArray(reply.data.inputOpeningIds) ? reply.data.inputOpeningIds : []);
   const liveCommands = new Set(Array.isArray(reply.data.commandIds) ? reply.data.commandIds : []);
+  void reloadForExtensionUpdate(reply.data.extensionUpdate, liveOpenings, liveCommands).catch(() => undefined);
   const renderingWanted = tab => {
     if (intent !== connectionEpoch || !token || disconnected) return false;
     if (liveChats.has(conversationForTab(tab))) return true;
@@ -2812,7 +2903,11 @@ async function enqueueClose(conversationId, byExtension = false) {
   // Publish the final departure and let the existing maintenance pass revoke its protection.
   // The close itself never grants a replacement tab.
   recoveryMonitoring = true;
-  if (!closeOutbox.some((entry) => entry && entry.conversationId === id)) {
+  const previous = closeOutbox.find((entry) => entry && entry.conversationId === id);
+  if (!previous || (!byExtension && previous.byExtension === true)) {
+    // A later user close must supersede an unacknowledged automatic departure.
+    // Replace the entry so an older in-flight response cannot retire the new fact.
+    closeOutbox = closeOutbox.filter((entry) => entry !== previous);
     closeOutbox.push({ conversationId: id, queuedAt: Date.now(), ...(byExtension ? { byExtension: true } : {}) });
     closeOutbox = closeOutbox.slice(-200);
     await persistLive();
@@ -2837,7 +2932,7 @@ async function drainCloses() {
       if (conversationStillOpen(conversationId)) continue;
       const result = await call('/closed', {
         method: 'POST',
-        // Confirmed removal/navigation is a deliberate departure, never a reload or a lost poll.
+        // Only a proven managed removal is non-manual; legacy/unknown departures stay conservative.
         body: JSON.stringify({ conversationId, manual: entry.byExtension !== true })
       });
       if (!result.ok) {
@@ -3049,7 +3144,10 @@ const HANDLERS = {
     const tab = await chrome.tabs.get(source.tab);
     if (!ownsDocument(source) || pluginRefreshMarker(tab) !== message.id) return { ok: false };
     if (!['claim', 'current', 'manual', 'complete', 'fail'].includes(message.action)) return { ok: false };
-    const body = JSON.stringify({ action: message.action, id: message.id, appId: message.appId, connectorName: message.connectorName, tools: message.tools, versionId: message.versionId, error: message.error });
+    // `tunnelId` is the connector's own tunnel from ChatGPT's plugin page; the app accepts it as
+    // enrollment proof only when it equals the tunnel it serves for that surface.
+    const tunnelId = typeof message.tunnelId === 'string' && /^tunnel_[a-zA-Z0-9]{8,80}$/.test(message.tunnelId) ? message.tunnelId : undefined;
+    const body = JSON.stringify({ action: message.action, id: message.id, appId: message.appId, connectorName: message.connectorName, tools: message.tools, versionId: message.versionId, error: message.error, tunnelId });
     if (body.length > 310000) return { ok: false };
     const result = await call('/plugin-refresh', { method: 'POST', body });
     if (!ownsDocument(source) || pluginRefreshMarker(await chrome.tabs.get(source.tab)) !== message.id) return { ok: false };
@@ -3114,8 +3212,13 @@ const HANDLERS = {
         if (!current.pinned && !current.pendingUrl && ownsDocument(source) && current.url === tab.url) {
           const proof = await tabReply(source.tab, { type: 'clf-close-temporary-planner', id, owner }, { documentId: source.documentId });
           const latest = await chrome.tabs.get(source.tab);
+          // The page proved it still holds this exact decision; after Send ChatGPT has usually
+          // moved it to /c/<id>?temporary-chat=true, which no longer carries cos-input.
+          const latestUrl = new URL(latest.url);
+          const helperUrl = latestUrl.searchParams.get('cos-input') === id ||
+            (latestUrl.searchParams.get('temporary-chat') === 'true' && /^\/c\/[0-9a-f-]{36}$/i.test(latestUrl.pathname));
           if (proof?.safe === true && ownsDocument(source) && !latest.pinned && !latest.pendingUrl && latest.url === tab.url &&
-              new URL(latest.url).searchParams.get('cos-input') === id) await chrome.tabs.remove(source.tab);
+              helperUrl) await chrome.tabs.remove(source.tab);
         }
       } catch { /* terminal outbox maintenance can retry the same exact safe close */ }
     }
@@ -3400,9 +3503,13 @@ const HANDLERS = {
     if (!(await currentConversationDocument(source, conversationId))) return { ok: false, error: 'stale_document' };
     const calls = Array.isArray(message.calls) ? message.calls : [];
     if (calls.length === 0) return { ok: false, error: 'bad_request_evidence' };
+    const agent = typeof message.agent === 'string' && /^[a-z0-9-]{1,40}$/i.test(message.agent) ? message.agent : null;
+    const agentCommandId = agent && typeof message.agentCommandId === 'string' && message.agentCommandId.length <= 200
+      ? message.agentCommandId
+      : null;
     const result = await call('/correlations', {
       method: 'POST',
-      body: JSON.stringify({ conversationId, calls })
+      body: JSON.stringify({ conversationId, calls, ...(agent && agentCommandId ? { agent, agentCommandId } : {}) })
     });
     if (!(await currentConversationDocument(source, conversationId))) return { ok: false, error: 'stale_document' };
     return binding.projectBound && result.data && typeof result.data === 'object'
@@ -3888,10 +3995,18 @@ chrome.tabs.onRemoved.addListener((id) => {
     delete discardProtectedTabs[String(id)];
     void persistLive().catch(() => undefined);
   }
-  const byExtension = selfRemovedTabs.delete(id);
   void serializeTab(id, async () => {
+    await load();
+    const key = String(id), removal = tabRemovals[key];
+    const byExtension = Boolean(removal && removal.documentId === tabDocuments[key] &&
+      removal.navigationEpoch === tabEpochs[key] && removal.conversationId === tabConversations[key]);
     const documentId = await markTerminal(id);
-    return releaseTab(id, null, documentId, null, byExtension);
+    const result = await releaseTab(id, null, documentId, null, byExtension);
+    if (removal && tabRemovals[key] === removal) {
+      delete tabRemovals[key];
+      await persistLive();
+    }
+    return result;
   }).catch(() => undefined);
 });
 
@@ -4356,6 +4471,11 @@ async function restoreChatgptTab(id, current = () => true, documentId = null) {
   }
   try {
     if (!current()) return false;
+    // Rebuild localization before the isolated-world DOM adapter and recorder that consume it.
+    // Static manifest injection has the same ordering. Keeping recovery identical matters after
+    // an extension reload, when the old isolated world (including its i18n helper) is invalidated.
+    await chrome.scripting.executeScript({ target, files: ['i18n.js'] });
+    if (!current()) return false;
     // Rebuild the isolated-world DOM adapter before the recorder that consumes it.
     await chrome.scripting.executeScript({ target, files: ['chatgpt-dom.js'] });
     if (!current()) return false;
@@ -4445,9 +4565,10 @@ async function restoreOpenChatgptTabs() {
 
 chrome.runtime.onInstalled.addListener(() => {
   void restoreOpenChatgptTabs().then(() => recoverDeferredRevivals()).catch(() => undefined);
-  void load().then(() => {
-    scheduleRetry();
-  });
+  void load()
+    .then(() => ensurePaired())
+    .catch(() => undefined)
+    .then(() => scheduleRetry());
 });
 
 if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 'function') {
@@ -4487,6 +4608,7 @@ if (chrome.alarms && chrome.alarms.onAlarm && typeof chrome.alarms.onAlarm.addLi
 // ordinary worker wake-ups are one cheap message per ChatGPT tab and inject nothing; only a
 // dead or stale recorder pays the scripting cost.
 void restoreOpenChatgptTabs().then(() => recoverDeferredRevivals()).catch(() => undefined);
-void load().then(() => {
-  scheduleRetry();
-});
+void load()
+  .then(() => ensurePaired())
+  .catch(() => undefined)
+  .then(() => scheduleRetry());

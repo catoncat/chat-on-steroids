@@ -23,7 +23,7 @@ vi.mock('electron', () => ({
     decryptStringAsync: async (data: Buffer) => ({ result: data.toString(), shouldReEncrypt: false })
   }
 }));
-vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd(), shippedExtensionBuild: () => null }));
+vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd(), shippedExtensionBuild: () => null, extensionUpdateOffer: () => null, prepareExtensionUpdate: () => null }));
 vi.mock('../src/main/connection.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/main/connection.js')>();
   return { ...actual, connect: async () => {}, getStatus: () => ({ ...actual.getStatus(), state: 'connected' }) };
@@ -1508,8 +1508,8 @@ describe('IPC input delivery and Goal control integration', () => {
   });
   it('requires an exact plugin claim and matching schema before a refresh completion', async () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: true } });
-    const { publishPluginSurface, resetPluginRefreshForTests } = await import('../src/main/plugin-refresh.js');
-    resetPluginRefreshForTests();
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
     const tools = [{ name: 'read', description: 'Read a file', inputSchema: { type: 'object', properties: {} } }];
     publishPluginSurface('core', 'Chat On Steroids Core', 'test', 'Synthetic instructions', tools);
     const requests = (await post('/plugin-refresh', { action: 'pending' })).body.requests;
@@ -1522,9 +1522,24 @@ describe('IPC input delivery and Goal control integration', () => {
     expect((await post('/plugin-refresh', { ...identity, action: 'complete', tools, versionId: 'asdk_app_v_synthetic' })).body.ok).toBe(true);
     resetPluginRefreshForTests();
   });
+  it('accepts a stale connector only by the tunnel id configured for its surface', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, ui: { ...base.ui, autoRefreshPlugins: true }, tunnel: { ...base.tunnel, tunnelId: 'tunnel_core00001', desktopTunnelId: 'tunnel_desk00001' } });
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
+    await writeDurableNow('plugin-refresh', []);
+    const tools = [{ name: 'computer', description: 'Current', inputSchema: { type: 'object', properties: {} } }];
+    publishPluginSurface('desktop', 'Chat On Steroids Desktop', 'test', '', tools);
+    const [request] = (await post('/plugin-refresh', { action: 'pending' })).body.requests;
+    const claim = (tunnelId?: string) => post('/plugin-refresh', { id: request.id, appId: 'asdk_app_desktop', action: 'claim', connectorName: 'Chat On Steroids Desktop', tools: [{ name: 'observe', description: 'Old', inputSchema: { type: 'object' } }], tunnelId });
+    expect((await claim()).body.ok).toBe(false);
+    expect((await claim('tunnel_core00001')).body.ok).toBe(false); // Core's tunnel is not Desktop's
+    expect((await claim('tunnel_desk00001')).body.ok).toBe(true);
+    resetPluginRefreshForTests();
+  });
   it('defaults automatic plugin refresh off and revokes an already offered claim without removing the backend', async () => {
     const plugin = await import('../src/main/plugin-refresh.js');
-    plugin.resetPluginRefreshForTests();
+    plugin.resetPluginRefreshForTests(); plugin.setPluginRefreshTunnelGraceForTests(0);
     await writeDurableNow('plugin-refresh', []);
     const tools = [{ name: 'read', description: 'Current declaration', inputSchema: { type: 'object', properties: {} } }];
     plugin.publishPluginSurface('core', 'Chat On Steroids Core', 'test', '', tools);
@@ -1544,12 +1559,12 @@ describe('IPC input delivery and Goal control integration', () => {
     await configure(false);
     // A click already accepted while enabled may still report its real result.
     expect((await post('/plugin-refresh', { ...claim, action: 'complete', tools })).body.ok).toBe(true);
-    plugin.resetPluginRefreshForTests();
+    plugin.resetPluginRefreshForTests(); plugin.setPluginRefreshTunnelGraceForTests(0);
   });
   it('accepts a manual plugin-refresh terminal state and removes it from browser pickup', async () => {
     await saveConfig({ ...defaultConfig(), ui: { ...defaultConfig().ui, autoRefreshPlugins: true } });
-    const { publishPluginSurface, resetPluginRefreshForTests } = await import('../src/main/plugin-refresh.js');
-    resetPluginRefreshForTests();
+    const { publishPluginSurface, resetPluginRefreshForTests, setPluginRefreshTunnelGraceForTests } = await import('../src/main/plugin-refresh.js');
+    resetPluginRefreshForTests(); setPluginRefreshTunnelGraceForTests(0);
     const tools = [{ name: 'read', description: 'Read current', inputSchema: { type: 'object', properties: {} } }];
     const installed = [{ ...tools[0], description: 'Read old' }];
     publishPluginSurface('core', 'Chat On Steroids Core', 'test', 'Synthetic instructions', tools);
@@ -2727,5 +2742,27 @@ it('retires a lost authorized browser receipt so the session accepts and deliver
     expect(await input.claimBrowserInput(lost.id, 'replacement-document', conversationId, true)).toBeNull();
     const next = await input.enqueueInput({ ...message(session.id, 'off'), mode: 'auto', text: 'Second request' });
     expect(await input.claimBrowserInput(next.id, 'replacement-document', conversationId, true)).not.toBeNull();
+  } finally { clock.mockRestore(); }
+});
+
+it('retires an opening send whose receipt never arrives after six hours, and not before', async () => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    // Measured 2026-09-27: first messages of app-started chats stayed in `browser` for days.
+    const request = message(null, 'off');
+    expect((await handlers.get('sessions:send')!(null, request)).ok).toBe(true);
+    const owner = `document-${request.id}`;
+    expect((await post('/input/claim', { id: request.id, owner, conversationId: null, requiresAuthorization: true })).body.input).toMatchObject({ opening: true });
+    expect((await post('/input/claim', { id: request.id, owner, conversationId: null, authorize: true })).body.ok).toBe(true);
+    now += 15 * 60_000 + 1; // past the ordinary bound, which leaves openings in custody
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(row => row.id === request.id)?.state).toBe('browser');
+    now += 6 * 60 * 60_000;
+    input.resetInputForTests();
+    expect((await input.listInputs()).find(row => row.id === request.id)).toMatchObject({
+      state: 'cancelled',
+      error: 'Stopped waiting for delivery confirmation. The message may already have been sent; it will not be resent.'
+    });
+    expect((await input.pendingBrowserInputs()).map(row => row.id)).not.toContain(request.id);
   } finally { clock.mockRestore(); }
 });
