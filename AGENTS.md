@@ -2361,11 +2361,17 @@ message id plus current route/epoch. Retired folds unwrap all native children an
 
 Native ChatGPT Project destinations enter through the source chat's exact native Project link.
 The header alone is not readiness: `chatgpt-dom.js::enterProject` waits for the source editor
-to be mounted, empty, idle and attachment-free before its one click. Source readiness and
-replacement-editor navigation each have a bounded 12-second phase using the same observer/timer.
-Destination proof requires the exact Project home, a different connected editor and no source
-turns. User interaction, cancellation or a foreign route revokes the attempt; no extra tab or
-second click compensates for a missing result.
+to be mounted, empty, idle and attachment-free before its one click. Source readiness has a
+60-second phase and the native transition has its own 12-second phase, reusing one observer/timer.
+The exact same-origin Project header link must be unique on the current page; its folder icon
+need not carry a test id. Destination proof requires the exact Project home, an empty writable,
+attachment-free connected editor and no current-page turns; ChatGPT may reuse the source editor.
+The DOM composer/turn readers and MAIN Fiber turn reader exclude nodes inside native page
+surfaces (`data-app-shell-page-surface`) with computed `display:none`, including hidden ancestor
+surfaces. Those retained redirect/source pages cannot supply composer, header or conversation
+identity for the resumed chat. Two displayed composers or matching header links remain ambiguous.
+User interaction, cancellation or a foreign route revokes the attempt; no extra tab or second
+click compensates for a missing result.
 
 The brief includes the original task, accepted steering, current result, remaining checks and
 relevant durable ids. Linked project instructions and current executor settings still apply.
