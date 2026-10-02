@@ -558,6 +558,9 @@ var CLF_DOM = (() => {
       let previous = null;
       for (const node of document.querySelectorAll(TURN)) {
         if (node.closest?.(`${OWN_SURFACES},.markdown,[data-markdown-text-style],[data-content-search-unit-key],[contenteditable]`)) continue;
+        // An earlier page kept undisplayed in this tab (the source chat after a Project resume)
+        // holds another conversation's turns; they are not this page's.
+        if (onKeptPage(node)) continue;
         if (node.matches?.(SEARCH_TURN) && (node.closest?.(LEGACY_TURN) || node.closest?.(SHELL_TURN))) continue;
         const id = turnIdOf(node);
         if (node.matches?.(SHELL_TURN)) {
@@ -784,7 +787,8 @@ var CLF_DOM = (() => {
       // Historical interrupted exchanges can retain in_progress forever. Only the
       // latest native response can describe this composer's current generation.
       const latest = [...document.querySelectorAll(SHELL_TURN)].filter(node =>
-        !node.closest(`${OWN_SURFACES},.markdown,[data-markdown-text-style],[data-content-search-unit-key],[contenteditable]`)).at(-1);
+        !node.closest(`${OWN_SURFACES},.markdown,[data-markdown-text-style],[data-content-search-unit-key],[contenteditable]`) &&
+        !onKeptPage(node)).at(-1);
       if (latest?.getAttribute('data-clf-shell-running') !== location.pathname) return false;
       /*
        * The stamp alone is not enough, and the comment above understates why: `in_progress` is
@@ -1626,12 +1630,26 @@ var CLF_DOM = (() => {
     }, []);
   }
 
+  /**
+   * Whether a node belongs to an earlier page ChatGPT keeps mounted but undisplayed. Its workspace
+   * keeps each step of a redirect as such a page: a tab opened on /c/<id> and moved into the chat's
+   * Project holds the chat two more times, editor, header and turns included (measured 2026-10-01).
+   */
+  function onKeptPage(node) {
+    for (let page = node?.closest?.('[data-app-shell-page-surface]'); page;
+      page = page.parentElement?.closest('[data-app-shell-page-surface]')) {
+      if (getComputedStyle(page).display === 'none') return true;
+    }
+    return false;
+  }
+
   function composer() {
     return safe(() => {
-      const classic = document.querySelector('#prompt-textarea');
-      if (classic) return classic;
+      const classic = [...document.querySelectorAll('#prompt-textarea')].filter(node => !onKeptPage(node));
+      if (classic.length) return classic.length === 1 ? classic[0] : null;
       const candidates = [...document.querySelectorAll('form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]')]
-        .filter(node => !node.closest(`${OWN_SURFACES},[data-turn-key],.markdown,[hidden],[aria-hidden="true"],[inert]`));
+        .filter(node => !node.closest(`${OWN_SURFACES},[data-turn-key],.markdown,[hidden],[aria-hidden="true"],[inert]`) &&
+          !onKeptPage(node));
       return candidates.length === 1 ? candidates[0] : null;
     }, null);
   }
@@ -2763,7 +2781,7 @@ var CLF_DOM = (() => {
   async function enterProject(entry, stillCurrent = () => true) {
     if (!entry || !/^g-p-[0-9a-f]{32}$/.test(entry.id) || conversationId() !== entry.sourceConversationId) return false;
     return new Promise(resolve => {
-      let clicked = false, done = false, sourceComposer = null;
+      let clicked = false, done = false;
       const interrupt = event => { if (event.isTrusted) finish(false); };
       const finish = result => {
         if (done) return;
@@ -2775,28 +2793,32 @@ var CLF_DOM = (() => {
       const check = () => {
         if (done) return;
         if (!stillCurrent()) return finish(false);
-        if (clicked && projectHomeId() === entry.id && composer()?.isConnected && composer() !== sourceComposer && !turns().length) return finish(true);
+        // ChatGPT can keep the same editor element from the chat to its Project home. The
+        // Project route, empty writable editor and no current-page turns prove entry; the
+        // bootstrap caller still refuses Send while a chat id remains.
+        if (clicked && projectHomeId() === entry.id && composer()?.isConnected && composerSubmitReady() &&
+            !hasComposerAttachments() && !turns().length) return finish(true);
         if (conversationId() !== entry.sourceConversationId) {
           if (projectHomeId() !== entry.id) finish(false);
           return;
         }
         if (clicked) return;
         // The native header arrives before the source chat finishes loading. Its link
-        // alone is not readiness: an early click can be swallowed during hydration and
-        // would also leave us comparing the destination editor with a null source.
+        // alone is not readiness: an early click can be swallowed during hydration.
         // Preserve the source draft/generation and spend our one click only once its
         // actual editor is mounted and ready.
         const source = composer();
         if (!source?.isConnected || !composerSubmitReady() || hasComposerAttachments()) return;
+        // The header's folder icon no longer has a test id. Use the exact same-origin Project
+        // route, requiring one native header link on the current page instead of guessing.
         const links = [...document.querySelectorAll('header a[href], [role="banner"] a[href]')].filter(link =>
-          link.querySelector('[data-testid="project-folder-icon"]') && !link.closest(OWN_SURFACES) &&
-          new URL(link.href, location.href).origin === location.origin && projectHomeId(new URL(link.href, location.href).pathname) === entry.id);
+          !link.closest(OWN_SURFACES) && !onKeptPage(link) && new URL(link.href, location.href).origin === location.origin &&
+          projectHomeId(new URL(link.href, location.href).pathname) === entry.id);
         if (links.length !== 1) return;
-        sourceComposer = source;
         clicked = true;
         // Loading the source and following its link are separate page transitions.
         // Reuse the same deadline timer; source loading must not consume the budget
-        // for observing the replacement editor after the one permitted click.
+        // for observing the ready Project home after the one permitted click.
         clearTimeout(timer);
         timer = setTimeout(() => finish(false), PROJECT_TRANSITION_MS);
         links[0].click();

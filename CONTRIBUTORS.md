@@ -210,6 +210,14 @@ and its [remounted-answer follow-up](https://github.com/totec448-spec/chat-on-st
 [@Gauthammaster2012Code](https://github.com/Gauthammaster2012Code) reported the plan-collapse
 affordance issue in [#191](https://github.com/totec448-spec/chat-on-steroids/issues/191).
 
+The October 2 fork integration selectively adapts [@Maximapple](https://github.com/Maximapple)'s
+Project entry/composer fixes from [#888](https://github.com/totec448-spec/chat-on-steroids/pull/888)
+and current-page DOM/Fiber turn filtering from
+[#901](https://github.com/totec448-spec/chat-on-steroids/pull/901). The Project header route identity
+also incorporates the prerequisite from [#883](https://github.com/totec448-spec/chat-on-steroids/pull/883).
+The Core mention and continuation-marker changes in #888 are not incorporated in this focused
+patch. This is an adapted source integration, not an unchanged merge or a live installation claim.
+
 Contributions also include reproductions, independent testing, designs and patches that are still under review or were superseded. Thank you to:
 
 - [@ventianima-lab](https://github.com/ventianima-lab) for detailed request-attribution and delivery investigations and controller, stream-observation and tab-reuse proposals, including [#108](https://github.com/totec448-spec/chat-on-steroids/issues/108), [#124](https://github.com/totec448-spec/chat-on-steroids/pull/124), [#159](https://github.com/totec448-spec/chat-on-steroids/pull/159) and [#170](https://github.com/totec448-spec/chat-on-steroids/pull/170).
