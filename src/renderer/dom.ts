@@ -15,6 +15,8 @@ import { currentLanguage, t, ui } from './i18n.js';
  */
 const ICONS: Readonly<Record<string, string>> = {
   'i-agents': 'robot',
+  'i-arrow-down': 'arrow-down',
+  'i-arrow-left': 'arrow-left',
   'i-arrow-right': 'arrow-right',
   'i-back': 'arrow-left',
   'i-ban': 'prohibit',
@@ -22,6 +24,7 @@ const ICONS: Readonly<Record<string, string>> = {
   'i-chart': 'chart-line',
   'i-chat': 'chat-circle',
   'i-check': 'check',
+  'i-check-circle': 'check-circle',
   'i-clock': 'clock',
   'i-copy': 'copy',
   'i-dock-expand': 'corners-out',

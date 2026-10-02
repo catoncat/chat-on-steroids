@@ -741,7 +741,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // going to reject outright. Repairing first means the rest of the pipeline sees a
           // line PowerShell can actually parse, and a line it cannot repair is left exactly
           // as written for the shell to refuse and the hint to explain.
-          const ripgrep = shell.shellType === 'cmd' ? null : locateRipgrep();
           const commandNotes: string[] = [];
           const normalizedCommands: string[] = [];
           const boundCommands = rawCommands.map((rawCommand, index) => {
@@ -751,7 +750,11 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             );
             normalizedCommands.push(normalized.cmd);
             const prefix = (note: string): string => (isBatch ? `Command ${index + 1}: ${note}` : note);
-            const bound = bindBundledRipgrep(normalized.cmd, shell.shellType, ripgrep);
+            const bound = bindBundledRipgrep(
+              normalized.cmd,
+              shell.shellType,
+              shell.shellType === 'cmd' ? null : locateRipgrep()
+            );
             const chained = normalizePowerShellOperators(bound, shell.shellType, shell.shellPath);
             commandNotes.push(
               ...repaired.notes.map(prefix),
@@ -838,6 +841,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             // id cannot briefly authorize its previous chat before this call publishes the new owner.
             forgetExecOwner(processId);
 
+            const ripgrep = locateRipgrep();
             const executionCommand = deriveExecArgs(shell,
               withPosixPathPrefix(boundCommand, shell.shellType, ripgrep ? nodePath.dirname(ripgrep) : null), useLoginShell);
             const output = await unifiedExecManager.execCommand({
@@ -968,8 +972,24 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // The ownership registry decides both admission and the reason for refusal.
           // A request-scoped caller can continue a process it opened before proof. Another
           // request must wait for exact correlation; a numeric process id is not custody.
-          const asking = execPrincipal();
-          const denied = execOwnershipFailure(input.session_id, asking);
+          let asking = execPrincipal();
+          let denied = execOwnershipFailure(input.session_id, asking);
+          if (denied === 'unidentified') {
+            const caller = currentCaller();
+            if (caller.requestId) {
+              // A later turn in the same chat can reach Core before the page reports this
+              // request-id mate. Wait only for that exact correlation, then re-run the same
+              // ownership check; the numeric session id never becomes authority by itself.
+              await awaitFreshCallOrigin(
+                'write_stdin',
+                currentCall()?.startedAt ?? Date.now(),
+                IDENTITY_EVIDENCE_MS,
+                { exact: true, requestId: caller.requestId }
+              );
+              asking = execPrincipal();
+              denied = execOwnershipFailure(input.session_id, asking);
+            }
+          }
           if (denied) {
             const reason = {
               unavailable: 'EXEC_SESSION_UNAVAILABLE: This process id is not available to this call in the running app. Check the original exec_command response and earlier results for its exit/output before deciding what remains; do not rerun the command solely because its id is unavailable.',

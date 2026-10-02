@@ -1,4 +1,9 @@
 {
+  "Jump to latest": "最新へ移動",
+  "Previous source": "前のソース",
+  "Next source": "次のソース",
+  "{0} more sources were not recorded with this reply.": "この返信では他の {0} 件のソースが記録されていません。",
+  "Thinking": "考え中",
   "Copy answer": "回答をコピー",
   "Export as Markdown": "Markdown としてエクスポート",
   "This answer": "この回答",
@@ -396,7 +401,7 @@
   "Add attachments": "添付ファイルを追加",
   "Chat mode": "チャットモード",
   "Chat automation": "チャットの自動化",
-  "What should this chat achieve?": "このチャットで何を達成しますか？",
+  "Optional. Leave empty to work toward what you asked in this chat.": "任意です。空欄のままにすると、このチャットで依頼した内容に向けて進めます。",
   "Goal behavior": "ゴールの動作",
   "Estimated session context": "セッションの推定コンテキスト量",
   "Reload ChatGPT models": "ChatGPT のモデルを再読み込み",
@@ -1538,7 +1543,7 @@
   "… still writing. The full answer appears when it finishes.": "… まだ書き込み中です。完了すると回答全文が表示されます。",
   "PDF exceeds the preview limit": "PDF がプレビュー上限を超えています",
   "PDF page dimensions exceed the preview limit": "PDF ページの寸法がプレビュー上限を超えています",
-  "No MCP tool call was recorded in the last response, so the app cannot tell whether the tool connection was lost. Automatic continuation is paused; Loop remains enabled. Check the tunnel and Core connector before continuing.": "前回の応答で MCP ツール呼び出しが記録されなかったため、アプリはツール接続が失われたかどうかを判断できません。自動継続は一時停止していますが、ループは有効のままです。続行する前にトンネルと Core コネクタを確認してください。",
+  "No MCP tool call was recorded in the last response. ChatGPT may be asking you something, or the tool connection may have been lost. Answer it, or check the tunnel if tools stopped working. Automatic continuation is paused; Loop remains enabled.": "前回の応答で MCP ツール呼び出しが記録されませんでした。ChatGPT が質問しているか、ツール接続が失われた可能性があります。質問に答えるか、ツールが動作しなくなった場合はトンネルを確認してください。自動継続は一時停止中ですが、Loop は有効のままです。",
   "There is no pending continuation for this answer. It may already have been handled or replaced by newer work. Check the latest chat activity before trying again.": "この回答に対する保留中の継続はありません。すでに処理済みか、新しい作業に置き換えられた可能性があります。再試行する前に最新のチャット活動を確認してください。",
   "The task and Goal/Loop instructions are too long to send to the helper. Shorten the task or the custom continuation instructions in Settings.": "タスクとゴール/ループの指示が長すぎるため、ヘルパーに送信できません。タスクまたは設定内のカスタム継続指示を短くしてください。",
   "The helper wrote a continuation that is too long to send. Ask for shorter continuation instructions or choose another helper model in Settings.": "ヘルパーが作成した継続内容が長すぎて送信できません。より短い継続指示を依頼するか、設定で別のヘルパーモデルを選択してください。",
@@ -1749,5 +1754,10 @@
   "This chat (estimate)": "このチャット（推定）",
   "Context limit": "コンテキスト上限",
   "Filled": "使用率",
-  "Compacts automatically at": "自動圧縮の開始"
+  "Compacts automatically at": "自動圧縮の開始",
+  "A chat stopped": "チャットが停止しました",
+  "Its last turn produced nothing and nothing followed. Send a message there to start a fresh turn.": "最後のターンは何も出力せず、その後も何も続きませんでした。新しいターンを始めるには、そのチャットにメッセージを送ってください。",
+  "Its last turn failed and nothing followed. Send a message there to start a fresh turn.": "最後のターンが失敗し、その後も何も続きませんでした。新しいターンを始めるには、そのチャットにメッセージを送ってください。",
+  "Recovery stopped": "復旧を停止しました",
+  "The browser did not pick up this chat's repair, so the app stopped retrying. Open its tab again and recovery resumes.": "ブラウザーがこのチャットの修復を引き受けなかったため、アプリは再試行を停止しました。タブを開き直すと復旧が再開されます。"
 }

@@ -174,8 +174,10 @@
 .plugin-tool b { font-size: calc(12px * var(--text-scale, 1)); font-weight: 600; overflow-wrap: anywhere; }
 .plugin-tool small { display: block; margin-top: 3px; font-size: calc(12px * var(--text-scale, 1)); line-height: 1.5; overflow-wrap: anywhere; }
 .plugin-about { display: block; margin-top: 24px; color: var(--soft); font-size: calc(12px * var(--text-scale, 1)); }
-.plugin-about > summary, .plugin-legal > summary { width: fit-content; cursor: pointer; }
-.plugin-about p { margin: 10px 0 0; }
+.plugin-about > summary, .plugin-legal > summary { display: flex; align-items: center; gap: 6px; width: fit-content; list-style: none; cursor: pointer; }
+.plugin-about > summary::-webkit-details-marker, .plugin-legal > summary::-webkit-details-marker { display: none; }
+.plugin-about > summary:hover, .plugin-legal > summary:hover { color: var(--ink); }
+.plugin-about p, .plugin-legal > p:first-of-type { margin: 10px 0 0; }
 .plugin-source { overflow-wrap: anywhere; font-size: calc(12px * var(--text-scale, 1)); }
 .plugin-error { color: var(--red); background: var(--red-wash); padding: 12px; border-radius: var(--r-sm); overflow-wrap: anywhere; }
 .plugin-card-error { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--red); font-size: calc(11px * var(--text-scale, 1)); }
@@ -2021,6 +2023,14 @@ input[readonly] {
 #timeline:has(+ #inputQueue > .pending-message) { padding-bottom: 0; }
 /* Reserve follows recorded AND pending messages, never separates their bubbles. */
 #timelineContent { padding-bottom: var(--timeline-scroll-reserve, 0px); }
+/* Back to the end: a quiet round button pinned to the bottom of the chat, shown only when content
+   lies below. A zero-height sticky dock keeps it out of the content's flow. */
+.jump-latest-dock { position: sticky; bottom: 14px; z-index: 5; height: 0; display: flex; justify-content: center; pointer-events: none; }
+.jump-latest { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; transform: translateY(calc(-100% + 8px)); border: 1px solid var(--edge); border-radius: 50%; background: var(--card); color: var(--soft); box-shadow: 0 4px 16px #0003; cursor: pointer; opacity: 0; pointer-events: none; transition: opacity 160ms ease, transform 160ms ease; }
+.jump-latest.is-shown { opacity: 1; pointer-events: auto; transform: translateY(-100%); }
+.jump-latest:hover { color: var(--ink); background: var(--hover); }
+.jump-latest .ico { --ico: 16px; --glyph: 16px; }
+@media (prefers-reduced-motion: reduce) { .jump-latest { transition: none; } }
 
 .ev {
   display: grid;
@@ -2112,8 +2122,40 @@ input[readonly] {
   animation: turn-sheen 4.2s ease-in-out infinite;
 }
 @keyframes turn-sheen { from { background-position: 130% 0; } to { background-position: -130% 0; } }
+/* What the turn does right now: the last row of its work. A running step keeps the activity rows'
+   rhythm and wears the icon its finished row will, in the accent and breathing, its words
+   shimmering like the Working line and its own clock faint. Thinking is not a step, so it does not
+   look like one: ChatGPT's own sign, a white dot that breathes, beside heavier words and set apart
+   from the rows above. A new state fades in where the last one was; a long one truncates rather than wrapping. */
+.turn-now[hidden] { display: none; }
+.turn-now-icon { flex: none; display: grid; place-items: center; width: 14px; height: 14px; color: var(--accent); animation: turn-now-breathe 1.6s ease-in-out infinite; }
+.turn-now-icon .ico { --ico: 14px; }
+.turn-now-body { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+/* Every state holds the same slot, set apart from the rows above, so a change of state never moves it. */
+.meta.is-progress.thinking-line.turn-now { margin-top: 14px; }
+.meta.is-progress.thinking-line.turn-now.is-thinking { gap: 10px; font-weight: 500; }
+.turn-now.is-thinking .turn-now-icon { width: 14px; height: 14px; animation: none; }
+.turn-now.is-thinking .turn-now-icon::before {
+  content: ''; width: 12px; height: 12px; border-radius: 50%; background: var(--ink);
+  animation: turn-now-dot 1.5s ease-in-out infinite;
+}
+@keyframes turn-now-breathe { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+@keyframes turn-now-dot { 0%, 100% { transform: scale(.6); } 50% { transform: scale(1); } }
+.turn-now-text {
+  min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+  color: transparent;
+  background: linear-gradient(100deg, var(--soft) 38%, var(--ink) 50%, var(--soft) 62%) 0 0 / 260% 100%;
+  -webkit-background-clip: text; background-clip: text;
+  animation: turn-sheen 4.2s ease-in-out infinite;
+}
+.turn-now-time { flex: none; color: var(--faint); font-variant-numeric: tabular-nums; }
+.turn-now-time:empty { display: none; }
+.turn-now.is-new { animation: turn-now-in 220ms ease-out; }
+@keyframes turn-now-in { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) {
   .turn-status.is-working .turn-worked-label { animation: none; color: var(--soft); background: none; }
+  .turn-now.is-new, .turn-now-icon, .turn-now.is-thinking .turn-now-icon::before { animation: none; }
+  .turn-now-text { animation: none; color: var(--soft); background: none; }
 }
 /* The status now opens each turn in the timeline; the header shows it only in developer mode. */
 .subhead-note.is-mirrored { display: none; }
@@ -2250,6 +2292,36 @@ input[readonly] {
   color: var(--blue);
   text-decoration: underline;
 }
+
+/* A source ChatGPT cites inline, drawn as its page draws it: a small pill with the source's name
+   and how many more sources stand behind it. */
+.msg.rich a.citation-pill {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 15rem; height: 18px; padding: 0 7px;
+  border-radius: 9px; background: var(--hover); color: var(--soft); text-decoration: none;
+  font-size: calc(10.5px * var(--text-scale, 1)); font-weight: 500; line-height: 1; vertical-align: 0.12em;
+}
+.msg.rich a.citation-pill:hover { background: var(--line); color: var(--ink); }
+.citation-pill-label { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.citation-pill-more { flex: none; opacity: .75; }
+/* ChatGPT's source card: hovering or focusing a pill shows its site, title, date and snippet, and
+   pages through every source behind the count. */
+.msg.rich .citation { position: relative; display: inline-block; }
+.msg.rich .citation-card {
+  position: absolute; z-index: 20; top: calc(100% + 6px); left: 0; display: flex; flex-direction: column; gap: 6px;
+  width: min(22rem, 80vw); padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px;
+  background: var(--card); box-shadow: 0 10px 30px #0004; color: var(--ink); font-size: calc(13px * var(--text-scale, 1)); line-height: 1.4;
+}
+.msg.rich .citation-card[hidden] { display: none; }
+.msg.rich .citation-card.is-end { left: auto; right: 0; }
+.citation-card-nav { display: flex; align-items: center; gap: 4px; margin: -4px -4px 2px; }
+.citation-card-step { display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 7px; background: transparent; color: var(--soft); cursor: pointer; }
+.citation-card-step:hover { background: var(--hover); color: var(--ink); }
+.citation-card-count { margin-left: auto; color: var(--soft); font-size: calc(11.5px * var(--text-scale, 1)); font-variant-numeric: tabular-nums; }
+.citation-card-site { color: var(--soft); font-size: calc(12px * var(--text-scale, 1)); }
+.msg.rich a.citation-card-title { color: var(--ink); font-weight: 600; text-decoration: none; }
+.msg.rich a.citation-card-title:hover { text-decoration: underline; }
+.citation-card-detail { color: var(--soft); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+.citation-card-note { color: var(--soft); font-size: calc(12px * var(--text-scale, 1)); }
 
 .msg.rich .markdown-table {
   max-width: 100%;

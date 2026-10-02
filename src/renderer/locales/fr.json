@@ -1,4 +1,9 @@
 {
+  "Jump to latest": "Aller au plus récent",
+  "Previous source": "Source précédente",
+  "Next source": "Source suivante",
+  "{0} more sources were not recorded with this reply.": "{0} autres sources n’ont pas été enregistrées avec cette réponse.",
+  "Thinking": "Réflexion",
   "Copy answer": "Copier la réponse",
   "Export as Markdown": "Exporter en Markdown",
   "This answer": "Cette réponse",
@@ -386,7 +391,7 @@
   "Add attachments": "Ajouter des pièces jointes",
   "Chat mode": "Mode du chat",
   "Chat automation": "Automatisation du chat",
-  "What should this chat achieve?": "Que doit accomplir ce chat ?",
+  "Optional. Leave empty to work toward what you asked in this chat.": "Facultatif. Laissez vide pour viser ce que vous avez demandé dans ce chat.",
   "Goal behavior": "Comportement Goal",
   "Estimated session context": "Contexte de session estimé",
   "Reload ChatGPT models": "Recharger les modèles ChatGPT",
@@ -1536,7 +1541,7 @@
   "complete": "terminé",
   "loading": "chargement",
   "syncing": "synchronisation",
-  "No MCP tool call was recorded in the last response, so the app cannot tell whether the tool connection was lost. Automatic continuation is paused; Loop remains enabled. Check the tunnel and Core connector before continuing.": "Aucun appel d’outil MCP n’a été enregistré dans la dernière réponse ; l’application ne peut donc pas déterminer si la connexion aux outils a été perdue. La continuation automatique est en pause ; Loop reste activé. Vérifiez le tunnel et le connecteur Core avant de continuer.",
+  "No MCP tool call was recorded in the last response. ChatGPT may be asking you something, or the tool connection may have been lost. Answer it, or check the tunnel if tools stopped working. Automatic continuation is paused; Loop remains enabled.": "Aucun appel d’outil MCP n’a été enregistré dans la dernière réponse. ChatGPT vous pose peut-être une question, ou la connexion aux outils a peut-être été perdue. Répondez à sa question ou vérifiez le tunnel si les outils ne fonctionnent plus. La continuation automatique est en pause ; Loop reste activé.",
   "There is no pending continuation for this answer. It may already have been handled or replaced by newer work. Check the latest chat activity before trying again.": "Aucune continuation n’est en attente pour cette réponse. Elle a peut-être déjà été traitée ou remplacée par un travail plus récent. Vérifiez l’activité la plus récente du chat avant de réessayer.",
   "The task and Goal/Loop instructions are too long to send to the helper. Shorten the task or the custom continuation instructions in Settings.": "La tâche et les instructions Goal/Loop sont trop longues pour être envoyées à l’assistant. Raccourcissez la tâche ou les instructions de continuation personnalisées dans les paramètres.",
   "The helper wrote a continuation that is too long to send. Ask for shorter continuation instructions or choose another helper model in Settings.": "L’assistant a rédigé une continuation trop longue pour être envoyée. Demandez des instructions de continuation plus courtes ou choisissez un autre modèle d’assistant dans les paramètres.",
@@ -1749,5 +1754,10 @@
   "This chat (estimate)": "Ce chat (estimation)",
   "Context limit": "Limite de contexte",
   "Filled": "Rempli",
-  "Compacts automatically at": "Compacte automatiquement à partir de"
+  "Compacts automatically at": "Compacte automatiquement à partir de",
+  "A chat stopped": "Un chat s’est arrêté",
+  "Its last turn produced nothing and nothing followed. Send a message there to start a fresh turn.": "Son dernier tour n’a rien produit et rien n’a suivi. Envoyez-y un message pour lancer un nouveau tour.",
+  "Its last turn failed and nothing followed. Send a message there to start a fresh turn.": "Son dernier tour a échoué et rien n’a suivi. Envoyez-y un message pour lancer un nouveau tour.",
+  "Recovery stopped": "Récupération arrêtée",
+  "The browser did not pick up this chat's repair, so the app stopped retrying. Open its tab again and recovery resumes.": "Le navigateur n’a pas pris en charge la réparation de ce chat, l’app a donc cessé de réessayer. Rouvrez son onglet et la récupération reprendra."
 }

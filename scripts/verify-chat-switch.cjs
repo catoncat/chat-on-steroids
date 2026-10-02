@@ -36,7 +36,7 @@ app.whenReady().then(async () => {
       listSessions:()=>ok({sessions,total:2,nextCursor:null,activeId:null,pressure:[],blocked:[]}),
       getSession:id=>window.hold?new Promise(resolve=>window.pending.push({id,resolve})):ok(detail(id)),
       getSessionControls:()=>ok({automation:'off',objective:'',blocked:'',job:null}),
-      listInputs:()=>ok(structuredClone(window.inputs)),listPausedHelpers:()=>ok([]),
+      listInputs:()=>ok(structuredClone(window.inputs)),runningTools:()=>ok([]),listPausedHelpers:()=>ok([]),
       onSessionChanged:listener=>{window.changed=listener;return ()=>{}},
       getSwarm:()=>ok({running:false,agents:[],pendingReports:0}),
       getChatModels:()=>ok({state:'unknown',models:[]})
@@ -93,7 +93,7 @@ app.whenReady().then(async () => {
       frames.push({count:[...document.querySelectorAll('#timeline .said.is-user,#inputQueue .pending-message')].filter(el=>el.textContent.includes('Exactly one follow-up')).length,
         previous:document.getElementById('timeline').textContent.includes('Transcript b'),welcome:!document.getElementById('timelineEmpty').hidden});
       if(++n===8){window.inputs[0]={...window.inputs[0],state:'sent',messageId:'native-followup',deliveredAt:4,historyAnchored:true,historySeq:2};window.changed()}
-      if(n===48){window.extra=[{seq:2,time:4,source:'app',kind:'user_message',messageId:'native-followup',inputId:'delivery',message:{text:'Exactly one follow-up',chars:21,truncated:false}}];window.changed()}
+      if(n===48){window.extra=[{seq:2,time:4,source:'app',kind:'user_message',messageId:'native-followup',inputId:'delivery',message:{text:'Exactly one follow-up',chars:21,truncated:false}}];window.changed({sessionIds:['b']})}
       if(n===100)resolve(frames);else requestAnimationFrame(frame);
     }requestAnimationFrame(frame)})`);
     assert.ok(deliveryFrames.every(f=>f.count===1 && f.previous && !f.welcome),JSON.stringify(deliveryFrames));

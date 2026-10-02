@@ -1,4 +1,9 @@
 {
+  "Jump to latest": "최신으로 이동",
+  "Previous source": "이전 출처",
+  "Next source": "다음 출처",
+  "{0} more sources were not recorded with this reply.": "이 답변에는 다른 출처 {0}개가 기록되지 않았습니다.",
+  "Thinking": "생각 중",
   "Copy answer": "답변 복사",
   "Export as Markdown": "Markdown으로 내보내기",
   "This answer": "이 답변",
@@ -366,7 +371,7 @@
   "Add attachments": "첨부파일 추가",
   "Chat mode": "채팅 모드",
   "Chat automation": "채팅 자동화",
-  "What should this chat achieve?": "이 채팅에서 무엇을 달성해야 하나요?",
+  "Optional. Leave empty to work toward what you asked in this chat.": "선택 사항입니다. 비워 두면 이 채팅에서 요청한 내용을 목표로 진행합니다.",
   "Goal behavior": "Goal 동작",
   "Estimated session context": "예상 세션 컨텍스트",
   "Reload ChatGPT models": "ChatGPT 모델 새로고침",
@@ -1480,7 +1485,7 @@
   "Line {0}: {1}": "{0}행: {1}",
   "New response": "새 응답",
   "No API key is configured for the continuation provider. Add one in Settings, or select the ChatGPT continuation source.": "계속하기 공급자의 API 키가 설정되지 않았습니다. 설정에서 키를 추가하거나 ChatGPT 계속하기 소스를 선택하세요.",
-  "No MCP tool call was recorded in the last response, so the app cannot tell whether the tool connection was lost. Automatic continuation is paused; Loop remains enabled. Check the tunnel and Core connector before continuing.": "마지막 응답에서 MCP 도구 호출이 기록되지 않아 앱이 도구 연결이 끊겼는지 판단할 수 없습니다. 자동 계속하기는 일시 중지되며 Loop는 켜진 상태로 유지됩니다. 계속하기 전에 터널과 Core 커넥터를 확인하세요.",
+  "No MCP tool call was recorded in the last response. ChatGPT may be asking you something, or the tool connection may have been lost. Answer it, or check the tunnel if tools stopped working. Automatic continuation is paused; Loop remains enabled.": "마지막 응답에서 MCP 도구 호출이 기록되지 않았습니다. ChatGPT가 질문을 하고 있거나 도구 연결이 끊겼을 수 있습니다. 질문에 답하거나 도구가 작동하지 않는 경우 터널을 확인하세요. 자동 계속하기는 일시 중지되며 Loop는 켜진 상태로 유지됩니다.",
   "No recorded conversation is available to continue. Send a task first.": "계속할 수 있는 기록된 대화가 없습니다. 먼저 작업을 보내세요.",
   "No task was provided. Enter a task before starting Goal/Loop.": "작업이 입력되지 않았습니다. Goal/Loop를 시작하기 전에 작업을 입력하세요.",
   "None or a static credential": "없음 또는 고정 자격 증명",
@@ -1749,5 +1754,10 @@
   "This chat (estimate)": "이 채팅(추정)",
   "Context limit": "컨텍스트 한도",
   "Filled": "사용률",
-  "Compacts automatically at": "자동 압축 시작"
+  "Compacts automatically at": "자동 압축 시작",
+  "A chat stopped": "채팅이 멈췄습니다",
+  "Its last turn produced nothing and nothing followed. Send a message there to start a fresh turn.": "마지막 턴이 아무것도 만들지 못했고 이후에도 아무것도 이어지지 않았습니다. 새 턴을 시작하려면 그 채팅에 메시지를 보내세요.",
+  "Its last turn failed and nothing followed. Send a message there to start a fresh turn.": "마지막 턴이 실패했고 이후에도 아무것도 이어지지 않았습니다. 새 턴을 시작하려면 그 채팅에 메시지를 보내세요.",
+  "Recovery stopped": "복구 중지됨",
+  "The browser did not pick up this chat's repair, so the app stopped retrying. Open its tab again and recovery resumes.": "브라우저가 이 채팅의 복구 요청을 받지 않아 앱이 재시도를 중지했습니다. 탭을 다시 열면 복구가 다시 시작됩니다."
 }

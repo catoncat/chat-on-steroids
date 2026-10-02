@@ -452,6 +452,17 @@
    * Do not fall back to arbitrary object/string fields. This helper runs in the page world
    * and its allowlist is a privacy boundary: only the public text payload crosses worlds.
    */
+  /**
+   * A message that mentions a ChatGPT app stores the mention inline as `[$slug](app://asdk_app_…)`
+   * (#861). That is how the message attached the app, not what its author wrote, and the app adds
+   * one to every prompt it sends, so user text is read without it. Ordinary links are untouched.
+   */
+  const APP_MENTION_LINK = /[ \t]*\[\$[a-z0-9][a-z0-9-]{0,80}\]\(app:\/\/asdk_app_[A-Za-z0-9_-]{1,160}\)[ \t]*/g;
+  function withoutAppMentions(value) {
+    if (typeof value !== 'string' || !value.includes('](app://asdk_app_')) return value;
+    return value.replace(APP_MENTION_LINK, ' ').trim();
+  }
+
   function authoredText(message) {
     const content = message && typeof message === 'object' ? message.content : null;
     if (!content || typeof content !== 'object' || content.content_type !== 'text') return null;
@@ -639,7 +650,7 @@
           /^image\/[a-z0-9.+-]{1,80}$/i.test(file.mime_type) && Number.isSafeInteger(file.size) && file.size >= 0 && file.size <= 512 * 1024 * 1024)
           .slice(0, Math.min(4, imageCount)).map(file => ({ id: file.id, name: file.name, size: file.size, mimeType: file.mime_type })) : [];
       const authored = multimodal ? content.parts.filter(part => typeof part === 'string').join('\n') : authoredText(message);
-      const rawText = budgetedText(authored, budget, MAX_RENDERED_TEXT) || '';
+      const rawText = budgetedText(withoutAppMentions(authored), budget, MAX_RENDERED_TEXT) || '';
       if (!id || (!rawText && !attachments.length)) continue;
       if (seen.has(id)) continue;
       seen.add(id);
@@ -818,6 +829,56 @@
    * raw Markdown. Finally, the old positional fallback remains only for the fully balanced
    * case, where every remaining candidate has exactly one remaining visible block.
    */
+  /**
+   * The sources behind each citation pill in these sections, from the pill's own props: the list
+   * its hover card pages through, and the reply and reference index it belongs to (its reference's
+   * position in that reply's `content_references`, which the inline directive names). Titles,
+   * links, publication dates and snippets only, bounded; anything else is left out.
+   */
+  function citedSources(sections) {
+    const byMessage = new Map();
+    for (let sectionAt = 0; sectionAt < sections.length; sectionAt++) {
+      let pills;
+      try { pills = sections[sectionAt].querySelectorAll('a[data-testid="chatgpt-citation"]'); } catch { continue; }
+      for (let at = 0; at < pills.length && at < 128; at++) {
+        let fiber = null;
+        try { fiber = fiberOf(pills[at]); } catch { fiber = null; }
+        let sources = null, reference = null, context = null;
+        for (let depth = 0; fiber && depth < 16 && !(sources && context); depth++, fiber = fiber.return) {
+          const props = fiber.memoizedProps;
+          if (!props || typeof props !== 'object') continue;
+          if (!sources && Array.isArray(props.sources)) sources = props.sources;
+          if (!context && props.reference && props.turnContext && typeof props.turnContext === 'object') {
+            reference = props.reference;
+            context = props.turnContext;
+          }
+        }
+        const list = context && Array.isArray(context.contentReferences) ? context.contentReferences : null;
+        const index = list ? list.indexOf(reference) : -1;
+        const messageId = context && typeof context.messageId === 'string' && context.messageId.length <= 200 ? context.messageId : null;
+        if (!sources || index < 0 || !messageId) continue;
+        const kept = [];
+        for (const source of sources.slice(0, 12)) {
+          if (!source || typeof source !== 'object') continue;
+          const url = typeof source.url === 'string' && source.url.length <= 2000 && /^https?:\/\//i.test(source.url) ? source.url : null;
+          if (!url) continue;
+          const text = (value, max) => typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, max) : '';
+          const label = text(source.label, 80), snippet = text(source.snippet, 300);
+          // ChatGPT keeps publication dates in epoch seconds.
+          const date = typeof source.pubDate === 'number' && isFinite(source.pubDate) && source.pubDate > 0
+            ? Math.round(source.pubDate < 1e10 ? source.pubDate * 1000 : source.pubDate) : 0;
+          kept.push({ title: text(source.title, 300), url, ...(label ? { source: label } : {}),
+            ...(date ? { date } : {}), ...(snippet ? { snippet } : {}) });
+        }
+        if (!kept.length) continue;
+        const references = byMessage.get(messageId) || [];
+        if (!references.some(entry => entry.index === index)) references.push({ index, sources: kept });
+        byMessage.set(messageId, references);
+      }
+    }
+    return byMessage;
+  }
+
   function renderedMessagesOf(sections, messages, budget, exactAnchors, conversationId) {
     const assistantCandidates = authoredAssistantMessages(messages, budget);
     const userCandidates = authoredUserMessages(messages, budget);
@@ -928,7 +989,9 @@
 
     // One canonical record per model message whether or not HTML could be attached.
     const out = [];
+    const cited = citedSources(sections);
     for (let c = 0; c < assistantCandidates.length; c++) {
+      const references = cited.get(assistantCandidates[c].id);
       out.push({
         messageId: assistantCandidates[c].messageId,
         rawMessageId: assistantCandidates[c].id,
@@ -937,6 +1000,7 @@
         order: assistantCandidates[c].order,
         createTime: assistantCandidates[c].createTime,
         ...(assistantCandidates[c].resolvedModel ? { resolvedModel: assistantCandidates[c].resolvedModel } : {}),
+        ...(references ? { references } : {}),
         rawText: assistantCandidates[c].rawText,
         renderedHtml: ''
       });
@@ -2273,6 +2337,12 @@
     }
     return state;
   }
+  /** Shell execution ids are provider identities, not localized presentation. */
+  function shellProExecutionModel(value) {
+    const normalized = typeof value === 'string' ? value.trim().toLowerCase() : '';
+    return /^(?:pro|(?:gpt-?)?\d+(?:[.-]\d+)?-pro)$/.test(normalized);
+  }
+
   // The native closed picker does not mount composerIntelligencePickerState.
   // Its own ancestor carries the current execution model; its visible label
   // carries the selected effort. These are observation, never catalog discovery.
@@ -2295,7 +2365,7 @@
       if (typeof current !== 'string' || !/^[a-zA-Z0-9._-]{1,80}$/.test(current) || (model && model !== current)) return null;
       model = current;
     }
-    const effort = (lane && lane.model === model && lane.effort) ||
+    const effort = shellProExecutionModel(model) ? 'pro' : (lane && lane.model === model && lane.effort) ||
       (machine !== null ? (['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(machine) ? machine : null) : captionEffort);
     if (!effort) return null;
     return model ? { id: model, effort } : null;
@@ -2357,7 +2427,8 @@
       // The machine reasoningEffort is a lane's transport setting, not its identity: the
       // Pro and Extra High lanes still report medium/max. The lane's visible label is what
       // the picker offers, matching readPickerSnapshot's modelLane/thinkingEffort mapping.
-      const laneEffort = c => effort(String(c?.labels?.effort ?? c?.sliderLabel ?? '').trim().toLowerCase()) ?? effort(c?.reasoningEffort);
+      const laneEffort = c => shellProExecutionModel(c?.model) ? 'pro' :
+        effort(String(c?.labels?.effort ?? c?.sliderLabel ?? '').trim().toLowerCase()) ?? effort(c?.reasoningEffort);
       const current = options.filter(o => o?.selected === true);
       if (current.length !== 1) return null;
       const version = group(current[0].id);
@@ -2375,6 +2446,19 @@
     }
     return null;
   }
+
+  /**
+   * What reading one connector's declarations back from the page may cost (#864 follow-up).
+   *
+   * The app publishes at most 250,000 UTF-8 bytes of Plugins declarations
+   * (src/main/plugins/exposure.ts). copySchema charges each character as three bytes, the
+   * worst case, plus key overhead, so the old 280,000 rejected anything above roughly 93 KB of
+   * text: a Unity plugin's 82 tools (about 116 KB) made every Plugins refresh fail with an
+   * unreadable settings card. Three times the publication budget, with room for key overhead,
+   * reads back everything the app can publish; the isolated world and the app still cap the
+   * projected JSON at 300,000 characters.
+   */
+  const PLUGIN_SCHEMA_READ_BYTES = 900000;
 
   function copySchema(value, budget, depth = 0) {
     if (depth > 32 || --budget.nodes < 0) throw new Error('schema_bound');
@@ -2436,7 +2520,7 @@
     if (!connector || !Array.isArray(connector.actions) || typeof connector.name !== 'string') return null;
     const externalPlugins = connector.name === 'Chat On Steroids Plugins';
     if ((!connector.actions.length && !externalPlugins) || connector.actions.length > (externalPlugins ? 257 : 16)) return null;
-    const budget = { bytes: 280000, nodes: 20000 };
+    const budget = { bytes: PLUGIN_SCHEMA_READ_BYTES, nodes: 20000 };
     // Measured 2026-09-27: this page sends `description_model: ""` rather than null, so `??`
     // read every declaration as empty and no refresh could ever match the published schema.
     const tools = connector.actions.map(action => ({ name: action.name, description: copySchema(action.description_model || action.description, budget), inputSchema: copySchema(action.params, budget) }));
@@ -2482,7 +2566,7 @@
         observedActions = props.actions;
         const externalPlugins = props.connector.name === 'Chat On Steroids Plugins';
         if ((!props.actions.length && !externalPlugins) || props.actions.length > (externalPlugins ? 257 : 16) || typeof props.connector.name !== 'string') return null;
-        const budget = { bytes: 280000, nodes: 20000 };
+        const budget = { bytes: PLUGIN_SCHEMA_READ_BYTES, nodes: 20000 };
         const tools = props.actions.map(action => ({ name: action.name, description: copySchema(action.description_model ?? action.description, budget), inputSchema: copySchema(action.params, budget) }));
         if (tools.some(tool => !NAME.test(tool.name) || typeof tool.description !== 'string' || !tool.inputSchema || tool.inputSchema.type !== 'object') ||
             new Set(tools.map(tool => tool.name)).size !== tools.length) return null;
