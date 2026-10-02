@@ -6,6 +6,7 @@ const source = readFileSync(new URL('../extension/chatgpt-dom.js', import.meta.u
 interface DomApi {
   insertPrompt(text: string, mode?: boolean | 'append', failure?: (reason: string) => void): boolean;
   enterProject(entry: { id: string; sourceConversationId: string }, current?: () => boolean): Promise<boolean>;
+  composer(): HTMLElement | null;
   composerActions(): { host: HTMLElement; before: HTMLElement | null } | null;
   generating(): boolean;
   sendButton(): HTMLButtonElement | null;
@@ -174,13 +175,68 @@ describe('one native HTML edit for prepared text', () => {
   });
 });
 
+describe('a workspace page kept mounted behind the current one', () => {
+  // Measured 2026-10-01: a tab opened on /c/<id> and moved into its Project keeps the first page
+  // mounted under display:none, editor and header included. Two editors meant no composer at all,
+  // so the tab could neither send nor enter its Project.
+  function keptPage(shown = false) {
+    const kept = document.createElement('div');
+    kept.setAttribute('data-app-shell-page-surface', 'true');
+    if (!shown) kept.style.display = 'none';
+    kept.innerHTML = '<form><div id="prompt-textarea" contenteditable="true">Old page</div><button type="button" data-testid="send-button">Send</button></form>';
+    document.body.prepend(kept);
+    return kept;
+  }
+  it('takes the rendered editor and its own Send', async () => {
+    keptPage();
+    expect(api.composer()).toBe(box);
+    let clicked = false;
+    button.addEventListener('click', () => { clicked = true; user('Exact app prompt'); box.replaceChildren(); });
+    expect(await api.send()).toBe(true);
+    expect(clicked).toBe(true);
+  });
+  it("reads only this page's turns, not those of an earlier page kept undisplayed", () => {
+    // After a Project resume the tab keeps the source chat hidden; its turns are another chat's.
+    const kept = keptPage();
+    const old = document.createElement('section');
+    old.setAttribute('data-testid', 'conversation-turn-1'); old.setAttribute('data-turn', 'user'); old.setAttribute('data-turn-id', 'old-turn');
+    const oldMessage = document.createElement('div');
+    oldMessage.setAttribute('data-message-id', 'old-message'); oldMessage.setAttribute('data-message-author-role', 'user');
+    oldMessage.textContent = 'Source chat question'; old.append(oldMessage); kept.append(old);
+    user('Resumed chat question');
+    expect(api.messages().map(message => message.text)).toEqual(['Resumed chat question']);
+  });
+  it('skips a nested page inside an undisplayed ancestor surface', () => {
+    const outer = keptPage();
+    const inner = document.createElement('div');
+    inner.setAttribute('data-app-shell-page-surface', 'true');
+    inner.append(...outer.childNodes); outer.append(inner);
+    expect(api.composer()).toBe(box);
+  });
+  it('filters kept pages for the id-less native editor too', () => {
+    box.removeAttribute('id'); box.setAttribute('role', 'textbox');
+    box.closest('form')!.setAttribute('data-chatgpt-composer', 'true');
+    const kept = keptPage();
+    const old = kept.querySelector('[contenteditable]')!;
+    old.removeAttribute('id'); old.setAttribute('role', 'textbox');
+    old.closest('form')!.setAttribute('data-chatgpt-composer', 'true');
+    expect(api.composer()).toBe(box);
+    kept.style.display = '';
+    expect(api.composer()).toBeNull();
+  });
+  it('still refuses two displayed editors', () => {
+    keptPage(true);
+    expect(api.composer()).toBeNull();
+  });
+});
+
 describe('native Project entry readiness', () => {
   const entry = { id: 'g-p-11111111222233334444555555555555', sourceConversationId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' };
   const projectUrl = `https://chatgpt.com/g/${entry.id}-example/project`;
-  function sourceLink() {
+  function sourceLink(markup = `<a href="${projectUrl}"><span data-testid="project-folder-icon"></span>Project</a>`) {
     dom.reconfigure({ url: `https://chatgpt.com/c/${entry.sourceConversationId}` });
     const header = document.createElement('header');
-    header.innerHTML = `<a href="${projectUrl}"><span data-testid="project-folder-icon"></span>Project</a>`;
+    header.innerHTML = markup;
     document.body.prepend(header);
     return header.querySelector('a')!;
   }
@@ -243,6 +299,91 @@ describe('native Project entry readiness', () => {
     await vi.advanceTimersByTimeAsync(2_000);
     expect(await entered).toBe(true);
     expect(clicks).toBe(1);
+  });
+
+  it('accepts the Project home when ChatGPT keeps the same editor element', async () => {
+    // Measured 2026-10-01: from a Project chat, the header link leads to the Project home in
+    // the same editor element. Waiting for a new editor failed every Compact & resume there.
+    const link = sourceLink(`<a href="/g/${entry.id}/project"><span>Homelab</span></a>`);
+    box.textContent = '';
+    user('Earlier turn');
+    const turn = document.querySelector('section[data-testid^="conversation-turn"]')!;
+    const kept = box;
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: `https://chatgpt.com/g/${entry.id}/project` });
+      dom.window.setTimeout(() => turn.remove(), 300);
+    });
+    const entered = api.enterProject(entry);
+    await vi.advanceTimersByTimeAsync(200);
+    // Still the source's turns on screen: not entered yet.
+    let settled = false; void entered.then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(await entered).toBe(true);
+    expect(document.getElementById('prompt-textarea')).toBe(kept);
+  });
+
+  it('enters while turns of an earlier page stay mounted but undisplayed', async () => {
+    // Measured 2026-10-01: the app's tab keeps its redirect steps as hidden pages, turns included.
+    const link = sourceLink(`<a href="/g/${entry.id}/project"><span>Homelab</span></a>`);
+    box.textContent = '';
+    user('Earlier turn');
+    const turn = document.querySelector('section[data-testid^="conversation-turn"]')!;
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      dom.reconfigure({ url: `https://chatgpt.com/g/${entry.id}/project` });
+      const kept = document.createElement('div');
+      kept.setAttribute('data-app-shell-page-surface', 'true'); kept.style.display = 'none';
+      turn.replaceWith(kept); kept.append(turn);
+    });
+    expect(await api.enterProject(entry)).toBe(true);
+    expect(turn.isConnected).toBe(true);
+  });
+
+  it('ignores the header of an earlier page ChatGPT keeps undisplayed', async () => {
+    // Measured 2026-10-01: a replacement tab's header held the Project link twice, one on a kept,
+    // undisplayed page. Counting both refused the only real link and the resume failed.
+    const link = sourceLink(`<div data-app-shell-page-surface="true" style="display:none"><a href="/g/${entry.id}/project"><span>Homelab</span></a></div><a href="/g/${entry.id}/project"><span>Homelab</span></a>`);
+    const shown = document.querySelectorAll('header a')[1]!;
+    box.textContent = '';
+    const clicks = vi.fn((event: Event) => { event.preventDefault(); dom.reconfigure({ url: `https://chatgpt.com/g/${entry.id}/project` }); });
+    shown.addEventListener('click', clicks);
+    expect(await api.enterProject(entry)).toBe(true);
+    expect(clicks).toHaveBeenCalledTimes(1);
+    void link;
+  });
+
+  it.each(['duplicate', 'cross-origin'])('refuses an ambiguous or foreign Project header: %s', async reason => {
+    const href = reason === 'cross-origin' ? `https://example.com/g/${entry.id}/project` : projectUrl;
+    const markup = `<a href="${href}">Project</a>` + (reason === 'duplicate' ? `<a href="${projectUrl}">Project</a>` : '');
+    sourceLink(markup); box.textContent = '';
+    const clicks = vi.fn((event: Event) => event.preventDefault());
+    document.querySelectorAll('header a').forEach(link => link.addEventListener('click', clicks));
+    const entered = api.enterProject(entry);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(await entered).toBe(false);
+    expect(clicks).not.toHaveBeenCalled();
+  });
+
+  it.each(['draft', 'readonly', 'attachment', 'cancelled'])('refuses an unready or retired destination with a kept editor: %s', async reason => {
+    const link = sourceLink(); box.textContent = '';
+    let current = true;
+    link.addEventListener('click', event => {
+      event.preventDefault(); dom.reconfigure({ url: projectUrl });
+      if (reason === 'draft') box.textContent = 'My new draft';
+      if (reason === 'readonly') box.setAttribute('contenteditable', 'false');
+      if (reason === 'attachment') {
+        const preview = document.createElement('button'); preview.setAttribute('aria-label', 'Remove file: user.txt');
+        box.closest('form')!.append(preview);
+      }
+      if (reason === 'cancelled') current = false;
+    });
+    const entered = api.enterProject(entry, () => current);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(false);
+    if (reason === 'draft') expect(box.textContent).toBe('My new draft');
   });
 
   it('still gives up on a native transition that does not arrive within its own deadline', async () => {
