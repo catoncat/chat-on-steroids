@@ -9,6 +9,183 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.25] — Chats keep going on their own
+
+This update is about chats that stopped and waited for you to type "continue". Answers sent with the Chat On Steroids mention are recorded properly again, resumed Project chats are followed correctly, and an automatic Continue no longer gets stuck in the message box.
+
+### Fixed
+
+- **Answers are recorded again for messages with the Core mention.** Since 2.1.24, CoS ends its messages with an "@Chat On Steroids Core" mention. CoS then sometimes didn't notice that such a message had started a turn, so it never saw the answer finish. This happened most often in a chat that had just continued after Compact & resume. Chats then looked stuck, and recovery stepped in although the answer was already there.
+- **Chats continued in a Project are followed correctly.** After Compact & resume in a Project, ChatGPT keeps the old chat hidden in the same tab. CoS read that hidden chat too, so it ignored the new chat's activity. It now reads only the chat you see.
+- **An automatic Continue no longer gets stuck in the message box.** After a reload, CoS's own "continue" text could stay unsent in the message box and block every further repair, until you pressed Send yourself. CoS now removes its own unsent text. If a Continue still can't be sent for three minutes, CoS stops trying instead of retrying every second, and its log says why.
+- **Extra High chats continue after two minutes, not twenty.** When an Extra High (or Max) answer was lost to a connection error, CoS still waited the long thinking window of up to twenty minutes before it stepped in. It now continues two minutes after the failure.
+- **Retry buttons in other languages are recognized.** When ChatGPT shows a connection error with a translated Retry button, CoS now recognizes it and recovers the chat.
+
+### Improved
+
+- **"Chat stopped" notices in your language.** The desktop notifications for a stopped chat now follow the app language instead of always being English.
+- **The Goal field says it's optional.** Goal always works toward what you asked in the chat. Its field now says you can leave it empty, or fill it in to state exactly when the work is done.
+
+### Thank you
+
+To **@Haz4rdovisk** for the precise analysis of the missing turns (#900), to **@lavalava45** for finding why the Continue text stayed in the message box, to **@AcureroAdrian** for the translated Retry buttons, to **@redzrush101** for merging the language tests, and to **@mahadansar** (#820) and **@jackbarunz** (#893) for the reports and screenshots.
+
+**Updating from 2.1.18 or older?** If the extension doesn't connect, click its icon once; from 2.1.19 on it connects by itself.
+
+## [2.1.24] — Projects and workers back on track
+
+This update fixes Compact & resume for chats inside Projects, workers that started without any Chat On Steroids tools on some ChatGPT accounts, and the automatic refresh of the Plugins connector.
+
+### Fixed
+
+- **Compact & resume works again in Projects.** For chats inside a ChatGPT Project, every Compact & resume failed with "ChatGPT could not open the source Project". ChatGPT changed how it opens a Project: the link at the top of the chat, the message box and the pages a tab keeps in the background all behave differently now. Long Project chats then stopped at their context limit until you stepped in. CoS handles the new behavior, and the replacement chat starts in the same Project.
+- **Workers and Loop get their tools on every account.** On some accounts (seen on Plus and Business in ChatGPT's Chat mode), ChatGPT only gives a chat the Chat On Steroids tools when the message mentions the app. Workers then received their task but couldn't run anything. Every message CoS sends now ends with an "@Chat On Steroids Core" mention, the same one you can pick from ChatGPT's @ menu. On accounts that didn't need it, you'll just see the small mention chip.
+- **The Plugins connector refreshes again.** With larger plugins installed, such as Unity, the automatic refresh of the Plugins connector failed every time, so ChatGPT kept an old tool list after an update. It now works for every plugin set CoS can publish.
+- **No leftover text after a failed worker start.** When ChatGPT didn't accept the start or wake message of a worker, the text stayed in that chat's message box and looked like something you still had to send. CoS now removes its own text; anything you typed stays.
+- **Pinned tabs stay where you put them.** CoS no longer moves a ChatGPT tab you pinned into its background window.
+
+### Improved
+
+- **Clearer Loop pause message.** When Loop pauses because the last answer called no tool, the message now says that ChatGPT may simply be asking you something, instead of only blaming the connection.
+
+### Thank you
+
+To **@lavalava45** for the pinned-tab fix, to **@sumit171204** for the clearer Loop message (a first contribution!), and to **@xeretuye** (#861), **@tude91979059-byte** (#882) and **@tngcphng** for the reports and screenshots that found these problems.
+
+**Updating from 2.1.18 or older?** If the extension doesn't connect, click its icon once; from 2.1.19 on it connects by itself.
+
+## [2.1.23] — Fewer stuck chats
+
+This update is about chats that got stuck and waited for no reason. Stop always works now, auto-compaction no longer waits needlessly, and CoS tells you when it can't recover a chat on its own.
+
+### Fixed
+
+- **Stop always gets you out.** Sometimes CoS kept showing the Stop button after ChatGPT had already finished, and your next message waited forever. Pressing Stop did nothing. Now Stop ends that answer, and your next message goes out.
+- **Auto-compaction starts right away.** If a chat reached its limit just as an answer was finishing, the app waited up to six minutes before compacting. Now it compacts as soon as the answer is done.
+- **Compact & resume works after you close the tab.** If you started Compact & resume and closed the chat's tab, the request quietly expired after ten minutes. It now reopens the chat and finishes the handoff.
+- **New worker chats start reliably.** The app's model check could borrow a worker chat's tab while it was still starting up, and both then competed for its message box. Starting workers are now left alone.
+- **Interrupted answers are recovered more reliably.** When ChatGPT can't resume an interrupted answer, CoS now notices immediately and recovers the chat instead of waiting for an error that never appears.
+
+### New
+
+- **WSL project folders on Windows.** You can approve project folders inside your local WSL distributions (`\\wsl.localhost\…`) and work in them like any other folder.
+- **A notice when recovery needs you.** If CoS has tried everything to recover a stuck chat, it now tells you with a notification instead of only writing it to the log.
+
+### Improved
+
+- **The desktop tools leave CoS alone on Windows too.** The model can no longer see or target the CoS window itself, so it can't change CoS's own settings. This was already the case on macOS.
+- Updated dependencies.
+
+### Thank you
+
+To **@AcureroAdrian** for WSL folder support, the recovery notice and the improved recovery of interrupted answers, and to **@lavalava45** for finding and fixing the worker start-up race. And to **@sumit171204** and **@tngcphng** for reporting stuck chats, with screenshots and logs.
+
+**Updating from 2.1.18 or older?** If the extension doesn't connect, click its icon once; from 2.1.19 on it connects by itself.
+
+## [2.1.22] — Long Loop sessions keep going
+
+A small update for everyone who lets CoS work for a long time. Chats in Loop and with auto-compaction no longer get stuck where 2.1.21 could hang until you stepped in.
+
+### Fixed
+
+- **The next message is not held up anymore.** Some ChatGPT versions return a long, indented message with its spaces spelled `&#x20;`. The app then did not recognize its own message: the internal context showed up in the chat, and the next message waited until you reloaded the page. The app now reads these messages correctly, and a message whose delivery ChatGPT does not confirm within two minutes no longer blocks the chat. It is marked as "may already have been sent" and is never sent twice.
+- **Auto-compaction also works during long-running commands.** While ChatGPT kept checking a long command, such as a test run, automatic Compact & resume gave up with "ChatGPT has not confirmed receiving the latest tool results" and the chat filled up to the limit. It now waits for the pause between two checks and compacts there.
+- **Easier to see why a stuck chat is not recovered.** When the ChatGPT page is not ready for a recovery reload, the app log now says what is holding it, for example a message still waiting for confirmation or text left in the message box.
+
+### Thank you
+
+To **@Haz4rdovisk** for tracking the stuck message down to the byte and fixing it, and to **@mahadansar** for the detailed reports and logs from long Loop sessions.
+
+**Updating from 2.1.18 or older?** If the extension doesn't connect, click its icon once; from 2.1.19 on it connects by itself.
+
+## [2.1.21] — Korean, a calmer chat and a much more reliable Goal, Loop and Compact & resume
+
+The biggest update in a while. CoS now speaks Korean, the message box has been redesigned, and the chat finally shows what ChatGPT is doing while it works. Under the hood, more than 20 fixes make Goal, Loop and Compact & resume far more dependable, especially with long answers, long thinking and more than one browser.
+
+### Highlights
+
+- **See what ChatGPT is doing right now.** While a chat works, a live line at its end says what is happening, for example "Running npm test 12s" or "Searching the web", instead of a silent spinner.
+- **Your message stays in view.** After you send, your message moves to the top and the answer grows beneath it, so nothing jumps while ChatGPT writes.
+- **Steps with a real title.** A group of steps is titled with ChatGPT's own summary of that round, such as "Created and verified the test file", like in ChatGPT itself.
+- **A clearer message box.** Normal, Goal and Loop in one menu, Plan as its own button, and a context ring that shows how full the chat is.
+- **Korean (한국어),** the 11th language.
+
+### New
+
+- **Korean.** Pick it in Appearance or with the flags in Setup.
+- **A clearer message box.** Normal, Goal and Loop sit in one mode menu, each with a short description of what it does; Plan is its own button. The context ring opens a small panel with how big the chat is, your limit, how full it is and when it compacts, next to the Compact & resume action. The model menu lists every model, the thinking-effort slider glides smoothly, and Instant models, which have nothing to choose, show no slider at all.
+- **Copy and export answers.** Under every finished answer you can copy it or save it as a Markdown file, and you can save the whole chat.
+- **See how long each answer took.** A quiet line under your message shows "Working for 12s" while ChatGPT works and "Worked for 1m 12s" when it is done.
+- **For agents on this computer: a local interface.** Off by default. Turned on in Settings → Setup → Advanced, it lets tools on this computer read whether the app is healthy, what its chats are doing and what it is waiting for, with keys and passwords masked. A second switch, also off by default, lets them send a message to a chat or cancel one that has not gone out yet. They never interrupt an answer unless they ask to.
+
+### Improved
+
+- **The live "what it's doing" line.** While ChatGPT works, the end of the chat names the current step and how long it has been running. On a ChatGPT page in another language it says "Thinking" for ChatGPT's own steps.
+- **Your message stays in view while the answer grows.** Scroll up any time to read earlier parts; a button takes you back to the end.
+- **Lighter, better-named steps.** Commands and edits no longer sit in heavy boxes, and a collapsed group is titled with ChatGPT's recap of the round, or else after what actually ran, never after a note written in between.
+- **ChatGPT's steps in the right place.** Its own step lines ("Searching…", "Reading…") appear before the paragraph they belong to, as in ChatGPT.
+- **Sources look like ChatGPT's.** Inline source references show as the small source pill ChatGPT draws instead of raw `:chatgpt-content-reference` text, and you can open the source from it.
+- **Smoother side and bottom panels.** Panels slide instead of jumping, tabs look the same in both panels and can be reordered by dragging, and long tab names no longer run under the close button.
+- **Tidier Plugins page and small polish.** The Legal Notices line fits on one row, "About this plugin" and "Setup requirements" show whether they are open, the toolbar lines up at any zoom level, and the German interface says "komprimieren" throughout.
+
+### Fixed
+
+**Goal and Loop**
+
+- **Goal says why it stopped.** When Goal could not write its next message for good, for example because the OpenRouter account ran out of credit, it kept showing "Answer settling". It now says the goal loop stopped, and why, in the app and on the ChatGPT page.
+- **Loop keeps track of long answers.** Right after a Loop message was sent, the new turn could be marked finished within a fraction of a second, and Loop never sent its next message. The turn now stays open until its own answer ends.
+- **No false "goal loop stopped".** With the same chat open in two tabs or browsers, the tab not running Goal claimed the loop had stopped while it went on in the other one. That tab now stays quiet.
+- **Long thinking isn't mistaken for a stall.** With Extra high, Max or Ultra thinking, ChatGPT can think silently for more than ten minutes. The app now waits as long as it does for Pro instead of starting a recovery.
+- **Recovery messages are sent, not left in the text box.** If ChatGPT rebuilt its text box just before Send, the automatic recovery message could stay there until you sent it yourself. It is now sent.
+
+**Compact & resume**
+
+- **A clean start in the new chat.** The new chat could show "Reloaded chat to recover a handoff request that has not been sent" above its first message, although that happened in the old chat and nothing had failed. The note now stays where it belongs, and the handoff shows as the compact summary card it was meant to be.
+- **It finishes after a long handoff.** If ChatGPT redrew its handoff while writing it, Compact & resume could wait on "Waiting for the handoff response" forever. It now picks up the finished handoff, and says so if it really cannot.
+- **It finds the message box after ChatGPT redraws it,** instead of stopping with "message box is not ready".
+- **A tab that could not open is reported at once,** instead of a vague timeout minutes later. The same goes for workers.
+
+**Two browsers, one chat**
+
+- **A chat stays in its browser.** With the extension in two browsers, a message or repair could open a second copy of a chat in the other browser, and Compact & resume could open the new chat there. Everything for a chat now stays in the browser that has it open.
+- **One new chat, not two.** A new chat could open as a blank tab in one browser while the other browser sent the message.
+- **Working chats are left alone.** A chat used from elsewhere (for example your phone) could make the app reload whichever chat was working at that moment.
+
+**Models**
+
+- **Saved GPT-6 Pro works.** Choosing GPT-6 Pro for workers or Goal's helper was not recognised and fell back to ChatGPT's current model. It is found now, and if the app's list of your models is older than your choice, it asks ChatGPT for a fresh one instead of quietly using another model.
+- **Pro is recognised on a ChatGPT page in any language,** instead of being read as "medium".
+
+**The chat view**
+
+- **The chat you're reading stays still** when another chat is busy.
+- **"Working…" stops as soon as the turn ends,** instead of lingering for up to 90 seconds.
+- **The chat stays at the newest answer** when you open the terminal or a side panel or type a long message.
+- **Numbers and times follow your language,** not your computer's region.
+- **The ChatGPT page switches work right away.** "Overwrite ChatGPT tool rows" and "Show durations in ChatGPT" in Agents & automation no longer stay greyed out until you press "Refresh browser preferences".
+
+**Everything else**
+
+- **The terminal panel can be resized again.**
+- **Workers whose folder was deleted** fall back or ask for a folder instead of failing their first command.
+- **Old leftovers leave your chat list.** Plan's helper chats from 2.1.14 and 2.1.15 are hidden (not deleted), and chats named after a ChatGPT project page get a proper name.
+- **The extension connects with restricted site access** ("on click" or "on specific sites").
+
+### Thank you
+
+This release is a real community effort:
+
+- **@Haz4rdovisk** for the redesigned message box, the live "what it's doing" line, your message staying in view, recap titles, copy and export, the "Worked for" times, source pills and the smoother panels.
+- **@AcureroAdrian** for the local interface for agents on this computer.
+- **@lavalava45** for the Compact & resume and Pro fixes and for keeping chats responsive through connection errors.
+- **@dltks0426-design** for the Korean translation.
+- **@WanxTitanx** for making saved models like GPT-6 Pro work.
+- **@redzrush101** for Nix support for developers.
+
+And to everyone who reported bugs with such precise details: many of these fixes started with your reports.
+
+**Updating from 2.1.18 or older?** If the extension doesn't connect, click its icon once; from 2.1.19 on it connects by itself.
+
 ## [2.1.20] — Cleaner replies and working OpenRouter keys
 
 A quality update. Replies from every ChatGPT account show properly, OpenRouter keys work however they were pasted, and CoS copes with new ChatGPT formats on its own.

@@ -1,4 +1,5 @@
 import { registerWorkspaceTerminalIpc } from './workspace-terminal-ipc.js';
+import { setStopNoticeTranslations } from './stuck-notice.js';
 import { applyLoginStartup, supportsLoginStartup } from './window-lifecycle.js';
 import { startControlApi, stopControlApi } from './control-api.js';
 import { appearanceSchema } from './appearance-schema.js';
@@ -10,7 +11,7 @@ import { SKILL_ID_PATTERN } from '../shared/skills.js';
 import { listSkillLibrary } from './skill-library.js';
 import { installRecommendedSkill, listRecommendedSkills } from './recommended-skills.js';
 import { noteChatOrigin } from './session/recorder.js';
-import { REASONING_EFFORTS } from '../shared/session.js';
+import { REASONING_EFFORTS, type SessionChange } from '../shared/session.js';
 import { safeExternalLink } from '../shared/external-link.js';
 import { wakeBrowserWork } from './browser-wake.js';
 import { getChatModels, startChatModelDiscovery, configureChatModelDiscovery } from './chat-models.js';
@@ -62,6 +63,7 @@ import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CH
 import { bridgePortSelection } from './bridge-ports.js';
 import { clearAllGoalSwitches, draftTaskPlan, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalReplyActiveNow, setGoalObjectiveNow } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
+import { runningToolActivity } from './mcp/call-context.js';
 import { runDiagnostics } from './diagnostics.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
@@ -651,6 +653,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   handle('projects:list', () => listProjects());
+  handle('ui:stopNoticeTexts', async payload => {
+    // The renderer's catalogs translate the stopped-chat notices (#855); bounded and allowlisted.
+    setStopNoticeTranslations(z.record(z.string().max(200), z.string().max(400)).refine(value => Object.keys(value).length <= 16).parse(payload));
+  });
   handle('pets:list', async () => petLibraryState());
   handle('pets:overlayState', async () => petOverlayControlState());
   handle('pets:overlayVisible', async payload => {
@@ -1034,7 +1040,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('sessions:clearImageStorage', async (payload) => {
     const { mode } = z.object({ mode: z.enum(['oldest-gib', 'all']) }).parse(payload);
     const result = await clearImageStorage(mode);
-    push('session:changed');
+    // Retired images can belong to any transcript; this is the explicit global invalidation.
+    push('session:changed', { allTranscripts: true } satisfies SessionChange);
     return result;
   });
   handle('sessions:events', async (payload) => {
@@ -1121,6 +1128,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
   handle('sessions:retryBrowser', async (payload) => retryQueuedInputBrowser(z.object({ id: z.string().uuid() }).parse(payload).id));
   handle('sessions:pausedHelpers', async () => pausedBrowserHelpers());
+  // What a working chat's tool calls are doing right now, for its live caption.
+  handle('sessions:runningTools', async (payload) => {
+    const { conversationIds } = z.object({ conversationIds: z.array(z.string().min(1).max(200)).max(16) }).parse(payload);
+    return runningToolActivity(conversationIds);
+  });
   handle('sessions:retryHelper', async (payload) => {
     const { id, sourceSessionId } = z.object({ id: z.string().uuid(), sourceSessionId: z.string().min(8).max(64) }).parse(payload);
     return retryGoalBrowserHelper(sourceSessionId, id);
@@ -1388,6 +1400,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   onUpdateChange(pushState);
   onMacOSDesktopAccessChange(pushState);
   onLog((entry) => push('log:entry', entry));
-  onSessionChange(() => push('session:changed'));
+  // Recorder pushes name their exact transcript owners; payload-less pushes are catalog/control only.
+  onSessionChange(change => push('session:changed', change));
   onSwarmChange(() => push('swarm:changed', swarmState()));
 }

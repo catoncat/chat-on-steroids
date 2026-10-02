@@ -384,14 +384,30 @@ describe('account-observed worker admission', () => {
   });
 
   // #499: a default saved before 2.1.15 read picker lanes stopped matching, and every spawn failed.
-  it('uses ChatGPT\'s current model when the saved default model is not offered, but keeps explicit requests strict', async () => {
+  // The same stale value is the picker label's hyphenated form of one unique family —
+  // it resolves to that family; explicit requests keep their strict id/alias check.
+  it('resolves a stale default display slug to its unique observed family, but keeps explicit requests strict', async () => {
     const base = defaultConfig();
     await saveConfig({ ...base, multiAgent: { ...base.multiAgent, enabled: true, defaultModel: 'gpt-5.6-sol', defaultReasoning: 'high' } });
     try {
       const result = spawn({ caller: prime, workers: [{ task: 'stale default' }, { task: 'second' }] });
-      expect(result.created.map(worker => [worker.model, worker.reasoningEffort])).toEqual([[null, 'high'], [null, 'high']]);
-      expect(result.defaultNotes).toEqual([expect.stringMatching(/default worker model "gpt-5.6-sol" saved in Settings is not offered/)]);
+      expect(result.created.map(worker => [worker.model, worker.reasoningEffort])).toEqual([['5.6', 'high'], ['5.6', 'high']]);
+      expect(result.defaultNotes ?? []).toEqual([]);
       expect(() => spawn({ caller: prime, workers: [{ task: 'explicit', model: 'gpt-5.6-sol' }] })).toThrow(/not observed/);
+    } finally { await setEnabled(true); }
+  });
+
+  it('uses ChatGPT\'s current model when the saved default is ambiguous, but keeps explicit requests strict', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, multiAgent: { ...base.multiAgent, enabled: true, defaultModel: '5.5', defaultReasoning: 'high' } });
+    vi.mocked(chatModels.getChatModels).mockReturnValue({ state: 'ready', requestedAt: null, observedAt: 1, models: [
+      { id: 'gpt-5-5-thinking', label: '5.5', efforts: ['medium', 'high'] },
+      { id: 'gpt-5-5-pro', label: '5.5', efforts: ['pro'] }
+    ] });
+    try {
+      const result = spawn({ caller: prime, workers: [{ task: 'ambiguous default' }] });
+      expect(result.created.map(worker => [worker.model, worker.reasoningEffort])).toEqual([[null, 'high']]);
+      expect(result.defaultNotes).toEqual([expect.stringMatching(/default worker model "5.5" saved in Settings is not offered/)]);
     } finally { await setEnabled(true); }
   });
 
@@ -4046,6 +4062,43 @@ describe('simultaneous independent prime families', () => {
     clearAgent('prime', nextA);
     expect(currentRunId(PRIME_CHAT)).toBeNull();
     expect(statusForCaller(primeB).state.agents.find(a => a.id === 'worker-1')?.state).toBe('active');
+  });
+
+  it('keeps a woken family selectable by the run_id its prime was given before it parked (#881, #882)', () => {
+    // Every report a worker sends the prime is labelled with the run_id of that moment. Once all
+    // workers slept, the family parked; the prime's next message woke it under a new id, and its
+    // reply with the id it had just been given was refused as "no agent family belongs to this
+    // conversation" (2.1.24 log in #882: three refusals right after each reactivation).
+    const a = recruit(prime, 1), b = recruit(primeB, 1);
+    bindConversation('worker-1', 'parallel-worker-a', a.runId);
+    bindConversation('worker-1', 'parallel-worker-b', b.runId);
+    finishAgent({ conversationId: 'parallel-worker-a' }, 'A sleeps');
+    expect(releaseQuiescentRun({}, a.runId)).toBe(true);
+    stageMessages({ ...prime, runId: a.runId }, [{ to: 'worker-1', text: 'reuse A' }]).commit();
+    const nextA = currentRunId(PRIME_CHAT)!;
+    expect(nextA).not.toBe(a.runId);
+
+    // The browser fence stays exact: only the new incarnation may claim the wake.
+    expect(claimWorkerRevival('worker-1', 'parallel-worker-a', a.runId)).toBe(false);
+    expect(claimWorkerRevival('worker-1', 'parallel-worker-a', nextA)).toBe(true);
+    expect(noteWorkerRevived('worker-1', 'parallel-worker-a', pendingWorkerRevivals()[0]!.messageIds, null, nextA)).toBe(true);
+    expect(noteAgentAlive('parallel-worker-a', 'call')?.revived).toBe(true);
+
+    // The prime's earlier id still selects its own, now woken family.
+    expect(statusForCaller({ ...prime, runId: a.runId })).toMatchObject({ runId: nextA });
+    const before = pendingCount('worker-1', nextA);
+    stageMessages({ ...prime, runId: a.runId }, [{ to: 'worker-1', text: 'follow-up with the id from the report' }]).commit();
+    expect(pendingCount('worker-1', nextA)).toBe(before + 1);
+
+    // It never selects another prime's family, and never moves the browser fence back.
+    expect(() => statusForCaller({ ...primeB, runId: a.runId })).toThrow(/AGENTS_BUSY/);
+    expect(() => stageMessages({ ...primeB, runId: a.runId }, [{ to: 'worker-1', text: 'not yours' }])).toThrow(/AGENTS_BUSY/);
+    expect(pendingCount('worker-1', b.runId)).toBe(0);
+
+    // And it survives a restart, like the family it names.
+    const snapshot = JSON.parse(JSON.stringify(snapshotSwarm()));
+    resetAgentsForTests(); restoreSwarm(snapshot);
+    expect(statusForCaller({ ...prime, runId: a.runId })).toMatchObject({ runId: nextA });
   });
 
   it('fences overlapping prime transfers and preserves B when A resumes', async () => {

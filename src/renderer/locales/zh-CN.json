@@ -1,4 +1,9 @@
 {
+  "Jump to latest": "跳到最新",
+  "Previous source": "上一个来源",
+  "Next source": "下一个来源",
+  "{0} more sources were not recorded with this reply.": "此回复未记录另外 {0} 个来源。",
+  "Thinking": "思考中",
   "Copy answer": "复制回答",
   "Export as Markdown": "导出为 Markdown",
   "This answer": "此回答",
@@ -396,7 +401,7 @@
   "Add attachments": "添加附件",
   "Chat mode": "聊天模式",
   "Chat automation": "聊天自动化",
-  "What should this chat achieve?": "此聊天要实现什么目标？",
+  "Optional. Leave empty to work toward what you asked in this chat.": "可选。留空则以你在此聊天中提出的请求为目标。",
   "Goal behavior": "目标行为",
   "Estimated session context": "会话上下文估算",
   "Reload ChatGPT models": "重新加载 ChatGPT 模型",
@@ -1475,7 +1480,7 @@
   "List recent recordings or find past and concurrent work by text.": "列出最近的记录，或按文本查找过去及并行进行的工作。",
   "Manage pets…": "管理宠物…",
   "No API key is configured for the continuation provider. Add one in Settings, or select the ChatGPT continuation source.": "未为继续提供者配置 API 密钥。请在设置中添加，或选择 ChatGPT 继续来源。",
-  "No MCP tool call was recorded in the last response, so the app cannot tell whether the tool connection was lost. Automatic continuation is paused; Loop remains enabled. Check the tunnel and Core connector before continuing.": "上一条回复中未记录任何 MCP 工具调用，因此应用无法判断工具连接是否已丢失。自动继续已暂停；Loop 仍保持启用。继续前请检查隧道和 Core 连接器。",
+  "No MCP tool call was recorded in the last response. ChatGPT may be asking you something, or the tool connection may have been lost. Answer it, or check the tunnel if tools stopped working. Automatic continuation is paused; Loop remains enabled.": "上一条回复中未记录 MCP 工具调用。ChatGPT 可能正在向你提问，也可能是工具连接已断开。请回答问题；如果工具无法继续工作，请检查隧道。自动继续已暂停；Loop 仍保持启用。",
   "No installed skills.": "没有已安装的技能。",
   "No recorded conversation is available to continue. Send a task first.": "没有可继续的已记录对话。请先发送任务。",
   "No skills yet.": "还没有技能。",
@@ -1749,5 +1754,10 @@
   "This chat (estimate)": "此对话（估算）",
   "Context limit": "上下文上限",
   "Filled": "已用",
-  "Compacts automatically at": "自动压缩起点"
+  "Compacts automatically at": "自动压缩起点",
+  "A chat stopped": "一个聊天已停止",
+  "Its last turn produced nothing and nothing followed. Send a message there to start a fresh turn.": "它的最后一轮没有产生任何内容，之后也没有后续。在那里发送一条消息即可开始新的一轮。",
+  "Its last turn failed and nothing followed. Send a message there to start a fresh turn.": "它的最后一轮失败了，之后也没有后续。在那里发送一条消息即可开始新的一轮。",
+  "Recovery stopped": "恢复已停止",
+  "The browser did not pick up this chat's repair, so the app stopped retrying. Open its tab again and recovery resumes.": "浏览器没有接手这个聊天的修复，因此应用已停止重试。重新打开它的标签页即可继续恢复。"
 }

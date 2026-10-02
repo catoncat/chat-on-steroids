@@ -1812,7 +1812,7 @@ async function reconcileBackgroundWindow(policy) {
   return inBackgroundWindow(async () => {
     let window = await storedBackgroundWindow();
     const tabs = await chrome.tabs.query({});
-    const owned = tabs.filter(tab => Number.isInteger(tab.id) && Number.isInteger(tab.windowId) && owns(tab));
+    const owned = tabs.filter(tab => Number.isInteger(tab.id) && Number.isInteger(tab.windowId) && !tab.pinned && owns(tab));
     if (!window) {
       // Only adopt a window made entirely of app-owned tabs. A personal window
       // containing one managed conversation is not authority over its other tabs.
@@ -1831,7 +1831,7 @@ async function reconcileBackgroundWindow(policy) {
       // async boundary so navigation cannot move an unrelated replacement tab.
       try {
         const current = await chrome.tabs.get(tab.id);
-        if (!owns(current) || current.windowId === window.id) continue;
+        if (current.pinned || !owns(current) || current.windowId === window.id) continue;
         await chrome.tabs.move(current.id, { windowId: window.id, index: -1 });
       } catch { /* A closing/navigating tab is reconsidered by the next ordinary status pass. */ }
     }
@@ -2253,6 +2253,13 @@ function catalogTabNonce(tab) {
     return url.origin === 'https://chatgpt.com' && url.pathname === '/' && /^[a-f0-9-]{36}$/i.test(nonce || '') ? nonce : null;
   } catch { return null; }
 }
+
+/** A command-owned opening is authored work, never an idle model-catalog surface. */
+function catalogCandidateTab(tab) {
+  const custody = discardProtectedTabs[String(tab?.id)];
+  return !(custody && custody !== true && commandMarkerId(custody.commandId));
+}
+
 function inspectRequestedModels(request) {
   if (modelCatalogFlight) return modelCatalogFlight;
   const intent = connectionEpoch;
@@ -2268,7 +2275,11 @@ function inspectRequestedModels(request) {
   };
   let targetNonce = null;
   modelCatalogFlight = (async () => {
-    const observed = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+    // A worker/resume tab gets command custody before it has a provider conversation. A passive
+    // catalog refresh can arrive in the same maintenance pass that created that tab; borrowing
+    // its still-loading composer races the bootstrap that owns it. Keep command-owned openings
+    // out of discovery until their command custody is released.
+    const observed = (await chrome.tabs.query({ url: CHATGPT_TAB_URLS })).filter(catalogCandidateTab);
     const owner = (await chrome.storage.session.get('modelCatalogOwner')).modelCatalogOwner;
     if (wanted && !current()) return;
     if (wanted && owner?.nonce === wanted.nonce && owner.opening) { await waiting('opening'); return; }
@@ -2828,7 +2839,11 @@ async function performBrowserRepairs(repairs, policy) {
         const draftOnly = reason === 'compaction';
         const check = inspectTurn ? await tabReply(target.id,
           { type: 'clf-repair-check', conversationId, draftOnly }, documentId ? { documentId } : undefined) : null;
-        if (check?.safe === false) continue;
+        if (check?.safe === false) {
+          // The repair stays handed for the next pass; the app logs once why the page held it.
+          await call(`/status?repairHeld=${encodeURIComponent(token)}&why=${encodeURIComponent(check.why || 'unknown')}`);
+          continue;
+        }
         const claim = await call('/repairs/claim', { method: 'POST', body: JSON.stringify({ token }) });
         if (!claim.ok || claim.data?.allowed !== true) continue;
         if (target && !suspended) {
@@ -2866,15 +2881,23 @@ async function performBrowserRepairs(repairs, policy) {
           continue;
         }
       }
-      if (target && (reason === 'unattributed' || reason === 'blind')) {
+      if (target && (reason === 'unattributed' || reason === 'blind' || reason === 'assistant-error')) {
         // An attribution refresh exists to make a live page report again, not to rescue a
         // broken one, and a reload in the middle of a stream ends that stream: ChatGPT answers
         // it with "Resume stream unavailable" or "could not be loaded", and the turn is lost.
-        // Reported in #393 and measured on 2026-09-26. A page that answers that it is streaming
-        // is alive; stand down and let the incident's next pass decide.
-        const status = await tabReply(target.id, { type: 'clf-page-status' });
-        if (status?.ok === true && status.streaming === true) {
+        // Reported in #393 and measured on 2026-09-26. Interrupted-response recovery has the
+        // same destructive edge once ChatGPT has already recovered: keep a resumed stream queued
+        // for another pass, and retire the episode without navigation only after its exact
+        // transport error has disappeared. A still-visible error keeps the existing reload path.
+        const status = await tabReply(target.id, { type: 'clf-page-status' },
+          documentId ? { documentId } : undefined);
+        if (status?.ok === true && status.streaming === true &&
+            (reason !== 'assistant-error' || status.assistantError === false)) {
           await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}`);
+          continue;
+        }
+        if (reason === 'assistant-error' && status?.ok === true && status.assistantError === false) {
+          await call(`/status?repaired=${encodeURIComponent(token)}&repairAction=preserved`);
           continue;
         }
       }
@@ -3202,7 +3225,7 @@ const HANDLERS = {
     }
     if (message.recoveryAction && message.owner !== owner) return { ok: false };
     const result = await call(typeof message.partial === 'string' ? '/input/progress' : typeof message.response === 'string' ? '/input/answer' : message.fail === true ? '/input/fail' : message.ack === true ? '/input/ack' : '/input/claim', {
-      method: 'POST', body: JSON.stringify({ id, owner, conversationId, recoveryAction: ['stop', 'stopped'].includes(message.recoveryAction) ? message.recoveryAction : undefined, silenceBusyTurnId: typeof message.silenceBusyTurnId === 'string' ? message.silenceBusyTurnId : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined })
+      method: 'POST', body: JSON.stringify({ id, owner, conversationId, recoveryAction: ['stop', 'stopped'].includes(message.recoveryAction) ? message.recoveryAction : undefined, silenceBusyTurnId: typeof message.silenceBusyTurnId === 'string' ? message.silenceBusyTurnId : undefined, recoveryVeto: message.recoveryVeto === 'page-final' ? 'page-final' : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, detail: typeof message.detail === 'string' && /^[a-z-]{1,40}$/.test(message.detail) ? message.detail : undefined, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined })
     });
     if (typeof message.response === 'string' && message.lifetime === 'temporary-planner' && result.ok && result.data?.ok === true && ownsDocument(source)) {
       // Acceptance retires this exact helper immediately. Fresh page proof still
@@ -4153,7 +4176,7 @@ chrome.tabs.onUpdated.addListener((id, changeInfo, tab) => {
  * receive both its static manifest injection and this recovery injection.
  */
 const CHATGPT_TAB_URLS = ['https://chatgpt.com/*', 'https://chat.openai.com/*'];
-const PAGE_RECORDER_VERSION = 21;
+const PAGE_RECORDER_VERSION = 22;
 
 let deferredRecoveryWork = null;
 
@@ -4236,6 +4259,18 @@ function successorChatBase(offered, source) {
 
 async function placeSuccessorChat(raw, tabId) {
   const id = commandMarkerId(raw && raw.id);
+  const placementError = error => error && typeof error.message === 'string' && error.message
+    ? error.message
+    : String(error);
+  const failPlacement = async reason => {
+    if (!id) return;
+    try {
+      await ackCommand(id, 'failed', reason, null, null, null);
+    } catch {
+      // ackCommand journals before transport. If local persistence itself fails, the command
+      // deadline remains the only truthful fallback; do not mint another opening attempt.
+    }
+  };
   if (id && raw.background === true) {
     const marker = `clf=${encodeURIComponent(id)}`;
     const model = commandModelSlug(raw.model);
@@ -4243,7 +4278,14 @@ async function placeSuccessorChat(raw, tabId) {
     const query = [marker];
     if (model) query.push(`model=${encodeURIComponent(model)}`);
     if (effort) query.push(`reasoning_effort=${encodeURIComponent(effort)}`);
-    const created = await createChatTab(`https://chatgpt.com/?${query.join('&')}#${marker}`, true);
+    let created;
+    try {
+      created = await createChatTab(`https://chatgpt.com/?${query.join('&')}#${marker}`, true);
+    } catch (error) {
+      await failPlacement(`successor_tab_create_failed: ${placementError(error)}`);
+      return;
+    }
+    // The tab exists and loads its marker: its page redeems the command, or the deadline reports it.
     await protectCreatedTab(created, id);
     return;
   }
@@ -4284,11 +4326,17 @@ async function placeSuccessorChat(raw, tabId) {
       const query = [marker];
       if (model) query.push(`model=${encodeURIComponent(model)}`);
       if (reasoningEffort) query.push(`reasoning_effort=${encodeURIComponent(reasoningEffort)}`);
+      let created;
       try {
-        const created = await createChatTab(`${base}?${query.join('&')}#${marker}`, false, raw.active !== false);
+        created = await createChatTab(`${base}?${query.join('&')}#${marker}`, false, raw.active !== false);
+      } catch (error) {
+        await failPlacement(`successor_tab_create_failed: ${placementError(error)}`);
+        return;
+      }
+      try {
         await protectCreatedTab(created, id);
       } catch {
-        // Opening authority was spent. The command deadline reports an unsuccessful attempt.
+        // The tab exists and loads its marker: its page redeems the command, or the deadline reports it.
       }
       return;
     }
@@ -4296,12 +4344,14 @@ async function placeSuccessorChat(raw, tabId) {
   let home = null;
   try {
     home = await chrome.tabs.get(tabId);
-  } catch {
-    // The polling tab closed between its request and this reply. Its operation has spent
-    // opening authority, so the command deadline reports the unsuccessful placement.
+  } catch (error) {
+    await failPlacement(`successor_home_tab_unavailable: ${placementError(error)}`);
     return;
   }
-  if (!home || typeof home.windowId !== 'number') return;
+  if (!home || typeof home.windowId !== 'number') {
+    await failPlacement('successor_home_window_missing');
+    return;
+  }
   // Both a query and a fragment, matching the app's commandUrl(): ChatGPT rewrites its own URL
   // during boot and which of the two survives has changed between builds.
   const base = successorChatBase(raw.project, raw.homeConversationId);
@@ -4315,11 +4365,17 @@ async function placeSuccessorChat(raw, tabId) {
   // Directly after the chat it continues, so a handoff reads as one piece of work instead of a
   // tab appended to the far end of a long strip.
   if (typeof home.index === 'number') create.index = home.index + 1;
+  let created;
   try {
-    const created = await chrome.tabs.create(create);
+    created = await chrome.tabs.create(create);
+  } catch (error) {
+    await failPlacement(`successor_tab_create_failed: ${placementError(error)}`);
+    return;
+  }
+  try {
     await protectCreatedTab(created, id);
   } catch {
-    // Opening authority was spent. The command deadline reports an unsuccessful attempt.
+    // The tab exists and loads its marker: its page redeems the command, or the deadline reports it.
   }
 }
 

@@ -288,6 +288,9 @@ hooks precede browser traffic. Then the secure window/tray, bridge for recording
 the opt-in local control API, independent retention maintenance, optional connector
 auto-connect and updater lifetime begin.
 The current first-window model-discovery exception is noted in §21.
+A restored catalog is observed again only on Refresh, after a send whose model could not be
+confirmed, or once per saved Settings choice it does not offer (Goal helper, default worker:
+`refreshForUnoffered`). Those two are passive: they ask an open ChatGPT page, never open a browser.
 
 Settings use validated current config and `effectiveCapabilities()`. Fresh-install defaults,
 legacy omitted fields and malformed-file recovery are three different cases. User choices must
@@ -516,6 +519,21 @@ metadata retains the Fiber path. Fetch reattachment at DOM readiness captures ea
 wrapper separately and deduplicates responses to avoid recursion through page instrumentation.
 The native `f/conversation/resume` stream uses the same complete-event reader. Observer version 2
 has an explicit refresh/disposal handle, also reached by existing MAIN-helper restoration.
+The same fetch wrapper observes exact same-origin POST `f/conversation/resume` HTTP 404s.
+Only `conversation_id` leaves a string JSON request body (bounded to 16 KiB); unsupported or
+id-less bodies abstain. Before fetch yields, synchronous `cos-resume-request` carries a unique
+id and conversation to content, which freezes the current open generation, native question,
+navigation epoch and request order. `cos-resume-response` retires that custody with the HTTP
+status (null for rejected/unknown/duplicate responses) and optional `streamOpened:true` only
+for 200 `text/event-stream` headers. Content retains at most 16 requests;
+readiness/restoration never replays them. A 404 earns `chat_error` with `reason:stream_gone`
+and `recoverable:true` only while that exact generation/question/epoch still owns it and
+has no native final or Stop. Idle-load 404s, late/foreign requests and ordinary polling abstain.
+The fact neither closes the turn nor renews activity. A newer resume's SSE-open headers,
+terminal evidence or navigation retires its page projection; local tool work behind a broken
+stream does not. Older 404s cannot resurrect failure after a newer successful resume.
+Recorder protocol 22 installs the matching isolated handler; MAIN observer replacement keeps
+its existing nonstreaming disposal gate. Tests: `usage-observer`, `content-script`, `bridge`.
 Replacing a versioned instance cancels its readers and retires listeners; a provider's wrapper
 can still delegate through an inactive instance. A legacy boolean has no disposal handle and
 requires a fresh document; `__cosUsageObserverNeedsReload` records that fact without an extra reload grant.
@@ -601,6 +619,16 @@ remote model receipt.
 
 **Intent:** a model can read or edit only paths approved for the relevant filesystem tool.
 Native and virtual spellings must reach the same decision.
+
+On Windows, folder approval also accepts existing local WSL folders beneath a distribution
+through `\\wsl.localhost\<distro>\...` or `\\wsl$\<distro>\...` when that alias works on the host.
+Other UNC hosts remain rejected by the picker/drop approval flow. Entire drives and entire
+WSL distributions cannot be approved. Native UNC tool paths must first match an already
+approved canonical root before filesystem lookup; virtual paths use the same containment and
+link checks. WSL server/distribution aliases are case-insensitive, but Linux components retain
+exact case through containment, virtual suffixes and project identity. Unsupported Linux links
+fail closed rather than becoming missing-file write targets. This does not select a Linux shell:
+Windows command execution keeps its existing shell and the user may explicitly invoke WSL.
 
 `sandbox.ts` owns root selection, virtual/native normalization, reserved names, traversal and
 invalid host-path rejection, symlink/junction/reparse checks, canonical existing targets and
@@ -950,7 +978,8 @@ for restored tickets and before claims; a genuine full final uses ordinary compl
 A running local tool still vetoes Send.
 
 Queued after-turn work and pending immediate corrections use **two-minute**
-silence/refresh authority for normal and unknown models; only proven Pro uses **ten minutes**.
+silence/refresh authority for normal and unknown models; proven Pro uses **ten minutes** and a
+non-Pro Extra high/Max/Ultra turn **twenty** (see the model table).
 Normal and unknown models then listen for **one minute
 from the acknowledged refresh** before queued-checkpoint delivery. The existing
 activity grant and outbox listening deadline own this wait. Thinking failed keeps two minutes
@@ -1040,7 +1069,12 @@ time alone cannot take this path. The same outbox expiry rule applies during nor
 Desktop delivery captures the native user-message identity inside the same Send acceptance
 operation that proves its text and route. It must not discard that receipt and rediscover the
 row after an await: React may already have replaced it. Navigation still revokes the operation;
-composer clear or a Stop button alone cannot supply a desktop delivery receipt.
+composer clear or a Stop button alone cannot supply a desktop delivery receipt. After the click,
+the wait for that receipt is bounded (`DESKTOP_RECEIPT_MS`) and never clicks again. When it ends
+unproven, the page reports the fixed reason `Native Send receipt was not confirmed.` and frees its
+input slot. `failBrowserInput` then retires the authorized row as the same uncertain send the
+outbox expiry produces (cancelled, never resent, a late exact receipt still confirms it), openings
+and Continue included, so later messages in that chat are claimable without a reload (#821).
 
 Confirmed terminal input receipts stop owning history retries after their exact local session
 directory is positively absent under an available history root. The outbox durably retires them
@@ -1696,8 +1730,9 @@ Model names and recovery policy checked against native picker metadata on **2026
 
 | Display family / compatible short name | Execution identity / selected effort | Silence refresh |
 | --- | --- | --- |
-| GPT-5.6 Sol / 5.6 Sol / Sol | `gpt-5-6`, `gpt-5-6-thinking`; Instant/Medium/High/Extra High | 2 minutes, then 1 minute listening after confirmed refresh |
-| GPT-5.5 / 5.5 | `gpt-5-5-instant`, `gpt-5-5-thinking`; non-Pro efforts | 2 minutes, then 1 minute listening |
+| GPT-5.6 Sol / 5.6 Sol / Sol | `gpt-5-6`, `gpt-5-6-thinking`; Instant/Medium/High | 2 minutes, then 1 minute listening after confirmed refresh |
+| GPT-5.5 / 5.5 | `gpt-5-5-instant`, `gpt-5-5-thinking`; non-Pro efforts up to High | 2 minutes, then 1 minute listening |
+| Any non-Pro family at Extra high / Max / Ultra | selected `xhigh`, `max` or `ultra` effort | 20 minutes (Thinking failed: 2), then 1 minute listening |
 | GPT-5.6 Pro / 5.6 Pro; GPT-5.5 Pro / 5.5 Pro | `gpt-5-6-pro`, `gpt-5-5-pro`, or an explicitly selected `pro` effort | 10 minutes |
 | GPT-6 Pro / 6 Pro / Astra | `gpt-6-pro`, `gpt-6-astra`; exact Astra identities retain their finish policy | 10 minutes |
 | Unobserved / unknown model | No invented model identity | 2 minutes, then 1 minute listening |
@@ -1710,6 +1745,15 @@ it need not repeat an unchanged selection in every turn-start batch. Recovery us
 selection for the exact conversation, pins known turn identity, and resolves previously unknown
 selection without advancing its last-work timestamp. Unknown timing does not invent normal-model
 proof for other features. All continuation paths still require their exact source/MCP/queue proof.
+
+Extra high, Max and Ultra can think for more than ten minutes without changing the page (#786).
+The bridge's `deliberate` grant flag widens only the silence window; the grant stays `other`
+and inherits no Pro rule. The flag belongs to the turn that armed the grant: a later picker
+change cannot rewrite it, while late exact picker evidence for a still-unknown grant widens that
+same grant from its existing work timestamp. The content script freezes the generation's first
+exact picker reading. Its ten-minute no-progress report waits for such a turn only while the
+route, native Stop, this document's section owner and that section's unfinished Fiber turn are
+all proven; losing any of them makes the already-expired report due at once.
 
 Direct Chrome selection is observed even with the picker closed. The existing MAIN scan reads
 the current native picker state, including September's retained `dropdownContent.props`, then
@@ -1848,6 +1892,14 @@ An unexpected lost/discarded page retains its existing recovery contract. A newe
 of the exact departed page clears the dismissal; unresolved work reuses its last exact MCP
 timestamp and normal deadline. A tab close never fabricates provider completion.
 
+Several browsers can run the extension against one app. Each sends a random
+`x-extension-browser` id; its `/status` pass reports the chats it has open, and a browser that
+reported a chat and is still polling (60 s) holds it. Work for an existing chat — a queued
+input, a repair, a Compact & Resume replacement with no page waiting — goes only to a browser
+holding that chat. A browser handed work for a chat it lacks opens the chat itself, so a second
+copy would otherwise run that work. A chat open nowhere, like a brand-new chat, goes to the
+first browser it is handed to while that browser polls. Requests without an id are not told apart.
+
 Browser-only preferences suppress automatic opening as defined by their owner. Background
 operations reuse a suitable existing window unchanged. If a new background window is actually
 authorized, its shared layout policy bounds it to 45% of the work area and 800×600, then
@@ -1928,7 +1980,8 @@ and workers retain their separate lifecycle. Silence intervention requires an ex
 local MCP call in the current source turn, including at refresh and restored-ticket admission.
 Observing a website chat, native searches and earlier-turn calls do not grant that permission.
 An eligible turn's actual-work silence earns one initial reload:
-two minutes normally/unknown, ten for proven Pro; Thinking failed shortens only Pro to five.
+two minutes normally/unknown, ten for proven Pro, twenty for non-Pro Extra high/Max/Ultra;
+Thinking failed shortens Pro to five and Extra high/Max/Ultra to two.
 These deadlines use the last real work, not the failure observation or its replay. After confirmed
 reload, idle permits Continue immediately if the same question still lacks a final. Native busy
 gets one additional minute (Pro: five), measured from the confirmed browser action. A slow reload
@@ -2132,8 +2185,9 @@ multiple candidates get a fixed one-minute window. The second and final attempt 
 minutes after that incident began, only if new unattributed work on that same request started
 after the first browser attempt and the request remains unresolved. Another request cannot
 renew this budget. Headerless activity cannot prove the same request and gets no second attempt.
-Exactly attributed current-owner MCP calls remove their chat from the original cohort; exact
-correlation resolves the matching request. The cohort survives activity-label expiry, but never
+Exactly attributed current-owner MCP calls remove their chat from the original cohort, including
+one already recorded in the chat's frozen turn when the incident opens: that chat has shown its
+join works, so an unknown call is not its own. Exact correlation resolves the matching request. The cohort survives activity-label expiry, but never
 Stop, block, a completed/replaced turn, session rebind or supersession. Later active chats do not
 join it. These deadlines follow the recorder's separate 20-second request-id grace.
 Attribution repair handouts retain their token after an absent acknowledgement. The extension
@@ -2142,10 +2196,16 @@ late attribution or lost owner authority denies that claim. A reload receipt pro
 not that attribution recovered. Other repair reasons retain their own delivery policy.
 Silence, missing-tab, stalled-tab and queued/Goal repairs also use that exact pre-action claim. Unclaimed
 offers retain one token; a claimed action is not reissued merely because its ACK is absent.
+When an unclaimed repair exhausts its offers the chat is marked page-less, the session gets its timeline note
+and the user gets one notification through the stuck-chat notifier, once per episode; a page that asks for
+its chat again lifts the verdict.
 A responsive page flushes native progress and Stop before the main claim, then rechecks its
 captured work/question/document after the claim. An explicit veto or navigation prevents the
 browser action. An unresponsive page supplies no new proof; the original main-process grant
 still requires independent validation. These checks use existing RPC and repair owners.
+A veto names its reason (`why`: page-changed, stop-requested, tool-running, sending, page-busy,
+compaction, draft, changed). The extension reports it with `/status?repairHeld=<token>&why=`, which
+hands nothing out and changes no repair; the app logs each token and reason once (#820).
 The maintenance projection must retain each repair's reason. Compaction uses the same two
 document checks in draft-only mode: its exact ticket can recover its busy source, but an unsent
 text/attachment draft or a new user question vetoes the reload. Suspended shells are checked
@@ -2168,6 +2228,15 @@ markers do not repeat the same notice, and commitment is logged only after actua
 Neither these notices nor page-helper observations grant a browser action.
 Recoverable notice equality ignores a trailing native Retry button label while retaining the
 original recorded error text. Canonical-question ownership still separates genuinely new work.
+`stream_gone` and a recoverable DOM notice for the same canonical question coalesce without
+comparing provider wording; the first recorded notice retains its text/reason. The bridge
+rechecks H2's exact currently open recorded turn and absence of a final before granting the
+existing `assistant-error` episode, whose key is the authored question, independent of text.
+`clf-page-status.assistantError` includes that document's current machine failure even without
+a rendered error card; the existing rule stays that a live stream defers the reload only
+once that error is gone. An exact no-action failure receipt releases the
+reserved reload budget; preservation after recovery spends none. Existing cooldown, claim,
+Stop/draft/tool, completion and after-turn gates continue to own action; no new timer exists.
 The renderer keeps acknowledged Reloaded/Reopened receipts visible after tools resume, colors
 those notices with the existing accent, and explains the one-error-reload budget and subsequent
 silence wait. Trying/failed receipts do not prove a reload; only actual completion is resolved.
@@ -2264,7 +2333,11 @@ awaiting-summary -> awaiting-chat -> claimed -> committing -> committed
    tail. Before automatic Stop, require a fresh native source-turn scan and receipt of its
    issued connector calls; local completion alone can precede delivery to ChatGPT. Missing
    scans or vanished calls cannot acknowledge an observed pending result. The bounded wait
-   leaves an unsent automatic ticket durable when receipt remains unknown. Recheck the exact
+   (six minutes, longer than one five-minute empty `write_stdin` poll plus the model's pause, so
+   a turn that keeps polling long commands is stopped in the gap between two calls; #825)
+   leaves an unsent automatic ticket durable when receipt remains unknown. A turn that ChatGPT
+   ends by itself (no Stop button on two polls, no local call running) counts as received: there
+   is nothing to stop, and a retry would skip the wait anyway. Recheck the exact
    source question, route and document across every await, then retain the local-tool drain.
    Mixed visible/pre-row calls retain their outstanding request evidence, and automatic Stop
    also waits for local execution to drain before the final native scan. Native Code Mode
@@ -2281,13 +2354,23 @@ awaiting-summary -> awaiting-chat -> claimed -> committing -> committed
    known pre-dispatch failure, but never click again merely because the receipt is missing.
 3. **Capture exact provenance.** Match the authored handoff request and assistant brief by
    token/message/turn identity. Enforce minimum and bounded brief content; do not capture the
-   latest convenient assistant text. The user may edit the **content instructions** used to
+   latest convenient assistant text. Once the authored handoff anchor is durable (`sent`), binding
+   it lets the bridge capture from the recorder's bounded interval after that anchor (store
+   `readHandoffResponse`): exactly one local generation, its latest boundary a completed
+   `turn_end`, exactly one nonempty final. That outranks the mounted Fiber shape, which can
+   lose the terminal when ChatGPT remounts a long answer under another assistant id. A second
+   generation for the same user message (Retry/regenerate) fails closed; never pick the
+   newest final. The user may edit the **content instructions** used to
    write that brief; continuation markers, send/provenance framing, tool-detail policy and the
    requirement that the compaction reply contain only the brief remain code-owned invariants.
    The shipped content prompt prefers a dense roughly 2k-6k-token operational handoff for a
    substantial session, shorter when less state exists and longer only when correctness needs
    it. Preparing a brief does not yet publish a rebind.
-4. **Elect B and commit.** Destination creation/claim has one opening owner. B must present
+4. **Elect B and commit.** Destination creation/claim has one opening owner. B opens in the
+   browser that holds A: the capture reply places it beside the capturing page, and a resume
+   queued with no page waiting is offered to a browser still reporting A open (§13). Only when
+   no browser holds A does the OS opener choose; an uncollected offer falls back to it after
+   60 s. B must present
    the exact continuation context; early B observations are gated to prevent a shadow local
    session. Persist the committing decision, rebind S's metadata, then publish projections.
    **Durable metadata rebind is the point of no return.** Before it, failure leaves A current;
@@ -2303,19 +2386,25 @@ can outlive a transport command; expiration releases transport, not permission f
 blind Send. Automatic tickets can wait indefinitely before the request was sent and retain a
 six-hour sent-request window; manual transport is shorter (ten minutes). Pickup budgets depend
 on phase: unsent 2m×5, writing 5m×3, opening 15m×3. These are bounded recovery of one obligation,
-not fresh compaction attempts. Re-observe the exact page before advancing its state.
+not fresh compaction attempts. After writing 3/3 the sent transaction stays protected with no
+fourth reload; one visible timeline note says it is stuck, and lifetime limits stay terminal. Re-observe the exact page before advancing its state.
 A manual ticket whose frozen source selection is Pro instead gets a one-hour deadline while the
 brief is being written: Pro reasoning is not visible transcript, so it produces no text growth
 to renew the ordinary clock, and a healthy long Pro generation used to be swept as "took too
 long". Captured/claimed phases and an unobserved selection keep the ordinary ten minutes.
 
 An explicit desktop compaction immediately uses the existing exact-tab recovery path, which can
-open a missing source while Chrome is already running. It may replace an unclaimed ordinary
+open a missing source while Chrome is already running. It also passes a user's earlier close of that tab: the
+close pauses only automatic repairs, and pressing Compact & resume is the return. It may replace an unclaimed ordinary
 repair, but cannot create a second browser action while another repair is already claimed.
 Every compaction reload rechecks its original continuation token and phase at handout and the
 browser action claim. Cancellation, replacement, source dispatch and completed capture revoke
 obsolete pickup authority. Recovery text distinguishes an unsent request from an outstanding
-answer; neither implies a completed brief exists. A reloaded source waits for its visible,
+answer; neither implies a completed brief exists. An explicit desktop compaction's reload says it sends the
+request; nothing failed. Every reload row's id names the chat it reloaded
+(`browser-repair:<chat>:<id>`) and the page paints it only in that chat. B's page may record its
+sent resume message after B's first attributed call already committed; that message is the
+feed's resume boundary, where A's rows stop. A reloaded source waits for its visible,
 editable composer and recorded original question before freezing the source identity or stopping
 the turn. Already observed identities and a real user Send remain cancellation boundaries during
 hydration; an empty loading DOM must not be treated as a different conversation. The source
@@ -2327,7 +2416,10 @@ An unnamed destination never reports a successful resume ACK, even after a trans
 Keep its armed dispatch and journal gate for exact marker reconciliation; a missing id plus
 generic timeout text is not proof of non-delivery and cannot authorize another Send.
 Continuation readback accepts one layer of Markdown escaping on ASCII punctuation, never
-escapes on letters/digits. Main/store/renderer and the unbundled content script must agree on
+escapes on letters/digits. The same fallback turns a line-opening `&#x20;` back into a space:
+the page writes an indented line's first space that way (#821). An `&#x20;` inside a line
+stays literal. The `COS_CONTEXT` frame readers (`shared/user-prompt.ts`, `chatgpt-dom.js`)
+follow the same order: exact first, then this one layer. Main/store/renderer and the unbundled content script must agree on
 the marker and preserve its exact removable span. Match an escaped marker separately from
 the brief before considering a fully escaped rendering, preserving literal path/glob backslashes.
 Bootstrap receipt fallback remains restricted to app-owned opening messages and retains native
@@ -2774,6 +2866,13 @@ evicted. Historical browsing leaves committed inputs with history. Never infer m
 the minimum event timestamp: old observations and tool start times can occur on newer pages.
 Pushes and async loads are scoped to selection/draft generation; a late load must not overwrite
 focused edits or a newer A → B → A view.
+`session:changed` carries a `SessionChange`: the recorder coalesces the exact local ids it
+wrote in one 400 ms burst (`sessionIds`; input-history offered → confirmed revisions publish
+their owner there too), and a mutation without enumerable owners, such as image-storage
+cleanup, sends `allTranscripts`. A payload-less push refreshes only catalog/controls. The
+scheduled refresh rereads the selected transcript only when it is named, all transcripts are
+invalidated, or its refreshed summary's `updatedAt`/`events` differ from those its last live-tail
+read was requested against; manual/visible refreshes still reread. Losing the selected row from the catalog clears its transcript.
 
 First-run Setup keeps the six-step flow, with reviewed screenshots in `renderer/setup-images/`
 and translated numbered highlights in `renderer/setup-guide.ts`. Sensitive identifiers must
@@ -2831,6 +2930,16 @@ status checks or waits on the same process inside the existing activity disclosu
 each row on expansion; a failed call breaks the fold. An immediately preceding recorded progress
 line may title that disclosure as the observed activity phase. Tool diff counts and shell/result
 headers are projections of recorded data, not new execution or completion evidence.
+A working turn's timeline ends with one live row: the call this app is running for the chat,
+else a step ChatGPT's page names in the progressive, else Thinking. `sessions:runningTools`
+answers it from `mcp/call-context.ts` `runningToolActivity`, whose caption the kernel builds
+from the call's arguments when it starts. It shares one ownership rule, `exactOwner`, with
+`runningToolProgress`: a call counts for a chat by its placed conversation or, while it still
+runs, by the page's exact proof of its request id (`requestCorrelation`, installed through
+`setRequestOwner`). The anonymous safety counters never feed it. The renderer asks at most once
+a second while the chat works. The row is presentation only: it records nothing and is not
+completion evidence. Page step labels are recognised by English wording; in other languages
+the row says Thinking.
 Setup's Show/Hide guide button stays available even while setup is incomplete. Manual collapse
 survives status pushes. Profile management stays out of first-run Setup: a compact row below
 Language in Appearance has a dropdown, a plus button with a name dialog and a delete button
@@ -2892,7 +3001,10 @@ App-owned external/local links cross their validated main-process route.
 
 English, Spanish, Simplified Chinese, Traditional Chinese, Japanese, Turkish, French, European Portuguese, Brazilian Portuguese and German use the existing UI
 catalogs (`i18n.ts`, `locales/{es,zh-CN,zh-TW,ja,tr,fr,pt-PT,pt-BR,de}.json`), with the selected locale in
-`cos.ui.language`. Setup uses SVG flags only, with native language names in tooltips and
+`cos.ui.language`. The main process has no catalogs: the renderer translates the allowlisted
+stopped-chat notice texts (`shared/stop-notice.ts`) and publishes them over `ui:stopNoticeTexts`
+at startup and on each language change; unknown keys are refused and untranslated notices stay English.
+Setup uses SVG flags only, with native language names in tooltips and
 accessible labels; Appearance retains the named language dropdown. Both controls share the
 same persisted preference. `translate="no"` protects text and attributes, including native
 language names. Japanese has its own system-font fallbacks and CJK wrapping. Changing language

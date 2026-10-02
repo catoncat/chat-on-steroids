@@ -1,4 +1,9 @@
 {
+  "Jump to latest": "Ir para o mais recente",
+  "Previous source": "Fonte anterior",
+  "Next source": "Fonte seguinte",
+  "{0} more sources were not recorded with this reply.": "Outras {0} fontes não foram gravadas com esta resposta.",
+  "Thinking": "A pensar",
   "Copy answer": "Copiar resposta",
   "Export as Markdown": "Exportar como Markdown",
   "This answer": "Esta resposta",
@@ -379,7 +384,7 @@
   "Add attachments": "Adicionar anexos",
   "Chat mode": "Modo do chat",
   "Chat automation": "Automatização do chat",
-  "What should this chat achieve?": "O que deve este chat alcançar?",
+  "Optional. Leave empty to work toward what you asked in this chat.": "Opcional. Deixe em branco para seguir o que pediu neste chat.",
   "Goal behavior": "Comportamento do Goal",
   "Estimated session context": "Contexto estimado da sessão",
   "Reload ChatGPT models": "Recarregar modelos do ChatGPT",
@@ -1495,7 +1500,7 @@
   "Goal/Loop is off for this chat. Turn it on to allow continuation.": "O Objetivo/Ciclo está desligado neste chat. Ative-o para permitir a continuação.",
   "Internal Chromium · ready": "Chromium interno · pronto",
   "No API key is configured for the continuation provider. Add one in Settings, or select the ChatGPT continuation source.": "Não há uma chave API configurada para o fornecedor de continuação. Adicione uma nas Definições ou selecione o ChatGPT como origem da continuação.",
-  "No MCP tool call was recorded in the last response, so the app cannot tell whether the tool connection was lost. Automatic continuation is paused; Loop remains enabled. Check the tunnel and Core connector before continuing.": "Não foi registada nenhuma chamada a ferramentas MCP na última resposta, pelo que a aplicação não consegue saber se a ligação às ferramentas se perdeu. A continuação automática está em pausa; o Ciclo permanece ativo. Verifique o túnel e o conector Core antes de continuar.",
+  "No MCP tool call was recorded in the last response. ChatGPT may be asking you something, or the tool connection may have been lost. Answer it, or check the tunnel if tools stopped working. Automatic continuation is paused; Loop remains enabled.": "Não foi registada nenhuma chamada a ferramentas MCP na última resposta. O ChatGPT pode estar a fazer uma pergunta ou a ligação às ferramentas pode ter sido perdida. Responda à pergunta ou verifique o túnel se as ferramentas deixaram de funcionar. A continuação automática está em pausa; o Loop permanece ativo.",
   "No recorded conversation is available to continue. Send a task first.": "Não há nenhuma conversa registada para continuar. Envie primeiro uma tarefa.",
   "No task was provided. Enter a task before starting Goal/Loop.": "Não foi indicada nenhuma tarefa. Escreva uma antes de iniciar o Objetivo/Ciclo.",
   "PDF exceeds the preview limit": "O PDF excede o limite de pré-visualização",
@@ -1749,5 +1754,10 @@
   "This chat (estimate)": "Este chat (estimativa)",
   "Context limit": "Limite de contexto",
   "Filled": "Ocupado",
-  "Compacts automatically at": "Compacta automaticamente a partir de"
+  "Compacts automatically at": "Compacta automaticamente a partir de",
+  "A chat stopped": "Um chat parou",
+  "Its last turn produced nothing and nothing followed. Send a message there to start a fresh turn.": "O último turno não produziu nada e nada se seguiu. Envie uma mensagem aí para iniciar um novo turno.",
+  "Its last turn failed and nothing followed. Send a message there to start a fresh turn.": "O último turno falhou e nada se seguiu. Envie uma mensagem aí para iniciar um novo turno.",
+  "Recovery stopped": "Recuperação interrompida",
+  "The browser did not pick up this chat's repair, so the app stopped retrying. Open its tab again and recovery resumes.": "O navegador não assumiu a reparação deste chat, por isso a app deixou de tentar. Volte a abrir o separador e a recuperação continua."
 }
