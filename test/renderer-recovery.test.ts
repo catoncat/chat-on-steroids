@@ -135,3 +135,26 @@ it('shows the existing ticket pickup deadline after the native busy wait', () =>
   expect(host.textContent).toContain('Reload pending…');
   expect(host.textContent).not.toContain('sent');
 });
+
+it('shows a stopped pickup persistently with its attempt count and recovery reason', () => {
+  renderRecoveryCountdowns(host, [{ kind: 'pickup-stopped', deadline: 120_000, attempts: 3, next: 'queue' }], 0);
+  expect(host.hidden).toBe(false);
+  expect(host.textContent).toContain('Recovery stopped · next: Queued message');
+  expect(host.textContent).toContain('Stopped after 3 attempts');
+  expect(host.querySelector('.recovery-notice')?.getAttribute('title')).toContain('original queued input or Goal obligation remains saved');
+  expect(host.querySelector('[role="timer"]')?.getAttribute('aria-live')).toBe('off');
+});
+
+it('offers an action only where the caller supplies one, and explains what the interrupted-response reload does (#1032)', () => {
+  const action = (countdown: { kind: string }) => {
+    if (countdown.kind !== 'assistant-error') return null;
+    const button = document.createElement('button'); button.className = 'cancel-reload'; return button;
+  };
+  renderRecoveryCountdowns(host, [{ kind: 'assistant-error', deadline: 163_000 }], 0, action);
+  const row = host.querySelector('.recovery-notice')!;
+  expect(row.querySelector('.cancel-reload')).not.toBeNull();
+  expect(row.getAttribute('title')).toContain('reconnects');
+  expect(row.getAttribute('title')).not.toContain('New activity cancels');
+  renderRecoveryCountdowns(host, [{ kind: 'silence', deadline: 120_000 }], 0, action);
+  expect(host.querySelector('.cancel-reload')).toBeNull();
+});

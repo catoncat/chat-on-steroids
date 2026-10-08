@@ -48,9 +48,8 @@ function section(body, key) {
 export function checkPullRequest({ body, files, draft = false, fromFork = false, maintainerCanModify = true }) {
   const problems = [];
   const text = String(body || '');
-  if (!/(^|[\s(])#\d+\b/.test(text.replace(/<!--[\s\S]*?-->/g, ''))) {
-    problems.push('Link the issue this answers ("Fixes #123" or "Refs #123"). Open one first if none exists.');
-  }
+  // No issue is required: the description carries the why and the what, and discussion happens
+  // on the PR itself. A PR that closes an issue says "Fixes #123" so it closes on merge.
   if (section(text, 'why').length < 20) problems.push('Fill in "## Why": the root cause or the user problem, in a few sentences.');
   if (section(text, 'what').length < 20) problems.push('Fill in "## What changed": the behavior change, not a file list.');
 
@@ -65,9 +64,8 @@ export function checkPullRequest({ body, files, draft = false, fromFork = false,
     if (!tests.length && !optedOut) {
       problems.push('Add or update a test for the behavior change, or write "No test: <reason>" under "## Test".');
     }
-    if (tests.length && !/fail/i.test(testSection)) {
-      problems.push('Under "## Test", name the test and confirm it fails without your change.');
-    }
+    // Whether the new test fails without the change is proved by the "Fail-first test" job, which
+    // runs it against main's code. Requiring the word here as well only failed PRs on wording.
   }
 
   if (files.some((file) => UI.test(file.path)) && !/!\[[^\]]*\]\(|<img\s/i.test(section(text, 'screenshots')) &&

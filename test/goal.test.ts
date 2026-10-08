@@ -900,6 +900,65 @@ describe('the reply', () => {
     expect(view.reply).toBe('');
   });
 
+  it('keeps "the goal is met" as the run outcome for the app window after the page acts on it', async () => {
+    const sessionId = await seed('c-met');
+    globalThis.fetch = (async () => stream([delta('NO_REPLY'), 'data: [DONE]\n'])) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-met', turnId: 'g-1' });
+    const view = await settled('c-met');
+    expect(goal.goalOutcomeFor('c-met'), 'nothing to report before the page acts on it').toBeNull();
+    expect(goal.ackGoalDraft('c-met', view.token)).toBe(true);
+    // The page is done with it, so its own view goes quiet...
+    expect(goal.goalViewFor('c-met')).toBeNull();
+    // ...but the window still learns that this run ended with the goal met.
+    expect(goal.goalOutcomeFor('c-met')).toMatchObject({ stage: 'no-reply', turnId: 'g-1', reply: '' });
+  });
+
+  /**
+   * "The goal is met" needs nothing typed, so it must not wait for a page to come and act on it.
+   * Seen live on Windows (2026-10-05): the chat's tab closed while the model was deciding, its
+   * NO_REPLY was never acknowledged, the app restarted and lost the in-memory draft, and the
+   * turn stayed owed for the ledger's twelve hours, the Goal row spinning "Answer settling".
+   */
+  it('settles the owed turn as soon as the model says the goal is met, even if no page acknowledges it', async () => {
+    const sessionId = await seed('c-met-unacked');
+    await goal.acceptGoalReplyNow({
+      conversationId: 'c-met-unacked', sessionId, replyId: 'assistant-met-unacked', turnId: 'g-met', eventSeq: 3, blocked: false
+    });
+    globalThis.fetch = (async () => stream([delta('NO_REPLY'), 'data: [DONE]\n'])) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-met-unacked', turnId: 'g-met' });
+    expect((await settled('c-met-unacked')).stage).toBe('no-reply');
+
+    expect(goal.goalPendingReplyFor('c-met-unacked')).toBeNull();
+    expect(goal.pendingGoalReplies().map(owed => owed.conversationId)).not.toContain('c-met-unacked');
+    const saved = goal.snapshotGoalReplies();
+    expect(saved.replies).toContainEqual(expect.objectContaining({ replyId: 'assistant-met-unacked', state: 'handled' }));
+    goal.resetGoalStateForTests();
+    goal.restoreGoalReplies(saved);
+    expect(goal.goalPendingReplyFor('c-met-unacked'), 'still settled after a restart').toBeNull();
+  });
+
+  it('keeps the turn owed while a continuation waits to be typed', async () => {
+    const sessionId = await seed('c-typed-owed');
+    await goal.acceptGoalReplyNow({
+      conversationId: 'c-typed-owed', sessionId, replyId: 'assistant-typed-owed', turnId: 'g-typed', eventSeq: 3, blocked: false
+    });
+    globalThis.fetch = (async () => decision('continue', 'what about the tests')) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-typed-owed', turnId: 'g-typed' });
+    expect((await settled('c-typed-owed')).stage).toBe('ready');
+    // Only the page can type it; until it says it did, the turn is still owed.
+    expect(goal.goalPendingReplyFor('c-typed-owed')).toMatchObject({ turnId: 'g-typed' });
+  });
+
+  it('reports no outcome for a typed continuation the page has acted on', async () => {
+    const sessionId = await seed('c-typed');
+    globalThis.fetch = (async () => decision('continue', 'what about the tests')) as never;
+    goal.startGoalDraft({ sessionId, conversationId: 'c-typed', turnId: 'g-1' });
+    const view = await settled('c-typed');
+    expect(view.stage).toBe('ready');
+    expect(goal.ackGoalDraft('c-typed', view.token)).toBe(true);
+    expect(goal.goalOutcomeFor('c-typed')).toBeNull();
+  });
+
   /** Protocol words are never safe composer prose; ambiguity stops instead of self-prompting. */
   it('fails closed when legacy output wraps NO_REPLY in scratchpad prose', async () => {
     const sessionId = await seed('c-mentions');
@@ -1436,6 +1495,29 @@ describe('the model catalogue', () => {
     expect(goal.MODEL_PAGE_SIZE).toBe(20);
   });
 
+  it('searches the whole catalogue before paging matches', async () => {
+    const entries = Array.from({ length: 45 }, (_, index) => ({
+      id: `vendor/model-${index}`,
+      name: `Model ${index}`,
+      created: 10_000 - index
+    }));
+    entries[44] = { id: 'hidden/vendor-needle', name: 'Needle Model', created: 1 };
+    globalThis.fetch = vi.fn(async () => Response.json({ data: entries }));
+
+    const byName = await goal.listGoalModels(0, 20, 'needle');
+    expect(byName.total).toBe(1);
+    expect(byName.models.map(model => model.id)).toEqual(['hidden/vendor-needle']);
+
+    const byId = await goal.listGoalModels(0, 20, 'VENDOR-NEEDLE');
+    expect(byId.total).toBe(1);
+    expect(byId.models.map(model => model.id)).toEqual(['hidden/vendor-needle']);
+
+    const cleared = await goal.listGoalModels(0, 20, '   ');
+    expect(cleared.total).toBe(45);
+    expect(cleared.models).toHaveLength(20);
+    expect(cleared.models[0]?.id).toBe('vendor/model-0');
+  });
+
   it('returns catalogue reasoning metadata for the selected model even outside the requested page', async () => {
     await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, model: 'selected/old-model' } });
     globalThis.fetch = vi.fn(async () => Response.json({ data: [
@@ -1795,6 +1877,27 @@ describe('a chat driven towards a specific goal', () => {
       turnId: 'source-turn', eventSeq: 0, acceptedAt: Date.now(), state: 'pending'
     }] });
     expect(goal.goalPendingReplyFor('invalid-provisional')).toBeNull();
+  });
+
+  it('persists the three-reload Goal pickup stop and refuses a fourth attempt after restore', async () => {
+    const conversationId = 'goal-pickup-bound';
+    const session = await createSession({ title: 'Bounded Goal pickup', conversationId });
+    const acceptedAt = Date.now();
+    await goal.acceptGoalReplyNow({ conversationId, sessionId: session.id, replyId: 'goal-reply-bound',
+      turnId: 'goal-turn-bound', eventSeq: 42, blocked: false });
+
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 120_000, acceptedAt + 420_000))
+      .toEqual({ attempts: 1, nextAt: acceptedAt + 420_000 });
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 420_000, acceptedAt + 1_020_000))
+      .toEqual({ attempts: 2, nextAt: acceptedAt + 1_020_000 });
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 1_020_000, acceptedAt + 1_920_000))
+      .toEqual({ attempts: 3, stoppedAt: acceptedAt + 1_020_000 });
+
+    const saved = goal.snapshotGoalReplies();
+    goal.resetGoalStateForTests();
+    goal.restoreGoalReplies(saved);
+    expect(goal.goalPendingReplyFor(conversationId)).toMatchObject({ pickupAttempts: 3, pickupStoppedAt: acceptedAt + 1_020_000 });
+    expect(await goal.recordGoalPickupAttemptNow(conversationId, 'goal-reply-bound', acceptedAt + 1_920_000)).toBeNull();
   });
 
   it('upgrades a decided provisional turn to the stable reply without reopening it', async () => {

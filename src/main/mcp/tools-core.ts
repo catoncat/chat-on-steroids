@@ -1,8 +1,11 @@
 import { toolDeclaration } from './tool-declarations.js';
 import { registerPlanTool } from './plan-tool.js';
-import { goalWorkerChat } from '../bridge.js';
+import { goalWorkerChat, imageExportCapable } from '../bridge.js';
+import { exportImage, ImageExportError } from '../image-export.js';
+import { awaitRequestCorrelation } from '../session/correlation.js';
 import { announceSessionFinish, sessionFinishDeadline } from '../session/finish.js';
 import { getConfig } from '../config.js';
+import { connectorName } from '../../shared/connector-names.js';
 /**
  * The Core connector: reading, changing and running code on this PC.
  *
@@ -116,6 +119,7 @@ import {
   statusForCaller,
   stageFinishAgent,
   stageMessages,
+  stagePrimeMessage,
   stageSpawn,
   swarmRunning,
   swarmStateForCaller,
@@ -134,7 +138,7 @@ import {
   awaitFreshCallOrigin,
   recordAgentMessage
 } from '../session/recorder.js';
-import { findSessionByConversation } from '../session/store.js';
+import { findSessionByConversation, readRecentEvents } from '../session/store.js';
 import { requestCorrelation } from '../session/correlation.js';
 import {
   adoptAgent,
@@ -449,7 +453,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               'TOOL_DISABLED: view_image is disabled by the current Chat On Steroids permissions. Ask the user to enable reading in the app.'
             );
           }
-          const resolved = await resolveIn(ctx.roots, path);
+          const resolved = await resolveIn(ctx.roots, path, { access: 'read' });
           try {
             const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
             logInfo(`tool view_image ${resolved.virtual} (${formatBytes(image.bytes)})`);
@@ -458,6 +462,74 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             };
           } catch (error) {
             if (error instanceof ViewImageError) return fail(error.message);
+            throw error;
+          }
+        })
+    );
+  }
+
+  // -------------------------------------------------------------- save_image
+  //
+  // The original of an image ChatGPT generated in this chat, saved into an approved folder (#889).
+  // The chat's own page fetches it; see image-export.ts.
+  if (exposedCaps.create) {
+    reg.register(
+      'save_image',
+      toolDeclaration('save_image', () => ({
+        description: 'Save the original file of an image ChatGPT generated in this chat (not a screenshot or preview) to a new file in an approved folder. ' +
+          'Never replaces an existing file. The chat must be open in the browser with the image on its page.',
+        inputSchema: z
+          .object({
+            path: z.string().describe('New file path in an approved folder, for example /workspace/images/logo.png. Without an extension the image\'s own (.png, .jpg or .webp) is added.'),
+            // A number, not a name: ChatGPT fills a string here with the picture's `file_…` id and then
+            // fails the call internally before it reaches the app (measured live 2026-10-05).
+            nth: z.number().int().min(1).max(100).optional().describe('Which image, counting back from the newest generated in this chat: 1 (the default) is the latest, 2 the one before, and so on.')
+          })
+          .strict()
+      })),
+      async ({ path, nth }) =>
+        guard('save_image', async () => {
+          if (!caps.create) {
+            return fail('TOOL_DISABLED: save_image is disabled by the current Chat On Steroids permissions. Ask the user to enable creating files in the app.');
+          }
+          const caller = currentCaller();
+          const conversationId = caller.conversationId ??
+            (caller.requestId ? (await awaitRequestCorrelation(caller.requestId, 20_000))?.conversationId ?? null : null);
+          // Never guessed from recent activity: a wrong guess would save another chat's image.
+          if (!conversationId) {
+            // Name the Core that answered: with one ChatGPT account on several computers, ChatGPT
+            // may send a chat's call to another computer's Core, which never sees that chat (#1097).
+            return fail(`${connectorName('core', getConfig().connectorSuffix)} could not tell which chat this save_image call came from, ` +
+              'so it does not know which image to save. If the chat belongs to another computer, call save_image of that ' +
+              'computer\'s Chat On Steroids Core instead. Otherwise call save_image directly as its own tool call, not from ' +
+              'inside a JavaScript or exec step, and try again.');
+          }
+          if (!imageExportCapable()) {
+            return fail('save_image needs the Chat On Steroids browser extension to be connected and up to date, so the chat\'s page can hand over the image.');
+          }
+          const session = await findSessionByConversation(conversationId);
+          const recorded = session ? await readRecentEvents(session.id, 400, { kinds: ['native_image'] }) : [];
+          const images = recorded.filter((event): event is Extract<typeof event, { kind: 'native_image' }> =>
+            event.kind === 'native_image' && event.providerStatus !== 'in_progress');
+          const chosen = images.at(-(nth ?? 1));
+          if (!chosen) {
+            return fail(images.length
+              ? `save_image found only ${images.length} generated image${images.length === 1 ? '' : 's'} in this chat. Use nth ${images.length} or lower, or omit nth for the latest.`
+              : 'save_image found no image generated in this chat yet.');
+          }
+          const target = await resolveIn(ctx.roots, path, { allowMissing: true });
+          try {
+            await fs.lstat(target.real);
+            return fail(`${target.virtual} already exists. save_image never replaces a file; choose another name.`);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          }
+          try {
+            const saved = await exportImage({ conversationId, messageId: chosen.messageId, assetId: chosen.providerAssetId }, target);
+            logInfo(`tool save_image ${saved.virtual} (${formatBytes(saved.bytes)})`);
+            return ok(`Saved ${saved.virtual} (${saved.width}x${saved.height} ${saved.format.toUpperCase()}, ${formatBytes(saved.bytes)}), the original file ChatGPT generated.`);
+          } catch (error) {
+            if (error instanceof ImageExportError) return fail(`save_image did not save the image: ${error.message}`);
             throw error;
           }
         })
@@ -523,7 +595,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           const deadline = Date.now() + 10_000;
           const scopes: Array<{ real: string; virtual: string }> = [];
           if (p) {
-            const resolved = await resolveIn(ctx.roots, p);
+            const resolved = await resolveIn(ctx.roots, p, { access: 'read' });
             const stat = await fs.stat(resolved.real);
             if (stat.isFile()) {
               const outcome = await searchOneFile(resolved.real, resolved.virtual, {
@@ -1115,6 +1187,27 @@ async function measureSleepingWorkers(caller: Caller): Promise<void> {
   }
 }
 
+/** Publish a staged broker mutation only after its exact revision is durable. */
+async function acceptAgentMutation(
+  staged: { commit(): void | boolean; rollback(): void },
+  failure: string,
+  commitFailure: string = failure
+): Promise<void> {
+  try {
+    let durable: boolean;
+    try {
+      durable = await persistCriticalSwarmNow();
+    } catch (error) {
+      throw new Error(`${failure} (${error instanceof Error ? error.message : String(error)})`);
+    }
+    if (!durable) throw new Error(failure);
+    if (staged.commit() === false) throw new Error(commitFailure);
+  } catch (error) {
+    staged.rollback();
+    throw error;
+  }
+}
+
 function registerAgentsTool(reg: SurfaceRegistrar): void {
   reg.register(
     'agents',
@@ -1185,6 +1278,12 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           .max(40)
           .optional()
           .describe('message: one recipient; messaging a sleeping worker wakes it.'),
+        target_run_id: z
+          .string()
+          .min(1)
+          .max(36)
+          .optional()
+          .describe('message: existing prime run id; prime-only, no worker/status access.'),
         text: z.string().min(1).max(4000).optional().describe('message: what to say.'),
         result: z
           .string()
@@ -1196,7 +1295,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           )
       })
       .superRefine((input, ctx) => {
-        const reject = (field: 'context' | 'workers' | 'messages' | 'to' | 'text' | 'result', message: string): void => {
+        const reject = (field: 'context' | 'workers' | 'messages' | 'to' | 'target_run_id' | 'text' | 'result', message: string): void => {
           if (input[field] !== undefined) ctx.addIssue({ code: 'custom', path: [field], message });
         };
         if (input.action !== 'spawn') {
@@ -1206,6 +1305,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
         if (input.action !== 'message') {
           reject('messages', 'messages is only valid with action=message');
           reject('to', 'to is only valid with action=message');
+          reject('target_run_id', 'target_run_id is only valid with action=message');
           reject('text', 'text is only valid with action=message');
         }
         if (input.action !== 'finish') reject('result', 'result is only valid with action=finish');
@@ -1233,27 +1333,8 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
             context: input.context ?? null,
             caller: await callerNow(startedAt, { exact: true, runId: input.run_id })
           });
-          let accepted = false;
-          try {
-            let durable = false;
-            try {
-              durable = await persistCriticalSwarmNow();
-            } catch (error) {
-              throw new Error(
-                `The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request. (${error instanceof Error ? error.message : String(error)})`
-              );
-            }
-            if (!durable) {
-              throw new Error(
-                'The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request.'
-              );
-            }
-            staged.commit();
-            accepted = true;
-          } catch (error) {
-            if (!accepted) staged.rollback();
-            throw error;
-          }
+          await acceptAgentMutation(staged,
+            'The worker run could not cross its durable acceptance barrier. The spawn was rolled back; retry this same request.');
           const { created, becamePrime, runId, defaultNotes } = staged;
           if (currentCall()) currentCall()!.caller.runId = runId;
           // Browser tabs are a publication side effect, never part of planning. They become
@@ -1291,6 +1372,38 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
         }
 
         if (input.action === 'message') {
+          if (input.target_run_id) {
+            if (input.messages?.length) {
+              return fail('agents action=message with target_run_id takes one text message, not messages[].');
+            }
+            if (input.to && input.to !== PRIME_ID) {
+              return fail('agents action=message with target_run_id can address only the destination prime.');
+            }
+            if (!input.text) {
+              return fail('agents action=message with target_run_id requires text.');
+            }
+            const caller = await callerNow(startedAt, { runId: input.run_id, member: true });
+            const staged = stagePrimeMessage(caller, input.target_run_id, input.text);
+            await acceptAgentMutation(staged,
+              'The prime message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request.',
+              'TARGET_RUN_UNAVAILABLE: the destination prime family changed before acceptance. Nothing was queued.');
+            if (currentCall()) currentCall()!.caller.runId = staged.sourceRunId;
+            await recordAgentMessage(staged.message, 'sent', caller.conversationId);
+            return {
+              content: [{
+                type: 'text' as const,
+                text:
+                  `Queued for prime family ${staged.targetRunId}. The recipient can reply with target_run_id=${staged.sourceRunId}.`
+              }],
+              structuredContent: {
+                action: 'message',
+                run_id: staged.sourceRunId,
+                target_run_id: staged.targetRunId,
+                queued: [{ to: PRIME_ID }]
+              }
+            };
+          }
+
           // Two spellings of one operation. A single message is the common case and stays a
           // pair of scalars; `messages` is the same thing in bulk. Both in one call is a
           // request whose intended order nobody can read, so it is refused rather than
@@ -1309,25 +1422,8 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           // One call, one identity resolution, one all-or-nothing delivery: a prime
           // redirecting its whole run cannot end up with two of its three messages sent.
           const staged = stageMessages(caller, items);
-          let accepted = false;
-          try {
-            let durable = false;
-            try {
-              durable = await persistCriticalSwarmNow();
-            } catch (error) {
-              throw new Error(
-                `The agent message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request. (${error instanceof Error ? error.message : String(error)})`
-              );
-            }
-            if (!durable) {
-              throw new Error('The agent message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request.');
-            }
-            staged.commit();
-            accepted = true;
-          } catch (error) {
-            if (!accepted) staged.rollback();
-            throw error;
-          }
+          await acceptAgentMutation(staged,
+            'The agent message could not cross its durable acceptance barrier. Nothing was queued; retry the same message request.');
           const sent = staged.messages;
           const woken = staged.waking;
           // Reopening a sleeping worker's chat is a browser side effect, so it happens only
@@ -1364,28 +1460,9 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
             );
           }
           const staged = stageFinishAgent(await callerNow(startedAt, { runId: input.run_id, member: true }), input.result);
-          let accepted = staged.repeat;
-          try {
-            if (!staged.repeat) {
-              let durable = false;
-              try {
-                durable = await persistCriticalSwarmNow();
-              } catch (error) {
-                throw new Error(
-                  `The worker finish could not cross its durable acceptance barrier. Nothing was published; retry the same finish result. (${error instanceof Error ? error.message : String(error)})`
-                );
-              }
-              if (!durable) {
-                throw new Error(
-                  'The worker finish could not cross its durable acceptance barrier. Nothing was published; retry the same finish result.'
-                );
-              }
-              staged.commit();
-              accepted = true;
-            }
-          } catch (error) {
-            if (!accepted) staged.rollback();
-            throw error;
+          if (!staged.repeat) {
+            await acceptAgentMutation(staged,
+              'The worker finish could not cross its durable acceptance barrier. Nothing was published; retry the same finish result.');
           }
           const { info, report, repeat } = staged;
           if (report) await recordAgentMessage(report, 'sent', info.conversationId);
@@ -2057,7 +2134,7 @@ async function expandGlob(
   const rest = segments.slice(baseSegments.length).join('/');
   if (!rest) return { matches: [normalised], truncated: null };
 
-  const resolved = await resolveIn(roots, base);
+  const resolved = await resolveIn(roots, base, { access: 'read' });
   const info = await statInfo(resolved.real, resolved.virtual, { scanContent: false });
   if (info.type !== 'directory') throw new SandboxError(`${resolved.virtual} is not a folder, so it cannot be globbed`);
 
@@ -2148,7 +2225,7 @@ async function nearestFolderListing(roots: Root[], requested: string, err: unkno
     candidate = parent;
     let resolved;
     try {
-      resolved = await resolveIn(roots, candidate);
+      resolved = await resolveIn(roots, candidate, { access: 'read' });
     } catch (error) {
       if (error instanceof SandboxError && error.message.startsWith('Not found:')) continue;
       return '';
@@ -2179,7 +2256,18 @@ async function readOne(
   requested: string,
   options: ReadOneOptions
 ): Promise<{ text: string; bytes: number; image?: { data: string; mimeType: string } }> {
-  const resolved = await resolveIn(options.roots, requested);
+  // The virtual root itself: a model that has not looked yet naturally starts at "/", and "Path
+  // is empty" left it guessing the names. The shared folders are what "/" contains.
+  if (typeof requested === 'string' && (process.platform === 'win32' ? /^[/\\]+$/ : /^\/+$/).test(requested.trim())) {
+    if (!options.canBrowse) {
+      return { text: `--- / ---\nTOOL_DISABLED: listing folders needs the Browse folders permission.`, bytes: 0 };
+    }
+    const text = options.roots.length === 0
+      ? '--- / — no folders are shared yet ---'
+      : `--- / — ${options.roots.length} entr${options.roots.length === 1 ? 'y' : 'ies'}, one level ---\n${options.roots.map(root => `d ${root.name}`).join('\n')}`;
+    return { text, bytes: Buffer.byteLength(text, 'utf8') };
+  }
+  const resolved = await resolveIn(options.roots, requested, { access: 'read' });
   const info = await statInfo(resolved.real, resolved.virtual, { scanContent: !options.canRead });
 
   if (info.type === 'directory') {

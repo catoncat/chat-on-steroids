@@ -8,7 +8,8 @@ import { flushDurable, initDurableStore, readDurable, resetDurableForTests, writ
 import {
   fileSilenceInput, deferSilenceInput, revokeSilenceInputs, pendingQueuedPickups, inputBeforeGoal, inputArgs, acknowledgeBrowserInput, cancelInput, claimBrowserInput, completeBrowserDecision, enqueueInput,
   failBrowserInput, listInputs, offerToolInput as offerToolInputBatch, acknowledgeToolInput, pendingBrowserInputs, requestBrowserDecision, resetInputForTests, configureInputDelivery,
-  authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy
+  authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy, retryUnclaimedInput,
+  noteInputStartupError
 } from '../src/main/session/input.js';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import { noteChatOrigin } from '../src/main/session/recorder.js';
@@ -20,7 +21,7 @@ const offerToolInput = async (...args: Parameters<typeof offerToolInputBatch>) =
 vi.mock('../src/main/session/recorder.js', () => ({ noteChatOrigin: vi.fn(async () => undefined) }));
 
 const openings = vi.hoisted(() => new Map<string, { id: string; conversationId: string | null; origin: { kind: string } }>());
-const binding = vi.hoisted(() => ({ origin: 'desktop', conversationId: 'conversation-a', blocked: false, recorded: true, activeTurnId: null as string | null, lastToolCallAt: null as number | null, finishEnabled: true, goalEnabled: false, finishReleased: false, model: 'gpt-6-astra', leadMinutes: 5, impulseMinutes: 0, end: null as null | { kind: string; outcome: string; reason?: string; turnId: string; time: number; seq?: number } }));
+const binding = vi.hoisted(() => ({ origin: 'desktop', conversationId: 'conversation-a', blocked: false, recorded: true, activeTurnId: null as string | null, lastToolCallAt: null as number | null, finishEnabled: true, goalEnabled: false, finishReleased: false, recoveryAllowed: true, model: 'gpt-6-astra', leadMinutes: 5, impulseMinutes: 0, end: null as null | { kind: string; outcome: string; reason?: string; turnId: string; time: number; seq?: number } }));
 vi.mock('../src/main/session/store.js', () => ({
   sessionsRoot: () => path.join(directory, 'sessions'),
   listUsageSessions: vi.fn(async () => []),
@@ -38,7 +39,11 @@ vi.mock('../src/main/session/store.js', () => ({
     selectedModel: { conversationId: id === 'session-two' ? 'conversation-b' : binding.conversationId, model: binding.model } })),
   findSessionByConversation: vi.fn(async (id: string) => [...openings.values()].find(row => row.conversationId === id) ?? (binding.recorded && id === binding.conversationId ? { id: 'session-one', conversationId: id } : null))
 }));
-vi.mock('../src/main/config.js', () => ({ getConfig: () => ({ ui: { finishTool: binding.finishEnabled, finishAction: 'goal', finishLeadMinutes: binding.leadMinutes }, goal: { enabled: binding.goalEnabled, mode: 'goal', impulseMinutes: binding.impulseMinutes } }) }));
+vi.mock('../src/main/config.js', () => ({ getConfig: () => ({
+  ui: { finishTool: binding.finishEnabled, finishAction: 'goal', finishLeadMinutes: binding.leadMinutes },
+  goal: { enabled: binding.goalEnabled, mode: 'goal', impulseMinutes: binding.impulseMinutes },
+  multiAgent: { strictChatAllowlist: false }
+}) }));
 vi.mock('../src/main/session/blocked-chats.js', () => ({ isChatBlocked: () => binding.blocked }));
 let directory: string;
 let now: number;
@@ -61,7 +66,7 @@ beforeEach(async () => {
   resetInputForTests();
   automate.mockReset();
   changed.mockReset();
-  configureInputDelivery({ applyAutomation: automate, changed });
+  configureInputDelivery({ applyAutomation: automate, changed, recoveryAllowed: () => binding.recoveryAllowed });
   resetDurableForTests();
   directory = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-input-'));
   initDurableStore(directory);
@@ -72,6 +77,7 @@ beforeEach(async () => {
   binding.activeTurnId = null;
   binding.lastToolCallAt = null;
   binding.finishEnabled = true; binding.goalEnabled = false; binding.finishReleased = false; binding.model = 'gpt-6-astra'; binding.leadMinutes = 5; binding.impulseMinutes = 0;
+  binding.recoveryAllowed = true;
   binding.end = { kind: 'turn_end', outcome: 'completed', turnId: 'previous-turn', time: 0 };
   now = 1000;
   vi.spyOn(Date, 'now').mockImplementation(() => now);
@@ -84,6 +90,143 @@ afterEach(async () => {
 });
 
 describe('durable user input ownership', () => {
+  it.each([
+    ['held for Setup', 'Message queued. Finish Setup to send: Enter a tunnel ID that looks like tunnel_ followed by 32 hex characters.', 'queued'],
+    ['held after a failed browser start', 'Message queued. Browser startup failed: Chrome refused startup', 'queued'],
+    ['simply never picked up', null, 'failed']
+  ] as const)('applies the 60-second browser pickup deadline only to a message the app is not holding (%s)', async (_case, held, state) => {
+    // Seen on Windows without Setup: the follow-up said "Message queued. Finish Setup to send" and
+    // a minute later failed as "the browser did not pick up this message", losing the queue entry
+    // and naming the wrong cause.
+    binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    expect(row.transportIntent).toBe('browser');
+    if (held) await noteInputStartupError(row.id, held);
+    now += 60_001;
+    resetInputForTests();
+    const after = (await listInputs()).find(entry => entry.id === row.id);
+    expect(after?.state).toBe(state);
+    if (held) expect(after?.error).toBe(held);
+    else expect(after?.error).toContain('did not pick up this message');
+  });
+  it('requeues one proven pre-Send browser pickup timeout on the same row, then stops retrying', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    expect(row.transportIntent).toBe('browser');
+    now += 60_001;
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed', pickupFailedAt: now,
+      error: 'Not sent: the browser did not pick up this message within 60 seconds.' });
+    now += 120_000;
+    const retried = await retryUnclaimedInput(row.id);
+    expect(retried).toMatchObject({ id: row.id, state: 'queued', pickupRetryCount: 1 });
+    expect(retried).not.toHaveProperty('sendAuthorizedAt');
+    expect(retried).not.toHaveProperty('deliveredAt');
+    now += 60_001;
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ id: row.id, state: 'failed', pickupRetryCount: 1 });
+    now += 120_000;
+    expect(await retryUnclaimedInput(row.id)).toBeNull();
+  });
+  it('does not retry a pickup timeout after the user dismissed its browser chat', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    now += 60_001;
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed',
+      error: 'Not sent: the browser did not pick up this message within 60 seconds.' });
+
+    // retryUnclaimedBrowserInputs only opens the chat after retryUnclaimedInput returns a row.
+    // A manual browser dismissal must therefore leave this same row failed and produce no wake.
+    openings.set(sessionId, Object.assign({ id: sessionId, conversationId: binding.conversationId,
+      origin: { kind: binding.origin } }, { browserRecoveryDismissedAt: now }));
+    now += 120_000;
+    expect(await retryUnclaimedInput(row.id)).toBeNull();
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed' });
+    expect((await listInputs()).find(entry => entry.id === row.id)).not.toHaveProperty('pickupRetryCount');
+  });
+  it('does not requeue a never-claimed input after Automatic Continue is turned off', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    now += 60_001;
+    await listInputs();
+    now += 120_000;
+    binding.recoveryAllowed = false;
+    expect(await retryUnclaimedInput(row.id)).toBeNull();
+    const retained = (await listInputs()).find(entry => entry.id === row.id);
+    expect(retained?.state).toBe('failed');
+    expect(retained?.pickupRetryCount).toBeUndefined();
+  });
+  it('never auto-retries an authorized or legacy unmarked pickup failure', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    const authorized = await enqueueInput(input());
+    now += 60_001;
+    await listInputs();
+    const rows = await listInputs();
+    await writeDurableNow('session-input', rows.map(row => row.id === authorized.id
+      ? { ...row, state: 'failed' as const, pickupFailedAt: now - 120_000, sendAuthorizedAt: now - 30_000 }
+      : row));
+    resetInputForTests();
+    now += 120_000;
+    expect(await retryUnclaimedInput(authorized.id)).toBeNull();
+    const legacy = await enqueueInput(input());
+    now += 60_001;
+    await listInputs();
+    const legacyRows = await listInputs();
+    await writeDurableNow('session-input', legacyRows.map(row => row.id === legacy.id
+      ? { ...row, state: 'failed' as const, pickupFailedAt: undefined, error: 'Not sent: the browser did not pick up this message within 60 seconds.' }
+      : row));
+    resetInputForTests();
+    now += 120_000;
+    expect(await retryUnclaimedInput(legacy.id)).toBeNull();
+  });
+  it('gives a released hold its full 60 seconds for the browser to pick it up', async () => {
+    binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    await noteInputStartupError(row.id, 'Message queued. Finish Setup to send: Add a folder before connecting.');
+    now += 10 * 60_000; // Setup takes a while.
+    await noteInputStartupError(row.id, null); // Setup done: the browser may take it now.
+    now += 59_000;
+    resetInputForTests();
+    expect((await listInputs()).find(entry => entry.id === row.id)?.state).toBe('queued');
+    now += 2_000;
+    resetInputForTests();
+    expect((await listInputs()).find(entry => entry.id === row.id)?.state).toBe('failed');
+  });
+  it('marks the person\'s own request for a picture to go out without the Core mention, and nothing else', async () => {
+    binding.finishEnabled = false;
+    const claim = async (args: Partial<InputArgs>) => {
+      const row = await enqueueInput(input(args));
+      const claimed = await claimBrowserInput(row.id, 'page', binding.conversationId);
+      await acknowledgeBrowserInput(row.id, 'page', binding.conversationId, `m-${row.id}`).catch(() => undefined);
+      return claimed as (InputEntry & { coreMention?: false }) | null;
+    };
+    expect(await claim({ text: 'Create an image of a fox in a misty forest' })).toMatchObject({ coreMention: false });
+    expect(await claim({ text: 'Fix the failing test in src/app.ts' })).not.toHaveProperty('coreMention');
+    // Generated openings and workers keep the mention.
+    expect(await claim({ text: 'Create an image of a fox', authoredSource: 'objective' })).not.toHaveProperty('coreMention');
+    binding.origin = 'worker';
+    try { expect(await claim({ text: 'Create an image of a fox' })).not.toHaveProperty('coreMention'); }
+    finally { binding.origin = 'desktop'; }
+    // "make it brighter" changes a picture only right after ChatGPT made one.
+    expect(await claim({ text: 'make it brighter' })).not.toHaveProperty('coreMention');
+    const store = await import('../src/main/session/store.js');
+    const original = vi.mocked(store.readRecentEvents).getMockImplementation()!;
+    vi.mocked(store.readRecentEvents).mockImplementation(async (id, count, options) => options?.kinds?.includes('native_image') ? [
+      { kind: 'user_message', seq: 1, time: now, source: 'extension', messageId: 'q', message: { text: 'draw a fox', chars: 10, truncated: false } },
+      { kind: 'native_image', seq: 2, time: now, source: 'extension', messageId: 'a', providerStatus: 'finished_successfully' }
+    ] as never : original(id, count, options));
+    try { expect(await claim({ text: 'make it brighter' })).toMatchObject({ coreMention: false }); }
+    finally { vi.mocked(store.readRecentEvents).mockImplementation(original); }
+    // One failed edit in between ("image generation is unavailable") still leaves the picture current.
+    const turns = (...kinds: string[]) => vi.mocked(store.readRecentEvents).mockImplementation(async (id, count, options) => options?.kinds?.includes('native_image')
+      ? kinds.map((kind, seq) => kind === 'q' ? { kind: 'user_message', seq, time: now, source: 'extension', messageId: `q${seq}`, message: { text: 'q', chars: 1, truncated: false } }
+        : { kind: 'native_image', seq, time: now, source: 'extension', messageId: `a${seq}`, providerStatus: 'finished_successfully' }) as never
+      : original(id, count, options));
+    try {
+      turns('q', 'image', 'q');
+      expect(await claim({ text: 'make the boat red' })).toMatchObject({ coreMention: false });
+      turns('q', 'image', 'q', 'q');
+      expect(await claim({ text: 'make the boat red' })).not.toHaveProperty('coreMention');
+    } finally { vi.mocked(store.readRecentEvents).mockImplementation(original); }
+  });
   it('preserves messages beyond the former composer limit through admission, restart and browser claim', async () => {
     binding.finishEnabled = false;
     const text = 'Long user request. '.repeat(2000);
@@ -979,6 +1122,24 @@ describe('browser decision lifetime', () => {
     await expect(requestBrowserDecision('Retry', new AbortController().signal, { sourceSessionId: sessionId })).rejects.toThrow('goal_browser_send_unconfirmed');
     expect(await listInputs()).toHaveLength(1);
   });
+  it('lets a source retry after a confirmed temporary helper send timed out', async () => {
+    // 2026-10-02, live: a Temporary Chat helper confirmed its prompt, its answer was never taken,
+    // and the draft timed out. The retry was then refused as "could not confirm whether ChatGPT
+    // received the helper prompt" although it had been confirmed, and Goal stopped for good.
+    // Only a cancellation before any receipt is ambiguous enough to block a second helper.
+    const controller = new AbortController();
+    const answer = requestBrowserDecision('Choose', controller.signal, { sourceSessionId: sessionId, lifetime: 'temporary-planner' });
+    const rejected = expect(answer).rejects.toThrow('goal_browser_cancelled');
+    const row = (await listInputs())[0]!;
+    expect(await claimBrowserInput(row.id, 'document', null)).not.toBeNull();
+    expect(await acknowledgeBrowserInput(row.id, 'document', null, 'helper-user-message')).toBe(true);
+    controller.abort();
+    await rejected;
+    const retry = requestBrowserDecision('Retry', new AbortController().signal, { sourceSessionId: sessionId, lifetime: 'temporary-planner' });
+    void retry.catch(() => undefined);
+    await vi.waitFor(async () => expect((await listInputs()).filter(entry => entry.state === 'queued')).toHaveLength(1));
+  });
+
   it('accepts only its exact claimant answer, with idempotent send ACK', async () => {
     const controller = new AbortController();
     const answer = requestBrowserDecision('Choose one', controller.signal);
@@ -1669,6 +1830,14 @@ describe('one silence delivery for a correction and its next checkpoint', () => 
     now = listenUntil;
     return { head, later, correction };
   }
+
+  it('keeps the Core mention on a picture request that goes out together with a queued checkpoint', async () => {
+    // The combined message also carries the next instruction, which may need the app.
+    const { correction } = await bundle({ text: 'Create an image of a red cube' });
+    const claim = await claimBrowserInput(correction.id, 'first-page', binding.conversationId, true);
+    expect(claim?.text).toBe('Create an image of a red cube\n\nNext queued instruction:\nCheck geometry');
+    expect(claim).not.toHaveProperty('coreMention');
+  });
 
   it('claims only the next checkpoint, restores exact bytes, and records one combined native receipt', async () => {
     const { head, later, correction } = await bundle();

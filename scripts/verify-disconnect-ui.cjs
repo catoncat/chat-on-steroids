@@ -35,7 +35,7 @@ app.whenReady().then(async () => {
       onStateChanged:callback=>{push=()=>callback(structuredClone(state));},
       disconnect:async()=>{
         window.disconnectCalls++;
-        state.status.state='disconnecting';push();
+        state.status.state='disconnecting';window.disconnectingAt=Date.now();push();
         await new Promise(resolve=>window.releaseDisconnect=resolve);
         state.status.state='disconnected';push();return ok(state);
       },
@@ -68,8 +68,9 @@ app.whenReady().then(async () => {
     for(let i=0;i<100 && !(await js('!!window.releaseDisconnect'));i++) await new Promise(resolve=>setTimeout(resolve,25));
     assert.deepEqual(await js(`(() => {const b=document.getElementById('connectionPopoverToggle');for(let i=0;i<100;i++) b.click();return {text:b.textContent,disabled:b.disabled,calls:window.disconnectCalls,title:document.getElementById('connectionPopoverTitle').textContent};})()`),
       {text:'Disconnecting…',disabled:true,calls:1,title:'Disconnecting'});
-    assert.equal(await js(`document.getElementById('connectionPopoverVerified').textContent`),'Closing connection…');
-    assert.equal(await js(`document.getElementById('wizConnect').textContent`),'Disconnecting…');
+    assert.equal(await js(`document.getElementById('connectionPopoverTitle').title`),'Closing connection…');
+    assert.equal(await js(`document.getElementById('connectionPopoverVerified')`),null);
+    assert.equal(await js(`document.getElementById('wizConnectLabel').textContent`),'Disconnecting…');
     assert.equal(await js(`document.getElementById('wizConnect').disabled`),true);
     fs.mkdirSync(output,{recursive:true});
     assert.equal(await js(`document.getElementById('connectionPopover').checkVisibility()`),true);
@@ -77,9 +78,15 @@ app.whenReady().then(async () => {
     await js('new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))');
     fs.writeFileSync(path.join(output,'disconnecting.png'),(await win.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true})).toPNG());
     await js('window.releaseDisconnect()');
+    // A quick Disconnecting stays on screen a moment (about a second) before the real state shows.
     await js('new Promise(resolve=>setTimeout(resolve,0))');
-    assert.deepEqual(await js(`(() => {const b=document.getElementById('connectionPopoverToggle');return {text:b.textContent,disabled:b.disabled};})()`),{text:'Connect',disabled:false});
-    await js(`document.getElementById('connectionPopoverToggle').click()`);
+    // Only while the hold can still be running: the screenshots above may take longer than it under load.
+    assert.ok(await js(`Date.now()-window.disconnectingAt>1000 || document.getElementById('connectionPopoverTitle').textContent==='Disconnecting'`));
+    for(let i=0;i<100 && (await js(`document.getElementById('connectionPopoverTitle').textContent`))!=='Not connected';i++) await new Promise(resolve=>setTimeout(resolve,30));
+    // Disconnected: the capsule is the one Connect; the details only describe.
+    assert.deepEqual(await js(`(() => ({title:document.getElementById('connectionPopoverTitle').textContent,actionHidden:document.getElementById('connectionPopoverToggle').closest('.connection-popover-actions').hidden,capsule:document.getElementById('sidebarConnectionLabel').textContent}))()`),{title:'Not connected',actionHidden:true,capsule:'Connect'});
+    await js(`document.getElementById('sidebarConnection').click()`);
+    for(let i=0;i<100 && (await js(`document.getElementById('connectionPopoverTitle').textContent`))!=='Connected';i++) await new Promise(resolve=>setTimeout(resolve,30));
     assert.equal(await js(`document.getElementById('connectionPopoverTitle').textContent`),'Connected');
     console.log('Disconnect renderer passed: native click, visible pending state, 100 ignored duplicate clicks, completion and reconnect.');
   } finally {

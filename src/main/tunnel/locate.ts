@@ -11,6 +11,7 @@
 import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { app } from 'electron';
 import { pathEntries } from '../env.js';
 
 export type BinaryName = 'tunnel-client' | 'cloudflared';
@@ -159,12 +160,10 @@ export function locateBinary(name: BinaryName, hint?: string): string | null {
 function bundledDir(): string | null {
   const packaged = process.resourcesPath ? path.join(process.resourcesPath, 'tunnel') : null;
   if (packaged && existsSync(packaged)) return packaged;
-  // The dev mirror lives at <repo-root>/resources/tunnel, but the anchor differs
-  // by how this module is loaded: imported from source here (src/main/tunnel, three
-  // levels up) or bundled by electron-vite into out/main (two levels up). Probe both
-  // so `npm run tunnel`'s staged mirror is found from either depth.
-  const dev = path.resolve(__dirname, '..', '..', 'resources', 'tunnel');
+  // Electron's app path handles both packaged and bundled development entry points.
+  const dev = path.join(app.getAppPath(), 'resources', 'tunnel');
   if (existsSync(dev)) return dev;
+  // Direct source imports (for example focused tests) can have a different app path.
   const devFromSource = path.resolve(__dirname, '..', '..', '..', 'resources', 'tunnel');
   return existsSync(devFromSource) ? devFromSource : null;
 }

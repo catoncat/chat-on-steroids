@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import zhCN from '../src/renderer/locales/zh-CN.json';
 import type { Language } from '../src/renderer/i18n.js';
 
-const names = { en: 'English', es: 'Español', 'zh-CN': '简体中文', 'zh-TW': '繁體中文', ja: '日本語', ko: '한국어', ru: 'Русский', tr: 'Türkçe', fr: 'Français', 'pt-PT': 'Português (Portugal)', 'pt-BR': 'Português (Brasil)', de: 'Deutsch' } as const;
+const names = { en: 'English', es: 'Español', 'zh-CN': '简体中文', 'zh-TW': '繁體中文', ja: '日本語', ko: '한국어', ru: 'Русский', tr: 'Türkçe', vi: 'Tiếng Việt', fr: 'Français', 'pt-PT': 'Português (Portugal)', 'pt-BR': 'Português (Brasil)', de: 'Deutsch' } as const;
 const languages = Object.keys(names) as Language[];
 const catalogs = Object.fromEntries(languages.filter(locale => locale !== 'en').map(locale =>
   [locale, JSON.parse(readFileSync(`src/renderer/locales/${locale}.json`, 'utf8')) as Record<string, string>]));
@@ -51,6 +51,29 @@ it.each(languages)('restores %s and synchronizes accessible setup flags, setting
   expect((await import('../src/renderer/i18n.js')).currentLanguage()).toBe(locale);
 });
 
+it.each([
+  [['de-DE', 'de'], 'de'], [['zh-Hant-TW'], 'zh-TW'], [['zh-HK'], 'zh-TW'], [['zh-CN'], 'zh-CN'], [['zh'], 'zh-CN'],
+  [['pt-PT'], 'pt-PT'], [['pt-BR'], 'pt-BR'], [['pt'], 'pt-BR'], [['nl-NL', 'fr-FR'], 'fr'], [['nl', 'sv'], 'en'],
+  [['en-GB', 'de-DE'], 'en'], [['ja-JP'], 'ja'], [[], 'en']
+] as const)('maps system languages %j to %s', async (preferred, expected) => {
+  const { systemLanguage } = await import('../src/renderer/i18n.js');
+  expect(systemLanguage(preferred)).toBe(expected);
+});
+
+it('starts in the system language until a language is chosen, and a saved choice wins', async () => {
+  vi.spyOn(dom.window.navigator, 'languages', 'get').mockReturnValue(['de-DE', 'de']);
+  const first = await import('../src/renderer/i18n.js');
+  first.initLanguage();
+  expect(first.currentLanguage()).toBe('de');
+  expect(document.documentElement.lang).toBe('de');
+  expect(document.querySelector('.setup-heading h1')!.textContent).toBe(catalogs.de!.Setup);
+  // Following the system writes nothing: a later system change still applies until someone chooses.
+  expect(window.localStorage.getItem('cos.ui.language')).toBeNull();
+  window.localStorage.setItem('cos.ui.language', 'en');
+  vi.resetModules();
+  expect((await import('../src/renderer/i18n.js')).currentLanguage()).toBe('en');
+});
+
 it('defaults to English, rejects unsupported variants and switches even when storage fails', async () => {
   expect((await import('../src/renderer/i18n.js')).currentLanguage()).toBe('en');
   expect(window.localStorage.getItem('cos.ui.language')).toBeNull();
@@ -68,6 +91,38 @@ it('defaults to English, rejects unsupported variants and switches even when sto
   expect((document.getElementById('uiLanguage') as HTMLSelectElement).value).toBe('ja');
   expect(t('Settings')).toBe('設定');
   expect(t('unknown /Save/<img src=x>')).toBe('unknown /Save/<img src=x>');
+});
+
+it.each([
+  ['fr', /compétences?/iu], ['ja', /スキル/u], ['ko', /스킬/u], ['tr', /beceri/iu],
+  ['vi', /kỹ năng/iu], ['zh-CN', /技能/u], ['zh-TW', /技能/u]
+] as const)('uses the Skills page terminology in all four routing strings for %s', (locale, term) => {
+  const catalog = catalogs[locale];
+  if (!catalog) throw new Error(`Missing routing locale: ${locale}`);
+  expect(catalog.Skills).toMatch(term);
+  for (const key of [
+    'Choose whether imported Skills can be matched to ordinary messages.',
+    'Auto-select Skills',
+    'Match one imported Skill by its exact name in the message, not by topic. Explicit Skill choices always win.',
+    'Auto-selected Skill: /{0}'
+  ]) {
+    expect(catalog[key], `${locale}: ${key}`).toMatch(term);
+    expect(catalog[key], `${locale}: ${key}`).not.toMatch(/\bskills?\b/iu);
+  }
+});
+
+it.each(languages)('explains exact-name Skill routing rather than topic matching in %s', async locale => {
+  const source = 'Match one imported Skill by its exact name in the message, not by topic. Explicit Skill choices always win.';
+  const input = document.getElementById('autoSelectSkills') as HTMLInputElement;
+  const hint = input.closest('.setting')!.querySelector('em')!;
+  expect(hint.textContent).toBe(source);
+  expect(input.checked).toBe(false);
+  if (locale !== 'en') expect(catalogs[locale]).toHaveProperty(source);
+  const { initLanguage, setLanguage } = await import('../src/renderer/i18n.js');
+  initLanguage(); setLanguage(locale);
+  expect(hint.textContent).toBe(catalogs[locale]?.[source] ?? source);
+  expect(document.getElementById('autoSelectSkills')).toBe(input);
+  expect(input.checked).toBe(false);
 });
 
 it('translates known IPC failures and keeps provider errors and successful replies literal', async () => {
@@ -131,6 +186,8 @@ describe('app interface localization', () => {
       expect(strong!.outerHTML).toBe(savedHTML);
       const text = document.getElementById('newChat')!.textContent!.trim();
       expect(text).toBe(catalogs[locale]?.['New chat'] ?? 'New chat');
+      const globalWorkerLabel = document.getElementById('globalMaWorkers')!.closest('.setting')!.querySelector('b')!.textContent!;
+      expect(globalWorkerLabel).toBe(catalogs[locale]?.['Workers across all chats'] ?? 'Workers across all chats');
       const shell = document.querySelector('.plugin-refresh-guide')!.textContent!;
       if (snapshots.has(locale)) expect(shell).toBe(snapshots.get(locale));
       else snapshots.set(locale, shell);
@@ -254,17 +311,10 @@ describe('app interface localization', () => {
   });
 });
 
-it('matches both Turkish I pairs when filtering complete settings sections', async () => {
+it('matches both Turkish I pairs when searching settings', async () => {
   window.localStorage.setItem('cos.ui.language', 'tr');
-  const { filterSettingsSections } = await import('../src/renderer/dom.js');
-  const view = document.createElement('section');
-  view.innerHTML = '<h2 class="automation-section-head">İzinler</h2><div class="pane">IŞIK</div><p id="settingsSearchEmpty"></p>';
-  for (const query of ['izinler', 'İZİNLER', 'ışık', 'IŞIK']) {
-    filterSettingsSections(view, query);
-    expect(view.querySelector<HTMLElement>('.pane')!.hidden).toBe(false);
-    expect(view.querySelector<HTMLElement>('h2')!.hidden).toBe(false);
-  }
-  filterSettingsSections(view, 'missing');
-  expect(view.querySelector<HTMLElement>('.pane')!.hidden).toBe(true);
-  expect(view.querySelector<HTMLElement>('#settingsSearchEmpty')!.hidden).toBe(false);
+  const { searchSettings } = await import('../src/renderer/settings-search.js');
+  const entries = [{ tab: 'home', page: 'Çalışma alanı', section: 'İzinler', title: 'IŞIK', detail: '', target: document.createElement('div') }];
+  for (const query of ['izinler', 'İZİNLER', 'ışık', 'IŞIK']) expect(searchSettings(entries, query)).toHaveLength(1);
+  expect(searchSettings(entries, 'missing')).toEqual([]);
 });

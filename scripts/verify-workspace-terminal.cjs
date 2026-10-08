@@ -54,7 +54,9 @@ app.whenReady().then(async () => {
       onTerminalEvent:listener=>{const fn=(_,value)=>listener(value);ipcRenderer.on('workspaceTerminal:event',fn);return()=>ipcRenderer.removeListener('workspaceTerminal:event',fn)},
       writeClipboard:()=>Promise.resolve({ok:true,data:true})
     });`);
-  let win = new BrowserWindow({ show: false, width: 1100, height: 800, webPreferences: { preload, sandbox: true, contextIsolation: true, backgroundThrottling: false } });
+  // A hidden window on Windows advances no animations, so the docks' slide-in never settles there
+  // and a click is measured mid-drawer. Shown, it behaves like the app itself (2026-10-06, VM 141).
+  let win = new BrowserWindow({ show: WINDOWS, width: 1100, height: 800, webPreferences: { preload, sandbox: true, contextIsolation: true, backgroundThrottling: false } });
   backend.registerWorkspaceTerminalIpc(() => win);
   const fixture = `
     window.errors=[];window.addEventListener('error',e=>window.errors.push(e.message));window.addEventListener('unhandledrejection',e=>window.errors.push(String(e.reason)));
@@ -116,6 +118,10 @@ app.whenReady().then(async () => {
     await js('Promise.race([Promise.all(document.getAnimations().filter(animation => animation.effect?.getComputedTiming().endTime !== Infinity).map(animation => animation.finished.catch(() => undefined))), new Promise(resolve => setTimeout(resolve, 1500))])');
     await until(`!!document.activeElement?.closest('#workspaceTerminal .xterm')`);
     win.webContents.insertText(sh.proof);
+    // insertText and sendInputEvent take different input paths, so Return could reach the shell
+    // first: an empty Enter, then the command typed but never sent (macOS CI, 2026-10-03). Send
+    // Return only once the shell has echoed the text.
+    await until(`(outputs[${JSON.stringify(first)}]||'').replace(/\\x1b\\[[0-9;?]*[ -\\/]*[@-~]/g,'').includes('persisted')`);
     win.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Return' }); win.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Return' });
     await until(`outputs[${JSON.stringify(first)}]?.includes('PROOF_persisted_child')`);
     assert.ok(await js(`(()=>{const tab=document.querySelector('#workspaceTerminal .terminal-tab').getBoundingClientRect();const plus=document.querySelector('#workspaceTerminal .work-dock-add summary').getBoundingClientRect();return plus.left-tab.right<=12&&plus.left>=tab.right})()`));
@@ -171,11 +177,11 @@ app.whenReady().then(async () => {
     }
     await js(`window.api.terminalWrite(${JSON.stringify(second)}, ${JSON.stringify(sh.second + '\r')})`);
     await until(`outputs[${JSON.stringify(second)}]?.includes('SECOND_project')`);
-    // PowerShell prints a fresh "PS C:" prompt after Ctrl+C; elsewhere the marker below arriving
+    // PowerShell prints a fresh "PS <drive>:" prompt after Ctrl+C (D: on hosted CI runners); elsewhere the marker below arriving
     // long before the 30 s sleep ends is the proof that the interrupt landed.
-    const promptsBeforeInterrupt = WINDOWS ? await js(`(outputs[${JSON.stringify(second)}].match(/PS C:/g) || []).length`) : 0;
+    const promptsBeforeInterrupt = WINDOWS ? await js(`(outputs[${JSON.stringify(second)}].match(/PS [A-Z]:/g) || []).length`) : 0;
     await js(`window.api.terminalWrite(${JSON.stringify(second)}, "\\u0003")`);
-    if (WINDOWS) await until(`(outputs[${JSON.stringify(second)}].match(/PS C:/g) || []).length > ${promptsBeforeInterrupt}`);
+    if (WINDOWS) await until(`(outputs[${JSON.stringify(second)}].match(/PS [A-Z]:/g) || []).length > ${promptsBeforeInterrupt}`);
     await js(`window.api.terminalWrite(${JSON.stringify(second)}, ${JSON.stringify(sh.interrupt + '\r')})`);
     await until(`outputs[${JSON.stringify(second)}]?.includes('INTERRUPT_OK')`);
     win.setSize(830, 700); await new Promise(resolve => setTimeout(resolve, 300));

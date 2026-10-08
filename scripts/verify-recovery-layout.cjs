@@ -5,6 +5,16 @@ const path = require('node:path');
 const assert = require('node:assert/strict');
 const { build } = require('esbuild');
 
+async function captureOffscreenFrame(win, file) {
+  // This fixture is an offscreen window. Capture the frame from the offscreen renderer's own
+  // paint event instead of asking Viz to copy the hidden surface again with capturePage().
+  // The listener is armed before invalidation, so the saved image belongs to a freshly generated
+  // frame for the current size/zoom/layout rather than whichever surface Viz last exposed.
+  const frame = new Promise(resolve => win.webContents.once('paint', (_event, _dirty, image) => resolve(image)));
+  win.webContents.invalidate();
+  fs.writeFileSync(file, (await frame).toPNG());
+}
+
 app.whenReady().then(async () => {
   const root = path.join(__dirname, '..');
   const output = path.join(root, 'outputs/recovery-layout');
@@ -53,7 +63,7 @@ app.whenReady().then(async () => {
       results.push({ width, zoom, theme, kind, next, ...measured });
       if (width === 920 && zoom === 1 && theme === 'dark') {
         await win.webContents.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
-        fs.writeFileSync(path.join(output, `${kind}${next ? '-' + next : ''}.png`), (await win.webContents.capturePage()).toPNG());
+        await captureOffscreenFrame(win, path.join(output, `${kind}${next ? '-' + next : ''}.png`));
       }
     }
   }
@@ -61,6 +71,8 @@ app.whenReady().then(async () => {
   win.setContentSize(920, 320);
   win.webContents.setZoomFactor(1);
   const previews = [
+    { file: 'preview-pickup', kind: 'pickup', next: 'queue', deadline: 300_000, now: 0 },
+    { file: 'preview-pickup-stopped', kind: 'pickup-stopped', next: 'queue', attempts: 3, deadline: 300_000, now: 0 },
     { file: 'preview-unattributed', kind: 'unattributed', deadline: 15_000, now: 0 },
     { file: 'preview-unattributed-multiple', kind: 'unattributed', deadline: 60_000, now: 0 },
     { file: 'preview-unattributed-five-minute', kind: 'unattributed-wait', deadline: 300_000, now: 60_000 },
@@ -85,7 +97,7 @@ app.whenReady().then(async () => {
         : 'Loop · Continue the requested work and verify the result.';
       return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     })()`);
-    fs.writeFileSync(path.join(output, `${preview.file}.png`), (await win.webContents.capturePage()).toPNG());
+    await captureOffscreenFrame(win, path.join(output, `${preview.file}.png`));
   }
   fs.writeFileSync(path.join(output, 'measurements.json'), JSON.stringify(results, null, 2));
   console.log(`Passed ${results.length} recovery layout cases. Screenshots: ${output}`);

@@ -42,6 +42,7 @@ app.whenReady().then(async () => {
     const ok=data=>Promise.resolve({ok:true,data});
     window.api = new Proxy({ getState:()=>ok(state),getLog:()=>ok([]),
       listProjects:()=>ok(projects),listSessions:()=>ok({sessions:rows,total:22,nextCursor:null,activeId:null,pressure:[],blocked:[]}),
+      setProjectColor:(id,color)=>{const value=projects.find(row=>row.id===id);if(!value)return Promise.resolve({ok:false,error:'Project not found'});if(color)value.color=color;else delete value.color;return ok({...value})},
       getSwarm:()=>ok({running:false,runId:null,agents:[],maxWorkers:2,pendingReports:0}),
       getChatModels:()=>ok({state:'unknown',models:[]}),
       saveSettings:patch=>{state.config={...state.config,...patch};return ok(state)},
@@ -57,8 +58,12 @@ app.whenReady().then(async () => {
     const still=document.createElement('style'); still.textContent='*,*::before,*::after{animation:none!important;transition:none!important}'; document.head.append(still);
     window.fixtureReady=true;
   `;
+  // A verification worktree may share dependencies through a junction. Permit only the two
+  // actual icon assets outside this checkout; never publish a missing-glyph screenshot as proof.
+  const iconFiles = ['@phosphor-icons/web/regular/Phosphor.woff2', '@phosphor-icons/web/fill/Phosphor-Fill.woff2']
+    .map(file => fs.realpathSync(require.resolve(file)));
   const server = await createServer({ configFile:false, root:path.join(root,'src/renderer'),
-    server:{host:'127.0.0.1',port:0}, plugins:[{ name:'sidebar-fixture', configureServer(vite) {
+    server:{host:'127.0.0.1',port:0,fs:{allow:[root,...iconFiles]}}, plugins:[{ name:'sidebar-fixture', configureServer(vite) {
       vite.middlewares.use('/fixture.html', async (_request,response) => {
         const source = fs.readFileSync(path.join(root,'src/renderer/index.html'),'utf8')
           .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi,'').replace('</body>', '<script type="module">'+fixture+'</script></body>');
@@ -78,6 +83,8 @@ app.whenReady().then(async () => {
       fs.writeFileSync(path.join(output,name),(await win.webContents.capturePage(undefined,{stayHidden:true,stayAwake:true})).toPNG());
     };
     for(let i=0;i<100 && !(await js('!!window.fixtureReady && document.querySelectorAll(".project-group > .sess").length === 5'));i++) await new Promise(r=>setTimeout(r,25));
+    assert.equal(await js(`Promise.all(['CoS Phosphor','CoS Phosphor Fill'].map(name=>document.fonts.load('16px "'+name+'"'))).then(faces=>faces.every(face=>face.length>0))`),true,
+      'The actual bundled icon faces must load before visual evidence is captured');
     await js(`window.disclosureEvents=[]; for(const type of ['keydown','keypress','keyup','click']) document.addEventListener(type,e=>window.disclosureEvents.push({type,key:e.key,tag:e.target.tagName,cls:e.target.className,open:document.querySelector('.project-group')?.open}),true)`);
     // Project groups start closed. Exercise native summary activation before the
     // existing visible-row geometry, drag ordering and pagination checks.
@@ -95,6 +102,59 @@ app.whenReady().then(async () => {
     win.webContents.sendInputEvent({type:'mouseDown',button:'left',clickCount:1,...headingPoint});
     win.webContents.sendInputEvent({type:'mouseUp',button:'left',clickCount:1,...headingPoint});
     await expectDisclosure(true);
+    // The disclosure click above leaves the real pointer hovering the heading, which intentionally
+    // reveals its otherwise-quiet controls, and summary activation can retain focus too. Clear both
+    // before checking the idle baseline; hover/focus are separately intended to reveal the control.
+    win.webContents.sendInputEvent({type:'mouseMove',x:1090,y:890});
+    await js('document.activeElement?.blur(); new Promise(r=>requestAnimationFrame(r))');
+    // One quiet "⋯" on the project row; its menu replaces the color dot, pencil and trash.
+    assert.equal(await js(`document.querySelector('.project-group').dataset.projectColor`),undefined);
+    assert.equal(await js(`getComputedStyle(document.querySelector('.project-menu')).opacity`),'0');
+    assert.equal(await js(`document.querySelector('.project-heading').querySelectorAll('button').length`),1);
+    const press=keyCode=>{for (const type of ['keyDown','char','keyUp']) if (type!=='char'||keyCode==='Enter') win.webContents.sendInputEvent({type,keyCode:type==='char'?'\r':keyCode});};
+    await js(`document.querySelector('.project-menu').click()`);
+    assert.equal(await js(`document.querySelector('.project-menu').getAttribute('aria-expanded')`),'true');
+    // The menu and its submenu stay inside the window: the old color popup was cut by the sidebar.
+    await js(`document.querySelector('.row-menu [data-row-action="color"]').focus()`);
+    press('Right');
+    for(let i=0;i<100 && await js(`document.querySelectorAll('.row-menu').length!==2`);i++) await new Promise(r=>setTimeout(r,10));
+    const fits=await js(`[...document.querySelectorAll('.row-menu')].map(m=>{const r=m.getBoundingClientRect();return r.left>=0&&r.top>=0&&r.right<=innerWidth&&r.bottom<=innerHeight})`);
+    assert.deepEqual(fits,[true,true],'The menu and its Color submenu fit in the window');
+    assert.equal(await js(`document.activeElement.dataset.rowAction`),'color-none','The submenu opens on the current color');
+    await screenshot('project-menu-color.png');
+    press('Down');
+    // Input events are handled asynchronously; a slow runner read the focus before the key landed.
+    for(let i=0;i<100 && await js(`document.activeElement.dataset.rowAction==='color-none'`);i++) await new Promise(r=>setTimeout(r,10));
+    assert.equal(await js(`document.activeElement.dataset.rowAction`),'color-blue');
+    press('Enter');
+    for(let i=0;i<100 && await js(`document.querySelector('.project-group').dataset.projectColor!=='blue'`);i++) await new Promise(r=>setTimeout(r,10));
+    assert.equal(await js(`document.querySelector('.project-group').dataset.projectColor`),'blue');
+    assert.equal(await js(`getComputedStyle(document.querySelector('.project-heading > .ico')).color`),'rgb(76, 127, 193)','The folder wears the project color');
+    assert.equal(await js(`document.querySelectorAll('.row-menu').length`),0);
+    await screenshot('project-color-blue.png');
+    assert.equal(await js(`document.activeElement===document.querySelector('.project-menu')`),true,
+      'Saving a keyboard-selected color must return focus to its project menu button');
+    // A later completion must not take focus back from a newer composer interaction.
+    await js(`window.originalColorSave=window.api.setProjectColor;
+      window.api.setProjectColor=(id,value)=>new Promise(resolve=>{window.completeColorSave=()=>window.originalColorSave(id,value).then(resolve)});
+      document.querySelector('.project-menu').click();
+      document.querySelector('.row-menu [data-row-action="color"]').click();
+      document.querySelector('.row-menu [data-row-action="color-green"]').focus()`);
+    press('Enter');
+    for(let i=0;i<100 && await js(`typeof window.completeColorSave!=='function'`);i++) await new Promise(r=>setTimeout(r,10));
+    assert.equal(await js(`typeof window.completeColorSave`),'function');
+    const composerPoint = await js(`(() => {const r=document.getElementById('chatInput').getBoundingClientRect();return {x:Math.round(r.left+20),y:Math.round(r.top+r.height/2)}})()`);
+    win.webContents.sendInputEvent({type:'mouseDown',button:'left',clickCount:1,...composerPoint});
+    win.webContents.sendInputEvent({type:'mouseUp',button:'left',clickCount:1,...composerPoint});
+    for(let i=0;i<100 && await js(`document.activeElement!==document.getElementById('chatInput')`);i++) await new Promise(r=>setTimeout(r,10));
+    assert.equal(await js(`document.activeElement===document.getElementById('chatInput')`),true);
+    await js(`window.completeColorSave()`);
+    for(let i=0;i<100 && await js(`document.querySelector('.project-group').dataset.projectColor!=='green'`);i++) await new Promise(r=>setTimeout(r,10));
+    assert.equal(await js(`document.querySelector('.project-group').dataset.projectColor`),'green');
+    await screenshot('project-color-newer-focus.png');
+    assert.equal(await js(`document.activeElement===document.getElementById('chatInput')`),true,
+      'A delayed color save must not steal focus from a newer composer interaction');
+    await js(`window.api.setProjectColor=window.originalColorSave;delete window.originalColorSave;delete window.completeColorSave`);
     await js(`document.querySelector('.project-heading').focus()`);
     for (const keyCode of ['Space','Enter']) {
       win.webContents.sendInputEvent({type:'keyDown',keyCode});
@@ -132,15 +192,12 @@ app.whenReady().then(async () => {
     win.webContents.setZoomFactor(1);
     await js(`document.querySelector('.project-show-more').click()`);
     assert.equal(await js(`document.querySelectorAll('.project-group > .sess').length`),13);
-    await js(`document.querySelector('[data-tab="setup"]').click(); document.getElementById('wizExpand').click()`);
-    assert.equal(await js(`document.getElementById('wizard').classList.contains('is-tidy')`),true);
+    await js(`document.querySelector('[data-tab="setup"]').click()`);
     assert.equal(await js(`document.querySelector('[data-panel="setup"]').classList.contains('is-active')`),true);
-    await new Promise(r=>setTimeout(r,200));
-    await screenshot('setup-collapsed.png');
-    await js(`document.getElementById('wizExpand').click()`);
-    assert.equal(await js(`document.getElementById('wizard').classList.contains('is-tidy')`),false);
+    // Setup is a stepped wizard, one step on screen at a time: there is no guide to collapse.
+    assert.equal(await js(`!!document.querySelector('#wizard > li.step.is-current')`),true);
     assert.equal(await js(`document.querySelector('[data-panel="setup"]').contains(document.getElementById('setupProfile'))`),false);
-    await new Promise(r=>setTimeout(r,100));
+    await new Promise(r=>setTimeout(r,200));
     await screenshot('setup-clean.png');
     await js(`document.querySelector('[data-tab="appearance"]').click(); document.getElementById('uiLanguage').scrollIntoView({block:'center'});`);
     for(const [width,zoom] of [[1100,1],[800,1],[1100,1.17],[800,1.17],[1100,1.5]]) {

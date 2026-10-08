@@ -50,7 +50,7 @@ import { TaskRequestError } from './task-request.js';
 import { GOAL_MARKER_INSTRUCTION, templateGoalDecision } from '../shared/goal-templates.js';
 import type { GoalBackend } from '../shared/types.js';
 import { createHash } from 'node:crypto';
-import { getConfig } from './config.js';
+import { defaultConfig, getConfig } from './config.js';
 import { getChatModels, refreshForUnoffered } from './chat-models.js';
 import { resolveChatModel } from '../shared/chat-models.js';
 import type { ReasoningEffort } from '../shared/session.js';
@@ -61,6 +61,7 @@ import { findSessionByConversation, getSession, readEvents, readHandoff, readRec
 import { foldProgress } from '../shared/session.js';
 import { modelFacingText } from '../shared/content-reference.js';
 import { supportsFinishAutomation } from '../shared/finish.js';
+import { BROWSER_PICKUP_MAX_ATTEMPTS } from '../shared/recovery.js';
 
 /** A finish-only preference has authority only while the finish tool is available. */
 export async function astraFinishOnly(sessionId: string, conversationId: string): Promise<boolean> {
@@ -288,11 +289,6 @@ const LOOP_RESPONSE_FORMAT = {
   }
 } as const;
 
-/** The persisted instruction used for the next draft. Exported for focused contract tests. */
-export function goalSystemPrompt(): string {
-  return getConfig().goal.prompt;
-}
-
 /** The persisted driver instruction, used instead of the gate once a chat carries a goal. */
 export function goalObjectivePrompt(): string {
   return getConfig().goal.objectivePrompt;
@@ -422,6 +418,10 @@ interface GoalReplyObligation {
   listenUntil?: number;
   /** A native Stop is claimed once for this final, including across app restart. */
   recoveryStopClaimed?: true;
+  /** This exact reply's browser pickup budget survives app restart. */
+  pickupAttempts?: number;
+  pickupNextAt?: number;
+  pickupStoppedAt?: number;
   conversationId: string;
   sessionId: string;
   replyId: string;
@@ -508,6 +508,13 @@ export function restoreGoalReplies(snapshot: GoalRepliesSnapshot | null): void {
       ...(Number.isSafeInteger(raw.listenUntil) && raw.listenUntil! > 0 ? { listenUntil: raw.listenUntil } : {}),
       ...(raw.silencePro === true ? { silencePro: true } : {}),
       ...(raw.recoveryStopClaimed === true ? { recoveryStopClaimed: true } : {}),
+      ...(Number.isSafeInteger(raw.pickupAttempts) && raw.pickupAttempts! >= 0
+        ? { pickupAttempts: Math.min(BROWSER_PICKUP_MAX_ATTEMPTS, raw.pickupAttempts!) } : {}),
+      ...(Number.isSafeInteger(raw.pickupNextAt) && raw.pickupNextAt! > 0 ? { pickupNextAt: raw.pickupNextAt } : {}),
+      ...(Number.isSafeInteger(raw.pickupStoppedAt) && raw.pickupStoppedAt! > 0
+        ? { pickupStoppedAt: raw.pickupStoppedAt }
+        : Number.isSafeInteger(raw.pickupAttempts) && raw.pickupAttempts! >= BROWSER_PICKUP_MAX_ATTEMPTS
+          ? { pickupStoppedAt: raw.acceptedAt } : {}),
       ...(raw.explicitActivation === true ? { explicitActivation: true } : {}),
       eventSeq: raw.eventSeq,
       acceptedAt: raw.acceptedAt,
@@ -548,7 +555,7 @@ export function goalDraftNeedsIntervention(conversationId: string): boolean {
 
 export function goalPendingReplyFor(
   conversationId: string
-): Pick<GoalReplyObligation, 'replyId' | 'turnId' | 'eventSeq' | 'acceptedAt' | 'silenceSourceTurnId' | 'silencePro' | 'listenUntil' | 'explicitActivation'> | null {
+): Pick<GoalReplyObligation, 'replyId' | 'turnId' | 'eventSeq' | 'acceptedAt' | 'silenceSourceTurnId' | 'silencePro' | 'listenUntil' | 'explicitActivation' | 'pickupAttempts' | 'pickupNextAt' | 'pickupStoppedAt'> | null {
   const reply = goalReplies.get(conversationId);
   // Expiry is read here as well as pruned on write, because the ledger is only pruned when
   // something writes to it. A chat reopened after the window must not be offered work the
@@ -559,7 +566,10 @@ export function goalPendingReplyFor(
       ...(reply.explicitActivation ? { explicitActivation: true as const } : {}),
       ...(reply.silenceSourceTurnId ? { silenceSourceTurnId: reply.silenceSourceTurnId } : {}),
       ...(reply.listenUntil ? { listenUntil: reply.listenUntil } : {}),
-      ...(reply.silencePro ? { silencePro: true } : {}) }
+      ...(reply.silencePro ? { silencePro: true } : {}),
+      ...(reply.pickupAttempts !== undefined ? { pickupAttempts: reply.pickupAttempts } : {}),
+      ...(reply.pickupNextAt ? { pickupNextAt: reply.pickupNextAt } : {}),
+      ...(reply.pickupStoppedAt ? { pickupStoppedAt: reply.pickupStoppedAt } : {}) }
     : null;
 }
 
@@ -573,18 +583,72 @@ export function goalPendingReplyFor(
  */
 export function pendingGoalReplies(
   now = Date.now()
-): Array<{ conversationId: string; sessionId: string; replyId: string; acceptedAt: number }> {
-  const owed: Array<{ conversationId: string; sessionId: string; replyId: string; acceptedAt: number }> = [];
+): Array<{ conversationId: string; sessionId: string; replyId: string; acceptedAt: number; pickupAttempts: number; pickupNextAt?: number; pickupStoppedAt?: number }> {
+  const owed: Array<{ conversationId: string; sessionId: string; replyId: string; acceptedAt: number; pickupAttempts: number; pickupNextAt?: number; pickupStoppedAt?: number }> = [];
   for (const reply of goalReplies.values()) {
     if (reply.state !== 'pending' || now - reply.acceptedAt >= GOAL_REPLY_TTL_MS) continue;
     owed.push({
       conversationId: reply.conversationId,
       sessionId: reply.sessionId,
       replyId: reply.replyId,
-      acceptedAt: reply.acceptedAt
+      acceptedAt: reply.acceptedAt,
+      pickupAttempts: reply.pickupAttempts ?? 0,
+      ...(reply.pickupNextAt ? { pickupNextAt: reply.pickupNextAt } : {}),
+      ...(reply.pickupStoppedAt ? { pickupStoppedAt: reply.pickupStoppedAt } : {})
     });
   }
   return owed.sort((a, b) => b.acceptedAt - a.acceptedAt);
+}
+
+/** Durably reserves one reload for this exact Goal reply before the browser can act. */
+export async function recordGoalPickupAttemptNow(conversationId: string, replyId: string, at: number, nextAt?: number): Promise<{
+  attempts: number; nextAt?: number; stoppedAt?: number
+} | null> {
+  const reply = goalReplies.get(conversationId);
+  if (!reply || reply.state !== 'pending' || reply.replyId !== replyId || reply.pickupStoppedAt ||
+      (reply.pickupAttempts ?? 0) >= BROWSER_PICKUP_MAX_ATTEMPTS) return null;
+  const previous = { ...reply };
+  reply.pickupAttempts = (reply.pickupAttempts ?? 0) + 1;
+  if (reply.pickupAttempts >= BROWSER_PICKUP_MAX_ATTEMPTS) {
+    reply.pickupStoppedAt = at;
+    delete reply.pickupNextAt;
+  } else if (nextAt !== undefined) reply.pickupNextAt = nextAt;
+  try {
+    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+  } catch (error) {
+    if (goalReplies.get(conversationId) === reply) goalReplies.set(conversationId, previous);
+    persistGoalRepliesSoon();
+    throw error;
+  }
+  return { attempts: reply.pickupAttempts, ...(reply.pickupNextAt ? { nextAt: reply.pickupNextAt } : {}),
+    ...(reply.pickupStoppedAt ? { stoppedAt: reply.pickupStoppedAt } : {}) };
+}
+
+/** Mirrors a shared source-turn pickup budget onto its Goal owner, including while Goal is Off. */
+export async function syncGoalPickupRecoveryNow(conversationId: string, replyId: string, state: {
+  attempts: number; nextAt?: number; stoppedAt?: number
+}): Promise<boolean> {
+  const reply = goalReplies.get(conversationId);
+  if (!reply || reply.replyId !== replyId || !Number.isSafeInteger(state.attempts) || state.attempts < 0) return false;
+  const attempts = Math.min(BROWSER_PICKUP_MAX_ATTEMPTS, Math.max(reply.pickupAttempts ?? 0, state.attempts));
+  const stoppedAt = reply.pickupStoppedAt ?? state.stoppedAt;
+  const nextAt = stoppedAt || attempts >= BROWSER_PICKUP_MAX_ATTEMPTS ? undefined
+    : state.attempts >= (reply.pickupAttempts ?? 0) ? state.nextAt ?? reply.pickupNextAt : reply.pickupNextAt;
+  if (reply.pickupAttempts === attempts && reply.pickupStoppedAt === stoppedAt && reply.pickupNextAt === nextAt) return true;
+  const previous = { ...reply };
+  reply.pickupAttempts = attempts;
+  if (stoppedAt || attempts >= BROWSER_PICKUP_MAX_ATTEMPTS) {
+    reply.pickupStoppedAt = stoppedAt ?? Date.now();
+    delete reply.pickupNextAt;
+  } else if (nextAt !== undefined) reply.pickupNextAt = nextAt;
+  try {
+    await writeDurableNow(GOAL_REPLIES_STATE, snapshotGoalReplies());
+  } catch (error) {
+    if (goalReplies.get(conversationId) === reply) goalReplies.set(conversationId, previous);
+    persistGoalRepliesSoon();
+    throw error;
+  }
+  return true;
 }
 
 /** Freezes Goal eligibility at the durable recorder boundary. */
@@ -631,6 +695,9 @@ export async function acceptGoalReplyNow(input: {
     ...(input.silenceSourceTurnId ? { silenceSourceTurnId: input.silenceSourceTurnId.slice(0, 200) } : {}),
     ...(input.silencePro ? { silencePro: true } : {}),
     ...(input.listenUntil ? { listenUntil: input.listenUntil } : {}),
+    ...(provisionalUpgrade && current?.pickupAttempts !== undefined ? { pickupAttempts: current.pickupAttempts } : {}),
+    ...(provisionalUpgrade && current?.pickupNextAt ? { pickupNextAt: current.pickupNextAt } : {}),
+    ...(provisionalUpgrade && current?.pickupStoppedAt ? { pickupStoppedAt: current.pickupStoppedAt } : {}),
     eventSeq: input.eventSeq,
     // `/goal/draft` may have had to persist the local turn before Fiber exposed ChatGPT's
     // stable assistant id. The later id strengthens that same row; it must not re-evaluate
@@ -1135,11 +1202,6 @@ export function moveGoalSwitch(fromConversationId: string, toConversationId: str
   return true;
 }
 
-export function goalSettings(): { enabled: boolean; mode: GoalMode; model: string; reasoning: string } {
-  const goal = getConfig().goal;
-  return { enabled: goal.enabled, mode: goal.mode, model: goal.model, reasoning: goal.reasoning };
-}
-
 export function goalBackendFor(mode: GoalMode): GoalBackend {
   const settings = getConfig().goal;
   return mode === 'loop' ? settings.loopBackend ?? 'chatgpt' : settings.backend ?? 'chatgpt';
@@ -1224,6 +1286,16 @@ export function goalViewFor(conversationId: string, clientId?: string): GoalDraf
   // that finished minutes ago.
   if (draft.acknowledged && !settledFailure(draft)) return null;
   return view(draft);
+}
+
+/**
+ * The run's outcome for the app window: an acknowledged "goal met" decision, until a newer turn
+ * replaces it. goalViewFor() hides it from the page once acted on, but the window must not fall
+ * back to "Pursuing goal" for a run that ended (found on Windows, 2026-10-04).
+ */
+export function goalOutcomeFor(conversationId: string): GoalDraftView | null {
+  const draft = drafts.get(conversationId);
+  return draft?.acknowledged && draft.stage === 'no-reply' ? view(draft) : null;
 }
 
 export async function retryGoalBrowserHelper(sourceSessionId: string, inputId: string): Promise<boolean> {
@@ -1386,8 +1458,7 @@ export async function setGoalReplyActiveNow(conversationId: string, active: bool
 
   const previous = { ...before };
   before.state = active ? 'pending' : 'handled';
-  // A deliberate On is a new pickup episode for the same stable final reply. It gets the
-  // recovery schedule from now, not from when that answer happened under an Off switch.
+  // Re-arming the same stable reply cannot refund its shared source-turn recovery budget.
   if (active) before.acceptedAt = Math.max(Date.now(), previous.acceptedAt + 1);
   if (active) before.explicitActivation = true;
   const acceptedAt = before.acceptedAt;
@@ -1581,6 +1652,10 @@ function settle(draft: GoalDraft, stage: GoalStage, error: string | null = null)
   draft.stage = stage;
   draft.error = error;
   draft.settledAt = Date.now();
+  // NO_REPLY is a decision with nothing to type, so it discharges the turn here, as the page's
+  // acknowledgement would. A page closed meanwhile never acknowledges, the draft dies with the
+  // process, and the turn stayed owed for the ledger's twelve hours ("Answer settling").
+  if (stage === 'no-reply') handleGoalReply(draft.conversationId, draft.turnId);
   notifyGoalChange();
   // A failed helper has not answered the source. Keep its debt; the failed draft
   // retains the transport's retry/ambiguity fence until a deliberate retry or change.
@@ -1644,7 +1719,10 @@ async function requestGoalDecision(request: GoalRequest): Promise<GoalDecision |
     : GOAL_REFERENCE_CONTRACT;
   if (request.backend === 'chatgpt') {
     const protocol = request.mode === 'loop' ? LOOP_OUTPUT_PROTOCOL : GOAL_OUTPUT_PROTOCOL;
-    const introduction = 'Return one JSON object: {"action":"stop" or "continue","reply":"the message"}. ' + referenceContract;
+    // ChatGPT offers connected apps, this one included, in every chat, the helper's too. A helper that
+    // called a tool ran it on this machine without any chat to answer for it (2026-10-02, live).
+    const introduction = 'Return one JSON object: {"action":"stop" or "continue","reply":"the message"}. ' + referenceContract +
+      ' Do not call any tools, apps or connectors; decide from the transcript alone.';
     const replacement = 'Use this complete source transcript as reference data.';
     const render = (messages: ChatMessage[], direction = replacement): string => [...request.system, protocol,
       introduction, direction, '<conversation>', ...messages.map(message => JSON.stringify(message)), '</conversation>', request.trailer].join('\n\n');
@@ -1788,7 +1866,12 @@ export function goalHelperSelection(): { model: string | null; reasoningEffort: 
   if (key) refreshForUnoffered(`goal helper ${key}`);
   if (key && key !== helperFallbackLogged) {
     helperFallbackLogged = key;
-    logWarn(`goal: the saved helper ${notes.join(' and ')} is not offered by this ChatGPT account; using ChatGPT's current selection`);
+    const line = `goal: the helper ${notes.join(' and ')} is not offered by this ChatGPT account; using ChatGPT's current selection`;
+    // Falling back from the built-in defaults is routine, not a problem: nobody chose them, and as a
+    // warning it showed as "1 problem" in Activity on every start for accounts without them.
+    const defaults = defaultConfig().goal;
+    if (settings.helperModel === defaults.helperModel && (settings.helperReasoning ?? 'high') === defaults.helperReasoning) logInfo(line);
+    else logWarn(line);
   }
   return { model, reasoningEffort };
 }
@@ -2798,13 +2881,24 @@ let modelCache: { at: number; keyScope: string; models: GoalModel[] } | null = n
  * exists than the one already chosen. Paged, because the listing is several hundred long and
  * nobody scrolls that.
  */
-export async function listGoalModels(offset = 0, limit = MODEL_PAGE_SIZE): Promise<{ models: GoalModel[]; total: number; selectedModel?: GoalModel }> {
+export async function listGoalModels(
+  offset = 0,
+  limit = MODEL_PAGE_SIZE,
+  query = ''
+): Promise<{ models: GoalModel[]; total: number; selectedModel?: GoalModel }> {
   const selectedId = getConfig().goal.model;
   const models = await allGoalModels();
+  const needle = query.trim().toLowerCase();
+  const visible = needle
+    ? models.filter(model => model.id.toLowerCase().includes(needle) || model.name.toLowerCase().includes(needle))
+    : models;
   const from = Math.max(0, Math.floor(offset));
   const count = Math.max(1, Math.min(100, Math.floor(limit)));
+  // Keep the selected model's metadata independent from the search result. A saved model can be
+  // outside both the current page and the active filter, but its reasoning options still belong
+  // to the selected configuration rather than to the query.
   const selectedModel = models.find(model => model.id === selectedId);
-  return { models: models.slice(from, from + count), total: models.length, ...(selectedModel ? { selectedModel } : {}) };
+  return { models: visible.slice(from, from + count), total: visible.length, ...(selectedModel ? { selectedModel } : {}) };
 }
 
 async function allGoalModels(): Promise<GoalModel[]> {

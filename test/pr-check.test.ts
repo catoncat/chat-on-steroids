@@ -28,18 +28,22 @@ describe('pull request checklist', () => {
   it('passes the unfilled template for nothing, and names every missing part', () => {
     const template = '<!-- note -->\n\nFixes #\n\n## Why\n\n<!-- x -->\n\n## What changed\n\n## Test\n';
     const problems = check({ body: template, files: [{ path: 'src/main/bridge.ts', changes: 10 }] });
-    expect(problems.join('\n')).toMatch(/Link the issue/);
+    expect(problems.join('\n')).not.toMatch(/issue/i);
     expect(problems.join('\n')).toMatch(/## Why/);
     expect(problems.join('\n')).toMatch(/## What changed/);
     expect(problems.join('\n')).toMatch(/Add or update a test/);
   });
 
-  it('requires a test or a stated reason for code changes, and a failing-first claim', () => {
+  it('needs no issue: the description carries the why and the what', () => {
+    expect(check({ body: good.replace('Fixes #744\n\n', ''), files: [{ path: 'extension/content.js', changes: 40 }, { path: 'test/content-script.test.ts', changes: 60 }] })).toEqual([]);
+  });
+
+  it('requires a test or a stated reason for code changes, and leaves the fail-first proof to its job', () => {
     const code = [{ path: 'src/main/goal.ts', changes: 12 }];
     expect(check({ body: good.replace(/## Test[\s\S]*/, '## Test\n\n'), files: code }).join()).toMatch(/Add or update a test/);
     expect(check({ body: good.replace(/## Test[\s\S]*/, '## Test\n\nNo test: the change only renames a log line.'), files: code })).toEqual([]);
-    expect(check({ body: good.replace(/fails without the change/, 'passes'), files: [...code, { path: 'test/goal.test.ts', changes: 5 }] }).join())
-      .toMatch(/fails without your change/);
+    // The "Fail-first test" job runs the new test against main; the description need not say so.
+    expect(check({ body: good.replace(/fails without the change/, 'passes'), files: [...code, { path: 'test/goal.test.ts', changes: 5 }] })).toEqual([]);
   });
 
   it('asks for screenshots when the interface changes', () => {

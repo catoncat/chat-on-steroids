@@ -63,7 +63,7 @@ Release CI builds and smoke-tests every platform/architecture on a native runner
 
 ## Canary builds
 
-The `canary` prerelease is a test build of `main`, replaced on every run of `canary.yml`. It has no release notes and no support. Issues and pull requests are accepted only for problems that also happen on the latest stable release.
+The `canary` prerelease is a test build of `main`, rebuilt automatically after every change to `main` that can affect the app (documentation and test-only changes are skipped). A newer build replaces the previous one. It has no release notes and no support. Issues and pull requests are accepted only for problems that also happen on the latest stable release.
 
 ## Issues
 
@@ -77,23 +77,22 @@ Maintainers are happy to fix small things before merging, but they do not build 
 
 What every PR needs:
 
-1. **An issue.** Link it (`Fixes #123` or `Refs #123`). For anything beyond a small fix, agree on the behavior in the issue before writing code.
-2. **Why and what.** The root cause or user problem, and the behavior change, in a few sentences each.
-3. **A test that fails without the change.** Name it in the PR. The "Fail-first test" check proves it: it runs your changed tests against `main`'s code, and at least one must fail there. Only when a test is truly impossible, write `No test: <reason>`; when your tests only follow a refactor, write `Fail-first: n/a <reason>`.
-4. **Screenshots for interface changes.** Before and after, with placeholder data. Run `npm run verify:ui`. When renderer code changes but nothing on screen does, write `No visual change: <reason>` instead.
-5. **One topic, small.** At most 600 changed lines outside tests and translations. Split larger work, or state `Large change: <reason>` and expect a slower review.
-6. **Clean contents.** Nothing unrelated: no worklogs, notes, logs, formatting-only edits or generated output. Rebase on `main` when it conflicts.
-7. **Green checks.** `npm run verify` passes on your machine. Say which OS you ran it on. Packaging/runtime changes also need a packaged-runtime smoke check.
-8. **Docs with contracts.** A change to the preload API, IPC handlers or `src/shared` types updates the matching part of [`AGENTS.md`](AGENTS.md) in the same PR, or states `No contract change: <reason>`. The same applies to new recorded fields, bridge routes and extension messages.
-9. **Maintainer edits allowed.** Keep "Allow edits by maintainers" on, so a maintainer can make a small fix before merging instead of another review round. Your authorship stays. It is not a way to leave work unfinished.
-10. **No stacks out of order.** A PR that builds on another one says `Depends on #N` and stays a draft until #N is merged; then rebase it on `main`.
+1. **Why and what, in the PR itself.** The root cause or user problem, and the behavior change, in a few sentences each. No separate issue is needed; discussion happens on the PR. When it closes an issue, write `Fixes #123` so the issue closes on merge. For anything beyond a small fix, open a draft PR early and agree on the behavior there before building it out.
+2. **A test that fails without the change.** Name it in the PR. The "Fail-first test" check proves it: it runs your changed tests against `main`'s code, and at least one must fail there. Only when a test is truly impossible, write `No test: <reason>`; when your tests only follow a refactor, write `Fail-first: n/a <reason>`.
+3. **Screenshots for interface changes.** Before and after, with placeholder data. Run `npm run verify:ui`. When renderer code changes but nothing on screen does, write `No visual change: <reason>` instead.
+4. **One topic, small.** At most 600 changed lines outside tests and translations. Split larger work, or state `Large change: <reason>` and expect a slower review.
+5. **Clean contents.** Nothing unrelated: no worklogs, notes, logs, formatting-only edits or generated output. Rebase on `main` when it conflicts.
+6. **Green checks.** `npm run verify` passes on your machine. Say which OS you ran it on. Packaging/runtime changes also need a packaged-runtime smoke check.
+7. **Docs with contracts.** A change to the preload API, IPC handlers or `src/shared` types updates the matching part of [`AGENTS.md`](AGENTS.md) in the same PR, or states `No contract change: <reason>`. The same applies to new recorded fields, bridge routes and extension messages.
+8. **Maintainer edits allowed.** Keep "Allow edits by maintainers" on, so a maintainer can make a small fix before merging instead of another review round. Your authorship stays. It is not a way to leave work unfinished.
+9. **No stacks out of order.** A PR that builds on another one says `Depends on #N` and stays a draft until #N is merged; then rebase it on `main`.
 
 What reviews look for, beyond the checks:
 
 - **Every change serves the linked issue.** No extra behavior changes "while at it", even small ones; open a separate issue for them.
 - **Nothing depends on ChatGPT's wording.** Decide behavior from structure, ids and machine fields, never from visible English text. ChatGPT is used in many languages; if text is unavoidable, include a non-English case in the test.
 - **Interface changes are checked in the real app.** Besides `npm run verify:ui`, run the change in a real build and show it in the screenshots or a short clip.
-- **Answer review comments or fix red checks when you can.** After 10 quiet days a bot leaves one friendly reminder, and 7 days later it closes the PR. Any push or reply, even "I need more time", resets the clock, and a closed PR can be reopened at any time.
+- **Answer review comments or fix red checks when you can.** After 3 quiet days a bot leaves one friendly reminder, and 3 days later it closes the PR. If only a small fix is missing, a maintainer may finish it instead. Any push or reply, even "I need more time", resets the clock, and a closed PR can be reopened at any time.
 
 ## Credit and attribution
 
