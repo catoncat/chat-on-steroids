@@ -342,6 +342,11 @@ var CLF_DOM = (() => {
   // "Stream cache expired" (2026-10-05).
   function transportFailure(value) {
     const line = String(value || '').replace(/\s+/g, ' ').trim();
+    // The same failures on a pt-BR account, as measured 2026-10-12 (a send that never reached the
+    // model, and its dropped answer). Only observed wording; other languages stay unrecognised.
+    if (/^(?:a entrega da mensagem atingiu o tempo limite(?:\. tente novamente\.?)?|conexão interrompida\.? aguardando a resposta completa\.?)(?: tentar novamente)?$/i.test(line)) return true;
+    // The same two on a German account, as measured 2026-10-14 after a long answer's stream broke.
+    if (/^(?:zeitüberschreitung bei der übermittlung der nachricht(?:\. bitte versuche es erneut\.?)?|verbindung unterbrochen\.? warten auf die vollständige antwort\.?)(?: erneut versuchen)?$/i.test(line)) return true;
     return /^(?:message delivery timed out(?:\. please try again\.?)?|connection interrupted\.? waiting for the complete answer\.?|chatgpt stream recovery polling timed out\.?|stream cache expired\.?|unknown error occurred\.?|there was an error generating (?:a|the) response\.?|error in message stream\.?|network error\.?|a network error occurred\.?(?: please check your connection and try again\.?)?|resume stream unavailable\.?|something went wrong\.?|something went wrong while generating the response(?:\. if this issue persists please contact us through our help center at help\.openai\.com\.?)?\.?)(?: retry)?$/i.test(line);
   }
 
@@ -883,8 +888,66 @@ var CLF_DOM = (() => {
    * card on a kept (undisplayed) page, or one without an enabled button, is not waiting.
    */
   function approvalWaiting() {
-    return safe(() => [...document.querySelectorAll(APPROVAL_CARD)].some(card =>
-      !onKeptPage(card) && card.getClientRects().length > 0 && card.querySelector('button:not([disabled])') !== null), false);
+    return safe(() => waitingApprovalCard() !== null, false);
+  }
+
+  function waitingApprovalCard() {
+    return [...document.querySelectorAll(APPROVAL_CARD)].find(card =>
+      !onKeptPage(card) && card.getClientRects().length > 0 && card.querySelector('button:not([disabled])') !== null) ?? null;
+  }
+
+  /**
+   * The waiting card as the app shows it to the person (2.1.38): its words, line by line, without
+   * its buttons and key hints, and whether ChatGPT lets Allow once be pressed. In a chat with
+   * external app access switched off, ChatGPT shows the card with Allow once disabled and only
+   * Deny enabled (2026-10-14), so the app must not offer Allow there. Only text leaves the page.
+   */
+  function approvalCard() {
+    return safe(() => {
+      const node = waitingApprovalCard();
+      if (!node) return null;
+      const clone = node.cloneNode(true);
+      for (const drop of clone.querySelectorAll('button, kbd, svg, script, style, [aria-hidden="true"]')) drop.remove();
+      const lines = [];
+      const block = element => element.closest('div, p, li, h1, h2, h3, h4, h5, h6');
+      const groups = new Map();
+      const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const owner = node.parentElement && block(node.parentElement);
+        if (!owner) continue;
+        groups.set(owner, (groups.get(owner) || '') + node.textContent);
+      }
+      for (const text of groups.values()) {
+        const line = text.replace(/\s+/g, ' ').trim().slice(0, 300);
+        if (line && lines.at(-1) !== line && lines.length < 8) lines.push(line);
+      }
+      return { node, lines, allow: approvalButton(node, 'allow') !== null };
+    }, null);
+  }
+
+  /** Deny carries an Esc key hint and Allow once a Return hint (2026-10-14); no label is read. */
+  function approvalButton(card, choice) {
+    const hint = choice === 'deny' ? 'Esc' : choice === 'allow' ? '\u23CE' : null;
+    if (!hint) return null;
+    const buttons = [...card.querySelectorAll('button')].filter(button =>
+      [...button.querySelectorAll('kbd')].some(kbd => kbd.textContent.trim() === hint));
+    const button = buttons.length === 1 ? buttons[0] : null;
+    return button && !button.disabled && button.getAttribute('aria-disabled') !== 'true' ? button : null;
+  }
+
+  /**
+   * Presses Deny or Allow once on exactly the card the person answered in the app. A card that is
+   * gone or replaced is never answered through an old reference, and the options menu beside
+   * Allow once (where "always" lives) is never touched.
+   */
+  function answerApprovalCard(card, choice) {
+    return safe(() => {
+      if (!card || !card.isConnected || waitingApprovalCard() !== card) return 'card_changed';
+      const button = approvalButton(card, choice);
+      if (!button) return 'unavailable';
+      button.click();
+      return 'clicked';
+    }, 'unavailable');
   }
 
   /** Stop is a busy hint only; the exact provider terminal still owns turn completion. */
@@ -2244,8 +2307,9 @@ var CLF_DOM = (() => {
       const sections = turnNodes(turn);
       if (!sections.length) return false;
       for (const section of sections) {
-        if (replaced) section.setAttribute('data-clf-turn-replaced', '1');
-        else section.removeAttribute('data-clf-turn-replaced');
+        // Only on a change: the once-a-second render reaches here for every rendered turn.
+        if (replaced) { if (section.getAttribute('data-clf-turn-replaced') !== '1') section.setAttribute('data-clf-turn-replaced', '1'); }
+        else if (section.hasAttribute('data-clf-turn-replaced')) section.removeAttribute('data-clf-turn-replaced');
       }
       if (replaced && root) {
         const anchor = placement && placement.anchor;
@@ -2413,7 +2477,15 @@ var CLF_DOM = (() => {
     }
   }
 
-  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, receiptTimeoutMs = null, mention = null, explain = null, sentRequest = null } = {}) {
+  /** Runs `run` on a later task. A message is not throttled like a timer in a background tab. */
+  function nextTask(run) {
+    if (typeof MessageChannel !== 'function') return void setTimeout(run, 0);
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => { channel.port1.close(); run(); };
+    channel.port2.postMessage(null);
+  }
+
+  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, receiptTimeoutMs = null, mention = null, explain = null, sentRequest = null, whileGenerating = false } = {}) {
     // Why a Send ended without acceptance, as one short code for the caller's diagnostics (#820).
     // It names the first refusal only and never changes what Send does.
     const refused = (why) => { try { explain?.(why); } catch { /* Diagnostics never change Send. */ } return false; };
@@ -2421,7 +2493,11 @@ var CLF_DOM = (() => {
       const box = composer();
       if (!box || !box.isConnected) return refused('editor-missing');
       if (!stillCurrent()) return refused('chat-changed');
-      if (generating() || stopButton()) return refused('page-busy');
+      // A message for the running turn goes out while ChatGPT works: its composer offers Send once it
+      // holds text, and ChatGPT folds the message into that turn (#1231). Only the exact new user row
+      // below accepts it, so this never relies on Stop or a cleared composer.
+      const busy = () => !whileGenerating && generating();
+      if (whileGenerating ? !acceptUserReceipt : generating() || stopButton()) return refused('page-busy');
       if (box.getAttribute('aria-disabled') === 'true' || box.getAttribute('contenteditable') === 'false') return refused('editor-disabled');
       // Rich editors use adjacent paragraphs for newlines; textContent concatenates
       // their words. Preserve those boundaries when matching the rendered user message.
@@ -2550,7 +2626,7 @@ var CLF_DOM = (() => {
           // readiness through this same bounded operation; neither a guessed Enter nor
           // an unrelated Stop/composer-clear is evidence that this draft was submitted.
           if (conversationId() !== beforeConversation || composer() !== box || !box.isConnected ||
-              draftText() !== (mentionedDraft ?? submitted) || generating()) return finish(false, generating() ? 'page-busy' : 'draft-changed');
+              draftText() !== (mentionedDraft ?? submitted) || busy()) return finish(false, busy() ? 'page-busy' : 'draft-changed');
           if (box.getAttribute('aria-disabled') === 'true' || box.getAttribute('contenteditable') === 'false') return;
           const button = sendButton();
           if (!sendButtonEnabled(button)) return;
@@ -2562,7 +2638,7 @@ var CLF_DOM = (() => {
             // Authorization can await the app. The exact editor, text and native control
             // must still be the ones it authorized; a late answer cannot revive this send.
             if (!stillCurrent() || conversationId() !== beforeConversation || composer() !== box ||
-                !box.isConnected || draftText() !== (mentionedDraft ?? submitted) || generating() || sendButton() !== control ||
+                !box.isConnected || draftText() !== (mentionedDraft ?? submitted) || busy() || sendButton() !== control ||
                 !sendButtonEnabled(control) || box.getAttribute('aria-disabled') === 'true' ||
                 box.getAttribute('contenteditable') === 'false') return finish(false, 'send-not-ready');
             if (mention && !mentionTried) {
@@ -2575,8 +2651,11 @@ var CLF_DOM = (() => {
                 mentionAdded = true;
                 mentioning = true;
                 resumeClick = () => click(true);
-                mentionTimers = [setTimeout(() => { mentionTicked = true; settleMention(); }, 0),
-                  setTimeout(() => { mentionTicked = true; settleMention(true); }, 1500)];
+                // One task later by a message, not a 0 ms timer: Firefox held that timer 25 s in
+                // the minimized window of app-opened chats (2026-10-15). The 1.5 s fallback for a
+                // dropped token may run late there; it only matters when the editor draws nothing.
+                nextTask(() => { mentionTicked = true; settleMention(); });
+                mentionTimers = [setTimeout(() => { mentionTicked = true; settleMention(true); }, 1500)];
                 return;
               }
             }
@@ -2624,6 +2703,22 @@ var CLF_DOM = (() => {
 
   /** Native attachment identity from the composer's exact tile/remove control. */
   function composerFileName(button) {
+    // Current shell: a filename-labelled open button and a translated remove button share a
+    // span tile, without role/group/default-action. Count only that exact remove control;
+    // treating both buttons as attachments prevents the upload receipt from reaching Send.
+    const attachmentHost = button.closest('[data-composer-attachments]');
+    const tileParent = button.parentElement;
+    if (attachmentHost && tileParent && tileParent !== attachmentHost) {
+      const actions = [...tileParent.querySelectorAll('button')];
+      if (actions.length === 2 && actions[1] === button) {
+        const open = actions[0], name = open.getAttribute('aria-label');
+        const removal = button.getAttribute('aria-label') || '';
+        const labelled = [...tileParent.querySelectorAll('span')].some(node =>
+          !node.children.length && node.textContent === name);
+        if (name && removal !== name && removal.endsWith(` ${name}`) && labelled &&
+            open.closest('[data-composer-attachments]') === attachmentHost) return name;
+      }
+    }
     const tile = button.closest('[data-composer-attachments] [role="button"][aria-label]');
     if (tile && tile !== button) {
       const name = tile.getAttribute('aria-label');
@@ -2666,6 +2761,33 @@ var CLF_DOM = (() => {
     ownConnectors = list;
     return true;
   }
+  /** This install's proven connector apps ({ surface, appId, linkId, name }), from the app's status. */
+  let ownApps = [];
+  function setConnectorApps(value) {
+    const list = [];
+    for (const surface of ['core', 'desktop', 'plugins']) {
+      for (const app of (value && Array.isArray(value[surface]) ? value[surface] : []).slice(0, 4)) {
+        if (!app || typeof app.appId !== 'string' || !/^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(app.appId)) continue;
+        list.push({ surface, appId: app.appId, linkId: typeof app.linkId === 'string' ? app.linkId : null,
+          name: typeof app.name === 'string' ? app.name : null });
+      }
+    }
+    const changed = JSON.stringify(list) !== JSON.stringify(ownApps);
+    ownApps = list;
+    return changed;
+  }
+  const connectorApps = () => ownApps.map(app => ({ ...app }));
+  /** Configured and learned names select one surface; renames never discard its proven IDs. */
+  function provenAppsFor(connectorName) {
+    const at = connectorNames().indexOf(connectorName);
+    const surfaces = new Set(ownApps.filter(app => app.name === connectorName).map(app => app.surface));
+    if (at >= 0) surfaces.add(['core', 'desktop', 'plugins'][at]);
+    // A learned name can collide with another surface's learned or configured name.
+    // That ambiguity is not permission to fall back to name-only enrollment.
+    if (surfaces.size > 1) return null;
+    const surface = [...surfaces][0];
+    return ownApps.filter(app => app.surface === surface);
+  }
   /** This install's three names, or the plain ones while the app has not said. */
   const connectorNames = () => [...(ownConnectors || PLAIN_CONNECTORS)];
   /** The Plugins connector of any computer: it only selects that connector's larger action limits. */
@@ -2673,7 +2795,12 @@ var CLF_DOM = (() => {
 
   /** Observed ChatGPT Plugins settings surface. Missing/ambiguous structure is not proof. */
   async function pluginRefreshView(connectorName, expectedTools = [], expectedAppId = null) {
-    const externalPlugins = pluginsConnectorName(connectorName);
+    // A durable exact-ID request already identifies its connector even when names collide.
+    // Use that ID's proven surface for limits too, rather than borrowing another surface's name.
+    const identified = expectedAppId ? ownApps.filter(app => app.appId === expectedAppId) : [];
+    const proven = identified.length ? identified : provenAppsFor(connectorName);
+    if (proven === null && !expectedAppId) return null;
+    const externalPlugins = proven?.length ? proven.every(app => app.surface === 'plugins') : pluginsConnectorName(connectorName);
     const snapshot = await new Promise(resolve => {
       const nonce = crypto.randomUUID();
       const finish = value => { clearTimeout(timer); window.removeEventListener('message', receive); resolve(value); };
@@ -2682,11 +2809,11 @@ var CLF_DOM = (() => {
         if (event.source === window && event.origin === location.origin && data?.source === 'clf-plugin-reply' && data.nonce === nonce && data.v === 1) finish(data.plugin);
       };
       const timer = setTimeout(() => finish(null), 1500);
-      window.addEventListener('message', receive); window.postMessage({ source: 'clf-plugin-ask', nonce, apps: connectorNames() }, location.origin);
+      window.addEventListener('message', receive); window.postMessage({ source: 'clf-plugin-ask', nonce, apps: connectorNames(), appIds: connectorApps() }, location.origin);
     });
     const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash) ||
       (!location.hash ? /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname) : null);
-    if (!snapshot || snapshot.appId !== route?.[1] || (expectedAppId ? snapshot.appId !== expectedAppId : snapshot.connectorName !== connectorName) ||
+    if (!snapshot || snapshot.appId !== route?.[1] || (expectedAppId ? snapshot.appId !== expectedAppId : !ownSnapshot(snapshot, connectorName)) ||
         !Array.isArray(snapshot.tools) || (snapshot.tools.length < 1 && !externalPlugins) || snapshot.tools.length > (externalPlugins ? 257 : 16) || JSON.stringify(snapshot.tools).length > 300000 ||
         snapshot.tools.some(tool => !tool || typeof tool.name !== 'string' || !/^[a-z][a-z0-9_]{0,79}$/.test(tool.name) || typeof tool.description !== 'string' || tool.inputSchema?.type !== 'object') ||
         new Set(snapshot.tools.map(tool => tool.name)).size !== snapshot.tools.length) return null;
@@ -2695,16 +2822,58 @@ var CLF_DOM = (() => {
       tools: snapshot.tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), refresh: buttons[0] || null,
       tunnelId: typeof snapshot.tunnelId === 'string' && /^tunnel_[a-zA-Z0-9]{8,80}$/.test(snapshot.tunnelId) ? snapshot.tunnelId : null, settled: snapshot.settled === true } : null;
   }
-  function pluginInstalledButtons(connectorName) {
+  /**
+   * Whether a plugin settings page shows this connector: by a proven app id when one exists (a
+   * same-named app with another id is somebody else's), otherwise by the configured name as before.
+   */
+  function ownSnapshot(snapshot, connectorName) {
+    const proven = provenAppsFor(connectorName);
+    return proven !== null && (proven.length ? proven.some(app => app.appId === snapshot.appId) : snapshot.connectorName === connectorName);
+  }
+  function pluginInstalledButtons(connectorName, expectedAppId = null, expectedSurface = null) {
+    // Native links name their exact App Id, even when a fresh provider rename has not reached
+    // the learned name yet. Legacy buttons still need names; the destination proves identity.
+    // A scoped enrolled observation keeps its App Id; other proven aliases cannot replace it.
+    if (expectedAppId !== null && (typeof expectedAppId !== 'string' || !/^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(expectedAppId))) return null;
+    let proven = provenAppsFor(connectorName);
+    if (expectedAppId !== null && expectedSurface !== null) {
+      const surfaceAt = ['core', 'desktop', 'plugins'].indexOf(expectedSurface);
+      if (surfaceAt < 0) return null;
+      const identified = ownApps.filter(app => app.appId === expectedAppId);
+      if (identified.length) {
+        // The durable exact ID and its requested surface survive colliding renames.
+        // An ID associated with another surface cannot borrow this row's authority.
+        if (identified.some(app => app.surface !== expectedSurface)) return null;
+        proven = identified;
+      } else if (proven !== null && (proven.some(app => app.surface !== expectedSurface) ||
+          (!proven.length && connectorNames()[surfaceAt] !== connectorName))) return null;
+    }
+    if (proven === null) return null;
+    const names = [connectorName, ...proven.map(app => app.name).filter(Boolean)];
+    const named = node => names.includes(text(node));
     return safe(() => {
       // The newer shell lists installed plugins on the /settings/plugins-settings page itself.
       if (location.pathname === '/settings/plugins-settings' && !location.hash) {
         const main = document.querySelector('main');
-        if (!main) return null;
-        const rows = [...main.querySelectorAll('button')].filter(button => !button.disabled && button.getClientRects().length > 0 &&
-          [...button.querySelectorAll('*')].some(node => !node.children.length && text(node) === connectorName));
+        if (!main || (!proven.length && !connectorNames().includes(connectorName))) return null;
+        // Measured 2026-10-11: installed rows became links to exact management pages.
+        // Catalog and external links cannot identify an installed connector.
+        const rows = [...main.querySelectorAll('button,a[href]')].filter(button => {
+          if (!button.isConnected || button.disabled || button.getClientRects().length === 0 || button.closest(`${OWN_SURFACES}, ${TURN}`) || !composerCssVisible(button)) return false;
+          if (button.tagName === 'A') {
+            const url = new URL(button.href, location.href);
+            const route = /^\/settings\/plugins-settings\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(url.pathname);
+            if (url.origin !== location.origin || !route || url.hash) return false;
+            if (expectedAppId !== null && route[1] !== expectedAppId) return false;
+            if (proven.length) return proven.some(app => app.appId === route[1]);
+            if (expectedAppId !== null) return true;
+          }
+          if (expectedAppId !== null) return false; // An enrolled observation needs the link's exact ID, never a name-only button.
+          return [...button.querySelectorAll('*')].some(node => !node.children.length && named(node));
+        });
         return rows.length ? rows : null;
       }
+      if (expectedAppId !== null) return null; // Legacy rows cannot prove a native installed App Id.
       const panels = [...document.querySelectorAll('[role="tabpanel"]')].filter(panel => panel.getClientRects().length > 0 &&
         (panel.querySelector('[data-testid="plugin-icon-wrapper"]') || panel.querySelector('a[href="/plugins"]')));
       if (panels.length !== 1) return null;
@@ -2713,7 +2882,7 @@ var CLF_DOM = (() => {
       const rows = [...panels[0].querySelectorAll('button')].filter(button => !button.disabled && button.getClientRects().length > 0 &&
         button.querySelector('[data-testid="plugin-icon-wrapper"]'));
       if (!rows.length) return null;
-      return rows.filter(button => [...button.querySelectorAll('*')].some(node => !node.children.length && text(node) === connectorName));
+      return rows.filter(button => [...button.querySelectorAll('*')].some(node => !node.children.length && named(node)));
     }, null);
   }
   function pluginManagementIdle() {
@@ -2806,10 +2975,29 @@ var CLF_DOM = (() => {
       };
       const timer = setTimeout(() => finish(null), 1500);
       window.addEventListener('message', receive);
-      window.postMessage({ source: 'clf-picker-ask', nonce, apps: connectorNames() }, location.origin);
+      window.postMessage({ source: 'clf-picker-ask', nonce, apps: connectorNames(), appIds: connectorApps() }, location.origin);
     });
   }
   /** UI only transports a requested selection. Provider state proves identity and availability. */
+  /**
+   * Which of ChatGPT's controls this page still has, for the diagnostics report (2026-10-15):
+   * after ChatGPT changes its page, a report says what the extension no longer finds. Booleans
+   * and the page's language tag only, never text from the page.
+   */
+  function pageChecks() {
+    return safe(() => {
+      const language = document.documentElement.getAttribute('lang') || '';
+      return {
+        composer: Boolean(composer()),
+        sendArea: Boolean(composerActions()),
+        modelMenu: Boolean(modelPickerTrigger()),
+        // The October 2026 composer marks it only as its add-context navigation target.
+        plusMenu: Boolean(document.querySelector('[data-composer-navigation-target="add-context"],#composer-plus-btn,[data-testid="composer-plus-btn"]')),
+        language: /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(language) ? language : null
+      };
+    }, { composer: false, sendArea: false, modelMenu: false, plusMenu: false, language: null });
+  }
+
   function modelPickerTrigger() {
     const reported = '[data-codex-intelligence-trigger],[data-composer-navigation-target="reasoning"]';
     const candidates = [...new Set([...(composer()?.closest('form')?.querySelectorAll('button[aria-haspopup="menu"]') || []),
@@ -2946,6 +3134,16 @@ var CLF_DOM = (() => {
     const model = node?.getAttribute('data-clf-selected-model'), reasoningEffort = node?.getAttribute('data-clf-selected-effort');
     return model && /^[a-zA-Z0-9._-]{1,80}$/.test(model) && ['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(reasoningEffort)
       ? { model, reasoningEffort } : null;
+  }
+  /**
+   * Whether a borrowed chat can serve account model discovery. A chat still set to a model the
+   * account no longer lists (GPT-5.6 Sol after GPT-6, VM 2026-10-08) has no selected version and no
+   * effort lanes, so the reader rightly refuses it; discovery elected that tab anyway and timed out
+   * with picker_unavailable. The Chat/Work toggle changes the picker first, so it defers to it.
+   */
+  async function modelPickerReadable() {
+    if ([...document.querySelectorAll('[role="radio"][data-tpp-toggle-value]')].some(node => !node.closest(OWN_SURFACES) && node.getClientRects().length > 0)) return true;
+    return Boolean(await readPickerState());
   }
   /** Account model discovery belongs to Chat; Work mounts a different picker.
    * The caller owns one idle document and verifies draft/epoch before and after this transition. */
@@ -3105,6 +3303,8 @@ var CLF_DOM = (() => {
    */
   const PROJECT_SOURCE_READY_MS = 60_000;
   const PROJECT_TRANSITION_MS = 12_000;
+  /** Clicks again after ChatGPT's own route rewrite drops the first one; two rewrites are seen. */
+  const PROJECT_RECLICKS = 2;
 
   /**
    * Enter a Project through its source chat's native link. Cold /project loads can error.
@@ -3117,12 +3317,24 @@ var CLF_DOM = (() => {
       reportFailure('invalid-entry');
       return false;
     }
+    // The exact same-origin Project-home target is the native entry. ChatGPT has moved this
+    // control across several shells: its folder icon lost a test id in early October, then the
+    // link itself moved outside both <header> and [role="banner"]. Do not bind navigation to
+    // either wrapper. Instead reject quoted/transcript links and hidden kept pages, then require
+    // one visible provider link to this exact Project. Ambiguity still fails closed.
+    const projectLinks = () => [...document.querySelectorAll('a[href]')].filter(link =>
+      !link.closest(`${OWN_SURFACES}, ${TURN}`) && composerCssVisible(link) &&
+      new URL(link.href, location.href).origin === location.origin &&
+      projectHomeId(new URL(link.href, location.href).pathname) === entry.id);
     return new Promise(resolve => {
       let clicked = false, done = false, lastObservation = 'source-not-ready';
+      // Where the source chat was when the link was clicked, and how many times its own route
+      // rewrite has since taken that click away.
+      let clickedPath = '', reclicks = 0;
       const interrupt = event => { if (event.isTrusted) finish(false, 'user-interrupted'); };
       const finish = (result, reason = 'unknown') => {
         if (done) return;
-        done = true; observer.disconnect(); clearTimeout(timer);
+        done = true; observer.disconnect(); clearTimeout(timer); clearInterval(routeWatch);
         document.removeEventListener('pointerdown', interrupt, true);
         document.removeEventListener('keydown', interrupt, true);
         if (!result) reportFailure(reason);
@@ -3155,6 +3367,22 @@ var CLF_DOM = (() => {
           return;
         }
         if (clicked) {
+          // A replacement tab opens the source at /c/<id>, and ChatGPT then rewrites that route
+          // twice (/g/<project>/c/<id>, then the same with the Project's name). A click that lands
+          // between the two is taken by the router and then dropped by its own second rewrite: the
+          // tab stays on the source chat and the entry timed out (measured 2026-10-10, 8 of 14
+          // Compact & resume attempts in a Project). The source route changing under the click is
+          // that drop, so the same single link is clicked again.
+          if (location.pathname !== clickedPath && reclicks < PROJECT_RECLICKS) {
+            const links = projectLinks();
+            if (links.length === 1) {
+              reclicks++;
+              clickedPath = location.pathname;
+              lastObservation = 'source-route-rewritten';
+              links[0].click();
+              return check();
+            }
+          }
           lastObservation = 'source-route';
           return;
         }
@@ -3167,20 +3395,13 @@ var CLF_DOM = (() => {
           lastObservation = 'source-not-ready';
           return;
         }
-        // The exact same-origin Project-home target is the native entry. ChatGPT has moved this
-        // control across several shells: its folder icon lost a test id in early October, then the
-        // link itself moved outside both <header> and [role="banner"]. Do not bind navigation to
-        // either wrapper. Instead reject quoted/transcript links and hidden kept pages, then require
-        // one visible provider link to this exact Project. Ambiguity still fails closed.
-        const links = [...document.querySelectorAll('a[href]')].filter(link =>
-          !link.closest(`${OWN_SURFACES}, ${TURN}`) && composerCssVisible(link) &&
-          new URL(link.href, location.href).origin === location.origin &&
-          projectHomeId(new URL(link.href, location.href).pathname) === entry.id);
+        const links = projectLinks();
         if (links.length !== 1) {
           lastObservation = 'candidate-count-' + links.length;
           return;
         }
         clicked = true;
+        clickedPath = location.pathname;
         lastObservation = 'source-route';
         // Loading the source and following its link are separate page transitions.
         // Reuse the same deadline timer; source loading must not consume the budget
@@ -3195,6 +3416,8 @@ var CLF_DOM = (() => {
       };
       const observer = new MutationObserver(check);
       observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+      // A route rewrite through history.replaceState changes no DOM by itself.
+      const routeWatch = setInterval(check, 250);
       let timer = setTimeout(
         () => finish(false, 'source-ready-timeout:last=' + lastObservation),
         PROJECT_SOURCE_READY_MS
@@ -3203,6 +3426,65 @@ var CLF_DOM = (() => {
       document.addEventListener('keydown', interrupt, true);
       check();
     });
+  }
+
+  /**
+   * ChatGPT's own "new Project" control in its sidebar, or null.
+   *
+   * Located by the attribute ChatGPT's sidebar action carries, not by its label, which is in the
+   * account's language (measured 2026-10-10: `data-app-action-sidebar-project-create`, labelled
+   * "Adicionar novo projeto" on a pt-BR account). Exactly one shown control, or nothing.
+   */
+  function projectCreateControl() {
+    return safe(() => {
+      const shown = [...document.querySelectorAll('button[data-app-action-sidebar-project-create]')]
+        .filter(node => !node.closest(`${OWN_SURFACES},[hidden],[aria-hidden="true"],[inert]`) && node.getClientRects().length > 0 && !node.disabled);
+      return shown.length === 1 ? shown[0] : null;
+    }, null);
+  }
+
+  /**
+   * Opens ChatGPT's collapsed sidebar once so its New project control can show. A narrow window
+   * unmounts the sidebar, and the control lives only there.
+   */
+  function revealSidebar() {
+    return safe(() => {
+      const toggles = [...document.querySelectorAll('button[data-testid="open-sidebar-button"][aria-expanded="false"]')]
+        .filter(node => !node.closest(`${OWN_SURFACES},[hidden],[aria-hidden="true"],[inert]`) && node.getClientRects().length > 0 && !node.disabled);
+      if (toggles.length !== 1) return false;
+      toggles[0].click();
+      return true;
+    }, false);
+  }
+
+  /** Every Project the page links to right now, by id: the account's Projects ChatGPT lists. */
+  function projectIdsShown() {
+    return safe(() => [...new Set([...document.querySelectorAll('a[href]')]
+      .map(link => projectHomeId(new URL(link.href, location.href).pathname)).filter(Boolean))], []);
+  }
+
+  /** ChatGPT's open "Create project" dialog: its name field and its one submit button. */
+  function projectCreateForm() {
+    return safe(() => {
+      const dialogs = [...document.querySelectorAll('[role="dialog"][aria-modal="true"]')]
+        .filter(node => node.querySelector('input#chatgpt-project-name') && node.getClientRects().length > 0);
+      if (dialogs.length !== 1) return null;
+      const input = dialogs[0].querySelector('input#chatgpt-project-name');
+      const submits = [...dialogs[0].querySelectorAll('button[type="submit"]')];
+      return input && submits.length === 1 ? { dialog: dialogs[0], input, submit: submits[0] } : null;
+    }, null);
+  }
+
+  /** Types a Project name the way React sees a person typing it. */
+  function fillProjectName(input, name) {
+    return safe(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (!setter) return false;
+      input.focus();
+      setter.call(input, name);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return input.value === name;
+    }, false);
   }
 
   async function newChatControl(stillCurrent = () => true) {
@@ -3235,13 +3517,20 @@ var CLF_DOM = (() => {
     turnIdOf,
     messageIdOf,
     composerAuthoredText,
+    pageChecks,
     userPromptText,
     userMessageReaction,
     presentUserPrompts,
     composerVisible,
     conversationLoadFailure,
     prepareChatModelSurface,
+    modelPickerReadable,
     newChatControl,
+    projectCreateControl,
+    projectCreateForm,
+    revealSidebar,
+    projectIdsShown,
+    fillProjectName,
     projectHomeId,
     enterProject,
     visibleModelSelection,
@@ -3252,6 +3541,8 @@ var CLF_DOM = (() => {
     composerAttachmentNames,
     pluginRefreshView,
     setConnectorNames,
+    setConnectorApps,
+    connectorApps,
     connectorNames,
     pluginInstalledButtons,
     pluginManagementIdle,
@@ -3303,6 +3594,8 @@ var CLF_DOM = (() => {
     sectionSignature,
     generating,
     approvalWaiting,
+    approvalCard,
+    answerApprovalCard,
     stopButton,
     stopGeneration,
     sendButton,

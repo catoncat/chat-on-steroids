@@ -1,11 +1,11 @@
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import { initConfigPath, defaultConfig, saveConfig } from '../src/main/config.js';
 import { initDurableStore, flushDurable, resetDurableForTests } from '../src/main/durable.js';
 import {
-  createSession, deleteSession, flushSessions, initSessionStore, renameSession, resetSessionStoreForTests, sessionSearchIndexPath, upsertMessageEvent
+  createSession, deleteSession, flushSessions, initSessionStore, readEvents, renameSession, resetSessionStoreForTests, sessionSearchIndexPath, upsertMessageEvent
 } from '../src/main/session/store.js';
-import { foldCase, locateSearchMatch, queryTerms, resetSessionSearchForTests, searchIndexingSettled, searchSessions, snippetFor } from '../src/main/session/search.js';
+import { findInSession, foldCase, locateSearchMatch, queryTerms, resetSessionSearchForTests, searchIndexingSettled, searchSessions, snippetFor } from '../src/main/session/search.js';
 import { positionOf } from '../src/shared/chronology.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
@@ -18,6 +18,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   await searchIndexingSettled(); resetSessionSearchForTests();
+  vi.restoreAllMocks();
   await flushDurable(); resetSessionStoreForTests(); resetDurableForTests(); await removeTempDir(directory);
 });
 
@@ -101,6 +102,31 @@ it('leaves helper chats out, as the sidebar does', async () => {
   expect(await search('internal')).toMatchObject({ results: [], total: 0 });
 });
 
+it('ranks an older title match before newer text matches even at a small result limit', async () => {
+  let clock = Date.now();
+  vi.spyOn(Date, 'now').mockImplementation(() => ++clock);
+  const title = await chat('Needle in the title', [['user', 'ordinary words']]);
+  for (let index = 0; index < 5; index++) await chat(`Recent ${index}`, [['user', 'needle in the text']]);
+  await search('needle');
+  const reply = await searchSessions('needle', 2);
+  expect(reply.results[0]!.id).toBe(title);
+  expect(reply.results).toHaveLength(2);
+  expect(reply.limited).toBe(true);
+});
+
+it('does not return superseded words while a changed chat awaits reindexing', async () => {
+  const id = await chat('Revision', [['user', 'obsolete needle']]);
+  await search('needle');
+  const original = (await readEvents(id, { kinds: ['user_message'] }))[0]!;
+  if (original.kind !== 'user_message') throw new Error('Missing original question');
+  await upsertMessageEvent(id, { ...original, time: original.time + 10,
+    message: { text: 'replacement words', chars: 17, truncated: false } });
+  await flushSessions();
+  expect((await searchSessions('needle')).results).toEqual([]);
+  await searchIndexingSettled();
+  expect((await search('replacement')).results.map(result => result.id)).toEqual([id]);
+});
+
 it('marks matches at the right place, also around characters whose lowercase is longer', () => {
   expect(foldCase('İstanbul Straße')).toHaveLength('İstanbul Straße'.length);
   const text = 'İstanbul: the bridge to İzmir';
@@ -155,4 +181,23 @@ it('locates the first message holding the query, so a result opens there', async
   // Nothing said matches (a title-only match): no place to open at.
   expect(await locateSearchMatch(id, 'planning')).toBeNull();
   expect(await locateSearchMatch(id, '   ')).toBeNull();
+});
+
+// Find in chat (Codex's ⌘F): every message holding the phrase, in the order they were said, from the
+// whole recording rather than the page the window happens to hold.
+it('finds every message of one chat that holds a phrase, in order', async () => {
+  const id = await chat('Release planning', [
+    ['user', 'Check the Windows installer'],
+    ['assistant', 'The windows   INSTALLER builds; the bridge is next.'],
+    ['user', 'And the installer for macOS?'],
+    ['assistant', 'Both installers are signed.']
+  ]);
+  const said = await readEvents(id, { kinds: ['user_message', 'assistant_message'] });
+  const found = await findInSession(id, 'Windows installer');
+  // Case and runs of spaces do not matter; the whole phrase must be there.
+  expect(found.map(location => location.seq)).toEqual([said[0]!.seq, said[1]!.seq]);
+  expect(found[0]).toEqual({ seq: said[0]!.seq, kind: 'user_message', messageId: (said[0] as { messageId?: string }).messageId ?? null, position: positionOf(said[0]!) });
+  expect((await findInSession(id, 'installer')).map(location => location.seq)).toEqual(said.map(event => event.seq));
+  expect(await findInSession(id, 'linux')).toEqual([]);
+  expect(await findInSession(id, '  ')).toEqual([]);
 });

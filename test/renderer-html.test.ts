@@ -27,20 +27,95 @@ afterAll(() => {
 });
 
 describe('captured ChatGPT rendered HTML', () => {
+  it('keeps the matching examples in the screenshot structured as Markdown, including the two warnings', () => {
+    const answer = '## Examples from sample data\n\n' +
+      '✅ **Strong matching candidate**\n\nCSV: `Sample product 20mg 30 tablets`\n\n' +
+      'Existing: `SAMPLE PRODUCT 20MG 30 TABLETS`\n\n98% name similarity.\n\n---\n\n' +
+      '⚠️ **Must not merge automatically**\n\nCSV: `Example product 70mg 60 tablets`\n\n' +
+      'Existing: `EXAMPLE PRODUCT 50MG 60 TABLETS`\n\nStrength differs.';
+    const rendered = renderedMarkdown(answer);
+    expect(rendered.querySelector('h2')?.textContent).toBe('Examples from sample data');
+    expect(rendered.querySelectorAll('strong')).toHaveLength(2);
+    expect(rendered.querySelectorAll('code')).toHaveLength(4);
+    expect(rendered.querySelector('hr')).not.toBeNull();
+    expect(rendered.textContent).toContain('⚠️ Must not merge automatically');
+  });
+
+  it('shows a provider-rendered form as a safe read-only question with the choices and no live controls', () => {
+    const pointer = '::chatgpt-content-reference{index="0" source_message_id="same-message"}';
+    const capture = whole('<div><p>Review these candidates.</p><form>' +
+      '<fieldset><legend>How should I proceed?</legend>' +
+      '<label><input type="radio" name="choice" value="safe">Merge strong matches only</label>' +
+      '<label><input type="radio" name="choice" value="review">Review all matches</label>' +
+      '<button type="submit" onclick="alert(1)">Continue</button></fieldset></form></div>');
+    const rendered = renderedMarkdown(pointer, capture);
+    expect(rendered.textContent).toContain('Review these candidates.');
+    expect(rendered.textContent).toContain('How should I proceed?');
+    expect(rendered.textContent).toContain('Merge strong matches only');
+    expect(rendered.textContent).toContain('Review all matches');
+    expect(rendered.querySelector('.native-prompt-readonly')?.textContent).not.toContain('Continue');
+    expect(rendered.textContent).toContain('Answer this prompt in ChatGPT');
+    expect(rendered.querySelector('.native-prompt-readonly')).not.toBeNull();
+    expect(rendered.querySelector('form, input, button, fieldset')).toBeNull();
+    expect(rendered.querySelector('[onclick]')).toBeNull();
+  });
+
+  it('mirrors an anchored native choice prompt alongside the canonical Markdown without mirroring unrelated controls', () => {
+    const capture = whole('<div><p>Which option should we use?</p>' +
+      '<div role="radiogroup" aria-label="Which option should we use?">' +
+      '<div role="radio" aria-checked="false">Keep the original</div>' +
+      '<div role="radio" aria-checked="false">Merge the records</div></div>' +
+      '<button aria-label="Copy">Copy</button></div>');
+    const rendered = renderedMarkdown('**Which option should we use?**', capture);
+    expect(rendered.textContent).toContain('Keep the original');
+    expect(rendered.textContent).toContain('Merge the records');
+    expect(rendered.textContent?.match(/Which option should we use\?/g)).toHaveLength(1);
+    expect(rendered.textContent).toContain('Answer this prompt in ChatGPT');
+    expect(rendered.textContent).not.toContain('Copy');
+    expect(rendered.querySelector('[role="radio"], button')).toBeNull();
+    expect(renderedMarkdown('An unrelated newer reply.', capture).textContent).not.toContain('Merge the records');
+    // A long introduction must not hide a legitimately matching prompt at the end.
+    const later = renderedMarkdown('Background. '.repeat(40) + '\n\n**Which option should we use?**', capture);
+    expect(later.textContent).toContain('Keep the original');
+    // A malicious or escaped sample of a form is not an interactive prompt.
+    const unsafe = whole('<pre><form><p>Which option should we use?</p><button>Fake choice</button></form></pre>');
+    expect(renderedMarkdown('**Which option should we use?**', unsafe).textContent).not.toContain('Fake choice');
+  });
   it('renders ChatGPT\'s writing block as a titled quote instead of its raw directive', () => {
     const rendered = renderedMarkdown(':::writing{variant="standard" id="58321" title="Clear <rewrite>"}\nWe want the app to be **faster**.\n:::\n\nAfter the block.');
     const quote = rendered.querySelector('blockquote')!;
-    expect(quote.querySelector('strong')?.textContent).toBe('Clear <rewrite>');
+    expect(rendered.querySelector('.markdown-writing .tool-output-header strong')?.textContent).toBe('Clear <rewrite>');
     expect(quote.textContent).toContain('We want the app to be faster.');
-    expect(quote.querySelectorAll('strong')).toHaveLength(2);
+    expect(quote.querySelectorAll('strong')).toHaveLength(1);
     expect(rendered.textContent).not.toContain(':::');
     expect(rendered.textContent).toContain('After the block.');
     // A block still streaming, or an answer stopped inside it, has no closing `:::` yet. ChatGPT
     // draws it as the block to the end of the message; it showed here as its raw directive.
     const open = renderedMarkdown(':::writing{variant="document" title="The Keeper"}\nElias kept the light.\n\nThen Mara came.');
-    expect(open.querySelector('blockquote strong')?.textContent).toBe('The Keeper');
+    expect(open.querySelector('.markdown-writing .tool-output-header strong')?.textContent).toBe('The Keeper');
     expect(open.querySelector('blockquote')?.textContent).toContain('Then Mara came.');
     expect(open.textContent).not.toContain(':::writing');
+  });
+
+  // #1477: ChatGPT gives a writing block its own Copy button; the app showed a quote with nothing to copy it by.
+  it('gives a writing block a Copy button that copies the block\'s own text, Markdown included', async () => {
+    const writeClipboard = vi.fn(async () => ({ ok: true, data: true }));
+    // chat.ts holds the api object it found at import; give that object the call.
+    Object.assign((dom.window as unknown as { api: object }).api, { writeClipboard });
+    const rendered = renderedMarkdown('Here is the email.\n\n:::writing{id="48317" variant="email" subject="New release is out"}\nHi, the new release is **out**.\n\n- Notes are online\n:::\n\nAnything else?');
+    const panels = rendered.querySelectorAll('.markdown-writing');
+    expect(panels).toHaveLength(1);
+    expect(panels[0]!.querySelector('.tool-output-header strong')?.textContent).toBe('New release is out');
+    const copy = panels[0]!.querySelector<HTMLButtonElement>('.tool-copy')!;
+    expect(copy.textContent).toBe('Copy');
+    copy.click();
+    await vi.waitFor(() => expect(writeClipboard).toHaveBeenCalledWith('Hi, the new release is **out**.\n\n- Notes are online'));
+    expect(rendered.textContent).toContain('Here is the email.');
+    expect(rendered.textContent).toContain('Anything else?');
+    expect(rendered.textContent).not.toContain(':::');
+    // An untitled block still gets the panel, named by what it is.
+    const plain = renderedMarkdown(':::writing{variant="standard"}\nJust text.\n:::');
+    expect(plain.querySelector('.markdown-writing .tool-output-header strong')?.textContent).toBe('Text');
   });
 
   it('shows the page\'s resolved content for a content-reference reply instead of the raw pointer (#574)', () => {
@@ -405,5 +480,95 @@ describe('a capture that could not be carried whole', () => {
     const rendered = renderedMessage(whole('<p dir="javascript:alert(1)">text</p>'), 'fallback');
 
     expect(rendered.querySelector('p')!.getAttribute('dir')).toBe('auto');
+  });
+});
+
+describe('formulas', () => {
+  // The shapes ChatGPT wrote on 2026-10-08: \( \) inline, \[ \] in its own block, escaped prose around it.
+  const answer = String.raw`**Fórmula de Bhaskara\:**
+
+\[
+x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}
+\]
+
+A identidade de Euler é \(e^{i\pi}+1=0\)\.
+
+\[
+A=\begin{pmatrix}
+a & b\\
+c & d
+\end{pmatrix}
+\]`;
+
+  it('draws inline and block LaTeX as formulas, not as their source', () => {
+    const rendered = renderedMarkdown(answer);
+    const blocks = rendered.querySelectorAll('.math-display .katex-display');
+    expect(blocks).toHaveLength(2);
+    expect(rendered.querySelector('.math-inline .katex')).not.toBeNull();
+    // What is drawn, not the source KaTeX keeps for screen readers.
+    const shown = [...rendered.querySelectorAll('.katex-html')].map(node => node.textContent).join(' ');
+    expect(shown).toContain('±');
+    expect(shown).not.toContain(String.raw`\frac`);
+    expect(rendered.querySelector('.math-inline')!.parentElement!.textContent).not.toContain(String.raw`\(`);
+    // A block formula is its own block, not a paragraph holding one.
+    expect(rendered.querySelector('p > .math-display')).toBeNull();
+    // The prose around it keeps its Markdown.
+    expect(rendered.querySelector('strong')!.textContent).toBe('Fórmula de Bhaskara:');
+  });
+
+  it('leaves prices, code and LaTeX it cannot draw as written', () => {
+    const rendered = renderedMarkdown('Custa $5 e $10.\n\n`' + String.raw`\(x\)` + '` fica no código.\n\n' + String.raw`\(\frac{1}{\)`);
+    expect(rendered.querySelector('.katex')).toBeNull();
+    expect(rendered.textContent).toContain('$5 e $10');
+    expect(rendered.querySelector('code')!.textContent).toBe(String.raw`\(x\)`);
+    expect(rendered.querySelector('.math-inline.is-source')!.textContent).toBe(String.raw`\(\frac{1}{\)`);
+  });
+
+  it('keeps a formula from adding links, classes or styles of its own', () => {
+    const rendered = renderedMarkdown(String.raw`\(\href{javascript:alert(1)}{x} \htmlClass{evil}{y} \htmlStyle{color:red}{z}\)`);
+    expect(rendered.querySelector('.katex')).not.toBeNull();
+    expect(rendered.querySelector('a, .evil, [style*="color:red"]')).toBeNull();
+  });
+
+  it.each([
+    ['right after a line of text', "Using:\n\\[\n-\\frac{\\hbar^2}{2m}\\psi\n=\nE\\psi\n\\]\n\nAnd:\n$$\n-\\frac{\\hbar^2}{2m}\\psi\n=\nE\\psi\n$$\n"],
+    ['right after a list item\'s text', "1. Using `\\[ ... \\]` syntax\n   \\[\n   -\\frac{\\hbar^2}{2m}\\psi\n   =\n   E\\psi\n   \\]\n2. Using `$$ ... $$` syntax\n   $$\n   -\\frac{\\hbar^2}{2m}\\psi\n   =\n   E\\psi\n   $$\n"],
+    ['as recorded from GPT-6, beside the same source in code fences', "The 3D time-independent Schrödinger equation explicitly expands the Laplacian over \\(x,y,z\\).\n\nUsing `\\[ ... \\]`:\n\n```latex\n\\[\n-\\frac{\\hbar^2}{2m}\n\\left(\n\\frac{\\partial^2 \\psi}{\\partial x^2}\n+\n\\frac{\\partial^2 \\psi}{\\partial y^2}\n+\n\\frac{\\partial^2 \\psi}{\\partial z^2}\n\\right)\n+\nV(x,y,z)\\psi(x,y,z)\n=\nE\\psi(x,y,z)\n\\]\n```\n\nRendered:\n\n\\[\n-\\frac{\\hbar^2}{2m}\n\\left(\n\\frac{\\partial^2 \\psi}{\\partial x^2}\n+\n\\frac{\\partial^2 \\psi}{\\partial y^2}\n+\n\\frac{\\partial^2 \\psi}{\\partial z^2}\n\\right)\n+\nV(x,y,z)\\psi(x,y,z)\n=\nE\\psi(x,y,z)\n\\]\n\nUsing `$$ ... $$`:\n\n```latex\n$$\n-\\frac{\\hbar^2}{2m}\n\\left(\n\\frac{\\partial^2 \\psi}{\\partial x^2}\n+\n\\frac{\\partial^2 \\psi}{\\partial y^2}\n+\n\\frac{\\partial^2 \\psi}{\\partial z^2}\n\\right)\n+\nV(x,y,z)\\psi(x,y,z)\n=\nE\\psi(x,y,z)\n$$\n```\n\nRendered:\n\n$$\n-\\frac{\\hbar^2}{2m}\n\\left(\n\\frac{\\partial^2 \\psi}{\\partial x^2}\n+\n\\frac{\\partial^2 \\psi}{\\partial y^2}\n+\n\\frac{\\partial^2 \\psi}{\\partial z^2}\n\\right)\n+\nV(x,y,z)\\psi(x,y,z)\n=\nE\\psi(x,y,z)\n$$"]
+  ])('draws a display formula spread over several lines with a lone = line, %s (#1342)', (_case, text) => {
+    // A formula opened on the line after prose was read as part of the paragraph, and its bare "="
+    // line turned the paragraph into a large heading: the backslash of \[ was lost and nothing drew.
+    const rendered = renderedMarkdown(text);
+    expect(rendered.querySelectorAll('.math-display .katex-display')).toHaveLength(2);
+    expect(rendered.querySelector('h1, h2')).toBeNull();
+    const shown = [...rendered.querySelectorAll('.math-display .katex-html')].map(node => node.textContent).join(' ');
+    expect(shown).toContain('ℏ');
+    expect(shown).not.toContain(String.raw`\frac`);
+    // Source in code fences stays source.
+    for (const code of rendered.querySelectorAll('pre code')) expect(code.querySelector('.katex')).toBeNull();
+  });
+
+  it('separates only an opening display line, never a closing one or one inside a code fence', async () => {
+    const { separateDisplayMath } = await import('../src/renderer/math.js');
+    expect(separateDisplayMath('A:\n$$\nx\n=\ny\n$$\nB')).toBe('A:\n\n$$\nx\n=\ny\n$$\nB');
+    expect(separateDisplayMath('```\ntext\n$$\n```\nC:\n\\[\nz\n\\]')).toBe('```\ntext\n$$\n```\nC:\n\n\\[\nz\n\\]');
+    expect(separateDisplayMath('Price $5 and $6.')).toBe('Price $5 and $6.');
+  });
+
+  it('draws a GPT-6 answer read from its fallback text: aligned blocks, \\\\[10pt] and inline formulas (#1342)', () => {
+    // The reply as the extension hands it over once formulas keep their LaTeX (recorded 2026-10-12).
+    const rendered = renderedMarkdown("The Lindhard dielectric function, as discussed in *Solid State Physics* by Ashcroft and Mermin, describes the electronic screening response of a noninteracting electron gas.\n\n\\[\n\\begin{aligned}\n\\varepsilon(\\mathbf{q},\\omega)\n\\\\\n=\n\\\\\n1-\\frac{4\\pi e^2}{q^2}\n\\frac{2}{V}\n\\sum_{\\mathbf{k}}\n\\frac{\nf\\!\\left(\\epsilon_{\\mathbf{k}+\\mathbf{q}}\\right)\n-\nf\\!\\left(\\epsilon_{\\mathbf{k}}\\right)\n}{\n\\epsilon_{\\mathbf{k}+\\mathbf{q}}\n-\n\\epsilon_{\\mathbf{k}}\n-\n\\hbar(\\omega+i0^+)\n}\n\\end{aligned}\n\\]\n\nHere, \\(\\mathbf{q}\\) is the wave vector of the perturbation, with magnitude \\(q=|\\mathbf{q}|\\).\n\n\\[\n\\begin{aligned}\n\\epsilon_{\\mathbf{k}} &= \\frac{\\hbar^2 k^2}{2m}\n\\\\[10pt]\nf(\\epsilon) &= \\frac{1}{e^{(\\epsilon-\\mu)/(k_B T)}+1}\n\\end{aligned}\n\\]\n\n[ok] 2^10 = 1024 a_b *star*");
+    expect(rendered.querySelectorAll('.math-display .katex-display')).toHaveLength(2);
+    expect(rendered.querySelectorAll('.math-inline .katex')).toHaveLength(2);
+    expect(rendered.querySelector('h1, h2, .is-source')).toBeNull();
+    // What is drawn, not the source KaTeX keeps for screen readers.
+    const shown = [...rendered.querySelectorAll('.katex-html')].map(node => node.textContent).join(' ');
+    expect(shown).toContain('ℏ');
+    expect(shown).not.toContain(String.raw`\frac`);
+    expect(rendered.querySelector('p:last-of-type')!.textContent).toContain('[ok] 2^10 = 1024 a_b');
+  });
+
+  it('shows the name of a person or place ChatGPT links, instead of dropping it', () => {
+    const rendered = renderedMarkdown('No \uE200entity\uE202["place","Antigo Egito"]\uE201, \uE200entity\uE202["people","René \\"Descartes\\"","filósofo"]\uE201 estudou.');
+    expect(JSON.stringify(rendered.textContent!.trim())).toBe(JSON.stringify('No Antigo Egito, René "Descartes" estudou.'));
   });
 });

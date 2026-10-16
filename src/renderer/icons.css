@@ -46,8 +46,10 @@
 .ph.ph-arrow-square-out::before { content: '\e5de'; }
 .ph.ph-arrow-up::before { content: '\e08e'; }
 .ph.ph-arrows-clockwise::before { content: '\e094'; }
+.ph.ph-caret-down::before { content: '\e136'; }
 .ph.ph-caret-left::before { content: '\e138'; }
 .ph.ph-caret-right::before { content: '\e13a'; }
+.ph.ph-caret-up::before { content: '\e13c'; }
 .ph.ph-chart-line::before { content: '\e154'; }
 .ph.ph-chat-circle::before { content: '\e168'; }
 .ph.ph-check::before { content: '\e182'; }
@@ -78,6 +80,7 @@
 .ph.ph-magnifying-glass::before { content: '\e30c'; }
 .ph.ph-magnifying-glass-minus::before { content: '\e30e'; }
 .ph.ph-magnifying-glass-plus::before { content: '\e310'; }
+.ph.ph-microphone::before { content: '\e326'; }
 .ph.ph-monitor::before { content: '\e32e'; }
 .ph.ph-palette::before { content: '\e6c8'; }
 .ph.ph-paw-print::before { content: '\e648'; }

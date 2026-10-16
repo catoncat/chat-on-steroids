@@ -1,5 +1,6 @@
 import { offerToolInput, acknowledgeToolInput, TOOL_INPUT_HEADER } from '../session/input.js';
 import { noteConnectorUse } from '../connector-proof.js';
+import { beginPluginToolCall } from '../plugin-refresh.js';
 import { pluginManager } from '../plugins/manager.js';
 import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-computer.js';
 /**
@@ -25,7 +26,7 @@ import { WINDOWS_COMPUTER_STATE_INPUT_METHODS } from '../../shared/windows-compu
 
 import { rawPromises as fs } from '../rawfs.js';
 import { randomUUID } from 'node:crypto';
-import { beginToolTiming, inboundRequestId, inboundPublication } from './inbound.js';
+import { beginToolTiming, inboundRequestId, inboundPublication, inboundProviderRequest } from './inbound.js';
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Capabilities, Root } from '../../shared/types.js';
@@ -41,12 +42,14 @@ import {
   type Resolved
 } from '../sandbox.js';
 import { currentWorkspace, forgetMissingWorkspace, learnWorkspace, setCurrentWorkspace } from '../workspace.js';
+import { lookupWorkerWorkspace, validateWorkerWorkspaceLease } from '../worktrees/index.js';
 import { getSessionProject } from '../projects.js';
 import { firstTaskRoot, resolveLinkedSkillAlias } from '../skill-access.js';
 import { isUserSkillVirtualPath, resolveUserSkillPath } from '../user-skills.js';
 import { ExecError } from '../exec.js';
 import { ComputerError } from '../computer/index.js';
 import { getConfig } from '../config.js';
+import { noteToolCall, toolOutcome } from '../diagnostics-facts.js';
 import {
   AgentError,
   IdentityLostError,
@@ -66,6 +69,8 @@ import {
   sleepSilentWorkers,
   noteAgentAlive,
   agentForCaller,
+  managedWorkerAllocationIdentity,
+  managedWorkerIsolationRequired,
   agentForOwnedConversation,
   agentForFinishCaller,
   hasRetiredWorkerLeases,
@@ -79,6 +84,7 @@ import {
   swarmRunning
 } from '../agents.js';
 import type { SurfaceId } from './surfaces.js';
+import { noteServedRequest } from '../connector-identity.js';
 import {
   currentCall,
   emptyEvidence,
@@ -498,7 +504,7 @@ async function withBackgroundExecRecovery(
 ): Promise<ToolResult> {
   const { publication, caller } = context;
   if (!publication || !caller.requestId) return result;
-  const principal = executionPrincipal(caller.requestId, caller.sessionId, context.allowUnattributed === true);
+  const principal = executionPrincipal(caller.requestId, caller.sessionId);
   if (!principal) return result;
   const used = result.content.reduce((bytes, part) => bytes + (part.type === 'text' ? Buffer.byteLength(part.text, 'utf8') : 0), 0);
   const budget = Math.min(12_000, DEFAULT_MAX_OUTPUT_TOKENS * 4 - used) - 64;
@@ -525,6 +531,9 @@ async function withBackgroundExecRecovery(
  * between a completed local operation, its unknown attribution, and an undelivered agent
  * message: none of those facts implies that completed work is about to disappear.
  */
+/** Tools whose answer does not depend on which chat called them. */
+const IDENTITY_FREE_TOOLS: ReadonlySet<string> = new Set(['usage']);
+
 function withUnattributedNotice(
   conversationId: string | null | undefined,
   result: ToolResult,
@@ -650,12 +659,14 @@ export async function dispatch(
   };
   // Every call runs through here, so the proof is installed before any call can be running.
   setRequestOwner(requestOwner);
+  const confirmUse = !parent && inboundProviderRequest() ? beginPluginToolCall(surface) : null;
   try {
     const result = await trackMcpRequest(() =>
       trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent))
     );
     // In-process callers have no socket; resolving their outer invocation publishes it.
     if (!parent && !inboundPublication()) context.publication!.completedAt = Date.now();
+    if (!result.isError) confirmUse?.();
     return result;
   } catch (error) {
     if (!parent) context.publication!.failed = true;
@@ -689,11 +700,14 @@ async function dispatchTracked(
 ): Promise<ToolResult> {
   noteTransportIdentity(transportKey);
   const markTiming = beginToolTiming();
+  const callStartedAt = Date.now();
   // Recorded here rather than in `guard` because only this layer knows which server
   // answered, and "was this connector ever actually used from ChatGPT" is a per-connector
   // question the setup screen has to answer honestly.
   surfaceToolCallAt.set(surface, Date.now());
   noteConnectorUse(surface, 'tool');
+  // Proof for connector identity: this exact request reached this surface's own endpoint.
+  if (!nested) noteServedRequest(requestId, surface);
   const isFinish = isFinishCall(name, args);
   const startedAt = context.startedAt;
   const allowUnattributed = context.allowUnattributed === true;
@@ -957,7 +971,7 @@ async function dispatchTracked(
   if (!nested && requestId && !preAckPolicyRefusal && !supersededConversation && !compacting) {
     const explicitPoll = name === 'write_stdin' && args && typeof args === 'object'
       ? (args as { session_id?: number }).session_id : undefined;
-    const principal = executionPrincipal(requestId, context.caller.sessionId, allowUnattributed);
+    const principal = executionPrincipal(requestId, context.caller.sessionId);
     await acknowledgeBackgroundExecOutput(principal, startedAt, explicitPoll);
   }
   let admissionRefusal = preAckPolicyRefusal;
@@ -1025,6 +1039,8 @@ async function dispatchTracked(
         : invokeHandler()
   );
   markTiming('handler');
+  // Nested exec children are counted under their own names, like direct calls.
+  noteToolCall(name, toolOutcome(result), Date.now() - callStartedAt);
   if (identityRefusals.has(result)) rememberIdentityRefusal(requestId, name);
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would
@@ -1086,7 +1102,10 @@ async function dispatchTracked(
   // The Plugins handler owns validation/redaction of external results. A dispatcher refusal
   // never visited that owner and therefore needs its own single redaction pass.
   const baseResult = surface === 'plugins' && !handlerRan ? pluginManager.redactResult(result) as ToolResult : result;
-  let delivered = nested ? baseResult : withUnattributedNotice(
+  // A tool that reads nothing belonging to a chat (usage) answers before the page's evidence
+  // for its request arrives; the attribution notice would only add noise to every such answer.
+  const identityFree = IDENTITY_FREE_TOOLS.has(name);
+  let delivered = nested ? baseResult : identityFree ? (deliveryFenced ? baseResult : withInbox(context.caller, context.agent, baseResult, isFinish)) : withUnattributedNotice(
     context.caller.conversationId,
     deliveryFenced ? baseResult : withInbox(context.caller, context.agent, baseResult, isFinish),
     context.caller.requestId,
@@ -1130,7 +1149,11 @@ async function dispatchTracked(
     const supplemental = delivered.content.slice(baseResult.content.length)
       .filter((part): part is Extract<ToolContent, { type: 'text' }> => part.type === 'text')
       .map(part => part.text).join('\n');
-    if (supplemental) delivered = { ...delivered, structuredContent: { ...delivered.structuredContent, supplemental_context: supplemental } };
+    // A handler may already have put its own app context there (exec_command's notes); keep it
+    // ahead of what delivery appended rather than replacing it.
+    const own = delivered.structuredContent['supplemental_context'];
+    const merged = [typeof own === 'string' ? own : '', supplemental].filter(Boolean).join('\n');
+    if (supplemental) delivered = { ...delivered, structuredContent: { ...delivered.structuredContent, supplemental_context: merged } };
   }
   const recorderStartedAt = Date.now();
   // Event duration includes identity/handler/delivery work. Recorder and local HTTP finish
@@ -1242,13 +1265,31 @@ function isFinishCall(name: string, args: unknown): boolean {
  * refusal it would have got for a relative path before, which is why ambiguity here costs a
  * retry rather than reaching the wrong file.
  */
-async function validatedWorkspace() {
+export async function validatedWorkspace() {
   return (await liveWorkspace()).workspace;
 }
 
 /** The workspace, plus the virtual path of a learned one just dropped because its folder is gone. */
 async function liveWorkspace(): Promise<{ workspace: { virtual: string; real: string } | null; missing: string | null }> {
-  const sessionId = currentCall()?.caller.sessionId;
+  const call = currentCall();
+  const sessionId = call?.caller.sessionId;
+  // Session project metadata is inherited by workers for grouping; the broker's exact
+  // worktree allocation must take precedence, including after a restart or revival.
+  // An evicted managed broker family is not permission to use the inherited Prime project.
+  // Exact-chat managed allocation/tombstone proof survives the finite broker-history window;
+  // ordinary and older unmanaged workers never acquire an isolation requirement by origin.
+  if (call && managedWorkerIsolationRequired(call.caller)) {
+    const allocation = managedWorkerAllocationIdentity(call.caller);
+    const lease = allocation && call.agent === allocation.agentId ? lookupWorkerWorkspace(allocation) : null;
+    if (!lease) {
+      throw new Error('WORKTREE_OWNER_UNAVAILABLE: the required isolated worker checkout has no verified owner. Relative file and command operations are blocked.');
+    }
+    // Cache provenance is not filesystem ownership: another process may replace the
+    // directory while this worker sleeps. Recheck marker, inode and Git owner now.
+    const verified = await validateWorkerWorkspaceLease(lease, getConfig().roots);
+    setCurrentWorkspace(verified.workspace);
+    return { workspace: verified.workspace, missing: null };
+  }
   // Explicit project bindings are durable authority, even after a cwd was learned.
   // Validate first so a revoked or moved project never becomes a first-root fallback.
   const project = sessionId ? await getSessionProject(sessionId) : null;

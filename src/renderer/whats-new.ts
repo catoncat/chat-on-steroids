@@ -14,6 +14,104 @@ interface Highlight { icon: string; title: () => string; text: () => string }
 interface Release { lead: () => string; highlights: Highlight[] }
 
 const RELEASES: Readonly<Record<string, Release>> = {
+  '2.1.39': {
+    lead: () => t('Fresh turns that work while ChatGPT thinks, and a fuller diagnostics report.'),
+    highlights: [
+      { icon: 'i-retry', title: () => t('Fresh turns that hold'), text: () => t('Long work now also continues in a fresh turn while ChatGPT is thinking or running a tool.') },
+      { icon: 'i-browser', title: () => t('No chats in incognito'), text: () => t('Chats the app opens go to your regular browser window, never an incognito one.') },
+      { icon: 'i-check-circle', title: () => t('A fuller diagnostics report'), text: () => t('It also shows how the app is installed, the browser, crashes, frequent warnings and each chat\'s state, still without anything personal.') }
+    ]
+  },
+  '2.1.38': {
+    lead: () => t('Firefox, fresh turns for long work, and approvals you answer in the app.'),
+    highlights: [
+      { icon: 'i-globe', title: () => t('Firefox'), text: () => t('Choose Firefox as the ChatGPT browser. Its add-on is signed by Mozilla and updates itself.') },
+      { icon: 'i-retry', title: () => t('Fresh turns for long work'), text: () => t('Long work continues in a fresh turn every 30 minutes, so it no longer breaks after about 40 minutes.') },
+      { icon: 'i-check-circle', title: () => t('Approvals in the app'), text: () => t('Answer ChatGPT\'s tool approval cards with Deny or Allow once, right in the app.') },
+      { icon: 'i-arrow-down', title: () => t('Update all'), text: () => t('Activity shows the app, the extension and each plugin with its status, and one button updates them.') },
+      { icon: 'i-chart', title: () => t('Codex and Claude Code in Usage'), text: () => t('See Codex\'s limits and the tokens Codex and Claude Code used, and ask for your usage in a chat.') }
+    ]
+  },
+  '2.1.37': {
+    lead: () => t('Find in chat, slash commands, and messages that go where you want.'),
+    highlights: [
+      { icon: 'i-search', title: () => t('Find in chat'), text: () => t('{0} searches the whole chat, older messages included.', [primaryShortcut('F')]) },
+      { icon: 'i-terminal', title: () => t('Slash commands'), text: () => t('Type / in the message box to pick a model, rename or pin the chat, see its status and more.') },
+      { icon: 'i-bolt', title: () => t('Send now'), text: () => t('A queued message can join the running answer right away, and you choose what Enter does.') },
+      { icon: 'i-check-circle', title: () => t('Told when a chat finishes'), text: () => t('A notification when a chat is done while the app is in the background, and the computer stays awake while it works.') },
+      { icon: 'i-agents', title: () => t('Worker chats out of the way'), text: () => t('Turn it on, and worker chats are archived in ChatGPT once the app is done with them.') }
+    ]
+  },
+  '2.1.36': {
+    lead: () => t('Steadier long runs, a tunnel that works behind a proxy, and ChatGPT\'s own words.'),
+    highlights: [
+      { icon: 'i-retry', title: () => t('Steadier long runs'), text: () => t('Chats recover more reliably, also after your computer sleeps, and the timeline keeps a long turn in order.') },
+      { icon: 'i-globe', title: () => t('Works behind a proxy'), text: () => t('The tunnel to ChatGPT uses your system\'s proxy by itself.') },
+      { icon: 'i-chat', title: () => t('Better dictation on Windows'), text: () => t('Dictation uses Windows\' own speech recognition, with punctuation and much better accuracy.') },
+      { icon: 'i-plug', title: () => t('Plugins, as ChatGPT calls them'), text: () => t('The app now says plugin, like ChatGPT, and plugins with many tools can be installed.') },
+      { icon: 'i-terminal', title: () => t('Start chats from your own tools'), text: () => t('The Local control API can start a new chat and send its events as they happen.') }
+    ]
+  },
+  '2.1.35': {
+    lead: () => t('ChatGPT Projects for your projects, workers in their own Git copy, and steadier long runs.'),
+    highlights: [
+      { icon: 'i-folder', title: () => t('Projects in ChatGPT'), text: () => t('New projects get their own ChatGPT Project, and their new chats open inside it.') },
+      { icon: 'i-browser', title: () => t('Background chats in a tab group'), text: () => t('Background chats can stay in one collapsed tab group in your browser window instead of their own window.') },
+      { icon: 'i-git-diff', title: () => t('Workers in their own Git copy'), text: () => t('When you turn it on, each new worker gets its own Git worktree and branch, away from your checkout.') },
+      { icon: 'i-chat', title: () => t('Dictation on Windows'), text: () => t('The microphone button turns your speech into text in the message box, and you send it when you\'re ready.') },
+      { icon: 'i-plug', title: () => t('Rename your plugins'), text: () => t('Chat On Steroids apps you rename in ChatGPT keep working.') }
+    ]
+  },
+  '2.1.34': {
+    lead: () => t('Goal on every plan, Compact & Resume in Projects, and a background window that stays.'),
+    highlights: [
+      { icon: 'i-target', title: () => t('Goal on every plan'), text: () => t('On plans without a model picker, such as Free, Goal and Loop follow-ups use the chat\'s current model instead of failing.') },
+      { icon: 'i-steps', title: () => t('Compact & Resume in Projects'), text: () => t('Moving a chat inside a ChatGPT Project to a new chat now completes, and the new chat stays in that Project.') },
+      { icon: 'i-browser', title: () => t('A background window that stays'), text: () => t('Background chats keep using the same window after the extension updates or reloads.') },
+      { icon: 'i-plug', title: () => t('Clearer plugin hints'), text: () => t('When ChatGPT calls a tool its plugin doesn\'t have, the result names the plugin that has it.') },
+      { icon: 'i-terminal', title: () => t('Fewer repeated commands'), text: () => t('When ChatGPT starts a command that is still running in that chat, the result points it to the running one.') }
+    ]
+  },
+  '2.1.33': {
+    lead: () => t('Reuse a saved summary, see why a message waits, and a background window that follows you.'),
+    highlights: [
+      { icon: 'i-steps', title: () => t('Reuse a saved summary'), text: () => t('If Compact & Resume stops after ChatGPT wrote its summary, open the new chat with that summary instead of starting over.') },
+      { icon: 'i-clock', title: () => t('See why a message waits'), text: () => t('A queued message says when it is waiting for the browser extension or for a running tool call.') },
+      { icon: 'i-browser', title: () => t('The background window follows you'), text: () => t('With Background chats on, the chat you select in the app is the one its background window shows.') },
+      { icon: 'i-retry', title: () => t('Calmer when ChatGPT is busy'), text: () => t('When ChatGPT limits how fast history loads, recovery waits as long as ChatGPT asks instead of reloading again.') },
+      { icon: 'i-bolt', title: () => t('Lighter on your computer'), text: () => t('Open ChatGPT chats use much less CPU while they wait.') }
+    ]
+  },
+  '2.1.32': {
+    lead: () => t('Messages that reach the running answer, the choices ChatGPT asks you about, and a Stop that sticks.'),
+    highlights: [
+      { icon: 'i-bolt', title: () => t('Messages reach the running answer'), text: () => t('Send directly puts your message into the running answer as a real ChatGPT message, even while a command runs, and the command keeps its result.') },
+      { icon: 'i-check-circle', title: () => t("ChatGPT's choices in the timeline"), text: () => t('When ChatGPT asks you to pick an option, the timeline shows the question and its choices.') },
+      { icon: 'i-ban', title: () => t('A Stop that sticks'), text: () => t('Stop ends the turn even when a late tool result reopens it, and the timeline says when it stopped.') },
+      { icon: 'i-chart', title: () => t('A clearer Usage page'), text: () => t('Whole token counts, a lower bound for costs without a price, and the newest weeks of activity first.') },
+      { icon: 'i-skill', title: () => t('Skills in your language'), text: () => t('The recommended skills describe themselves in the language of the app.') }
+    ]
+  },
+  '2.1.31': {
+    lead: () => t('GPT-6 support, a timeline that reads like ChatGPT, and a clearer view of your sub-agents.'),
+    highlights: [
+      { icon: 'i-sparkle', title: () => t('Ready for GPT-6'), text: () => t('Pick GPT-6, GPT-5.6 or GPT-5.5 with Instant, Medium or High. Goal, Loop and Compact & Resume work on GPT-6.') },
+      { icon: 'i-steps', title: () => t('A timeline in rounds'), text: () => t("Each turn reads in rounds like ChatGPT's own, with the model's notes between steps, a live status line and formulas.") },
+      { icon: 'i-agents', title: () => t('A clearer sub-agent list'), text: () => t('Each worker is named for its job and shows its task, its state and its model.') },
+      { icon: 'i-lock', title: () => t('Setup asks what ChatGPT may do'), text: () => t('The same permission switches as in Workspace, and Setup tells you when access is limited.') },
+      { icon: 'i-panel-right', title: () => t('Panels in the title bar'), text: () => t('The panel buttons moved to the title bar, and the right panel now runs the full height of the window.') }
+    ]
+  },
+  '2.1.30': {
+    lead: () => t('See what changed after each update, and long runs that stop and recover more calmly.'),
+    highlights: [
+      { icon: 'i-sparkle', title: () => t("What's new, after every update"), text: () => t('A short summary like this one shows once after each update, with a link to the full notes.') },
+      { icon: 'i-retry', title: () => t('Clear stops for stuck messages'), text: () => t('If ChatGPT never picks up a queued message, the app tries three times, then tells you and keeps it queued.') },
+      { icon: 'i-agents', title: () => t('Steadier sub-agents'), text: () => t('New worker tabs get more time on slow connections, and a worker no longer gets stuck behind its own unsent message.') },
+      { icon: 'i-gear', title: () => t('Your settings stay put'), text: () => t("A settings file the app can't read no longer resets everything: the app reads it anyway or keeps a copy.") },
+      { icon: 'i-loop', title: () => t('Recovery stays on'), text: () => t("When the app reuses a quiet chat's tab for a new chat, that chat keeps its automatic recovery.") }
+    ]
+  },
   '2.1.29': {
     lead: () => t('Pin your chats, search from anywhere, and know when ChatGPT is waiting for you.'),
     highlights: [
@@ -55,13 +153,14 @@ export function paintWhatsNew(version: string): boolean {
 /**
  * Centred in a window of odd width or height, the dialog starts half a pixel off the pixel grid
  * and every icon in it blurs and drifts by that half pixel. Its own size is whole pixels, so
- * shifting it back by the remainder keeps it centred within half a pixel and crisp.
+ * whole-pixel margins keep it centred within half a pixel and crisp. Margins, not a transform:
+ * a fractional transform rasterises the glyphs off the grid all the same.
  */
 function snapToPixels(dialog: HTMLDialogElement): void {
   if (!dialog.open) return;
   const x = (window.innerWidth - dialog.offsetWidth) / 2;
   const y = (window.innerHeight - dialog.offsetHeight) / 2;
-  dialog.style.translate = `${Math.floor(x) - x}px ${Math.floor(y) - y}px`;
+  dialog.style.margin = x < 0 || y < 0 ? '' : `${Math.floor(y)}px ${Math.ceil(x)}px ${Math.ceil(y)}px ${Math.floor(x)}px`;
 }
 
 let wired = false;

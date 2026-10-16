@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_GOAL_SYSTEM_PROMPT } from '../src/shared/goal.js';
 import { prependUserPrompt } from '../src/shared/user-prompt.js';
 import type { Handoff, SessionEvent, SessionSummary } from '../src/shared/session.js';
@@ -20,7 +20,7 @@ vi.mock('../src/renderer/file-code-editor.js', () => ({
     return { destroy: () => view.remove(), language: 'TypeScript' };
   }
 }));
-import { positionOf, projectTimeline } from '../src/shared/chronology.js';
+import { positionOf, projectTimeline, residenceOf } from '../src/shared/chronology.js';
 
 /**
  * The session timeline as the user reads it while a chat is running.
@@ -165,7 +165,7 @@ async function settleHistoryFrame(w: Pick<Window, 'requestAnimationFrame'>): Pro
   await settle();
 }
 
-async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; playfulStatus?: boolean; followOutput?: boolean; sessions?: SessionSummary[]; pro?: boolean; astra?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null; deferProcessStop?: boolean; defaultChatModel?: string; noModels?: boolean } = {}) {
+async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; playfulStatus?: boolean; followOutput?: boolean; followUp?: 'steer' | 'queue'; enterSends?: boolean; sessions?: SessionSummary[]; pro?: boolean; astra?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null; deferProcessStop?: boolean; defaultChatModel?: string; noModels?: boolean; approvalCard?: () => unknown; answerApproval?: (id: string, cardId: string, choice: string) => unknown } = {}) {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
@@ -196,7 +196,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
     },
     commandAllowlist: { enabled: false, mode: 'allow' as const, rules: [] as string[] },
     tunnel: { kind: 'openai', tunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', desktopTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light', developerMode: options.developerMode ?? false, playfulStatus: options.playfulStatus ?? false, ...(options.followOutput === undefined ? {} : { followOutput: options.followOutput }),
+    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light', developerMode: options.developerMode ?? false, playfulStatus: options.playfulStatus ?? false, ...(options.followOutput === undefined ? {} : { followOutput: options.followOutput }), ...(options.followUp === undefined ? {} : { followUp: options.followUp }), ...(options.enterSends === undefined ? {} : { enterSends: options.enterSends }),
       ...(options.defaultChatModel ? { defaultChatModel: options.defaultChatModel, defaultChatReasoning: 'high' } : {}) },
     sessions: { record: true, retainDays: 30, advisoryTokens: 300000, limitTokens: 400000 },
     compaction: { auto: true, autoTokens: 300000 },
@@ -231,6 +231,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
       setSessionAutomation: (id: string, action: string) => { live.controlCalls.push({ id, action }); live.automation = action; return ok({}); },
       compactSession: (id: string) => { live.controlCalls.push({ id, action: 'compact' }); live.compacting = true; return ok({}); },
       cancelSessionCompaction: (id: string) => { live.controlCalls.push({ id, action: 'cancel' }); live.compacting = false; return ok({}); },
+      resumeFromHandoff: (id: string, handoffId: string) => { live.controlCalls.push({ id, action: `resume:${handoffId}` }); return ok({}); },
       getLog: () => ok([]),
       getSwarm: () => ok({ running: false, runId: null, agents: [], maxWorkers: 2, pendingReports: 0 }),
       onStateChanged: () => () => undefined,
@@ -275,7 +276,9 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
         backgroundProcessListener = listener;
         return () => undefined;
       },
-      livePreview: () => ok(null), listPausedHelpers: () => ok(pausedHelpers),
+      approvalCard: () => ok(options.approvalCard?.() ?? null),
+      answerApproval: (id: string, cardId: string, choice: string) => ok(options.answerApproval?.(id, cardId, choice) ?? { ok: true }),
+      turnTraces: () => ok({}), listPausedHelpers: () => ok(pausedHelpers),
       retryHelper: (id: string, sourceSessionId: string) => {
         live.controlCalls.push({ id: sourceSessionId, action: `retry:${id}` });
         pausedHelpers = pausedHelpers.filter(row => row.id !== id);
@@ -297,10 +300,13 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
       },
       getSession: (_id: string, options?: { from?: number; before?: number; after?: number; limit?: number }) => {
         const from = options?.from ?? 0;
+        // Pages as the store does: by residence (a turn's final answer beside its end). The CI
+        // fail-first run executes this file against code without residenceOf; position is its fallback there.
+        const residence = residenceOf ?? positionOf;
         const eligible = live.events.filter((event) => event.seq >= from &&
-          (options?.before === undefined || positionOf(event) < options.before) &&
-          (options?.after === undefined || positionOf(event) > options.after))
-          .sort((a, b) => options?.from !== undefined ? a.seq - b.seq : positionOf(a) - positionOf(b));
+          (options?.before === undefined || residence(event) < options.before) &&
+          (options?.after === undefined || residence(event) > options.after))
+          .sort((a, b) => options?.from !== undefined ? a.seq - b.seq : residence(a) - residence(b));
         const limit = options?.limit ?? 30;
         const page = options?.after !== undefined || options?.from !== undefined
           ? eligible.slice(0, limit) : eligible.slice(-limit);
@@ -351,6 +357,13 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
     }
   };
 }
+
+it('ignores a pointer release when the timeline owns no pointer press', async () => {
+  const { w } = await boot([]);
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+  w.dispatchEvent(new w.MouseEvent('pointerup'));
+  expect(error).not.toHaveBeenCalled();
+});
 
 it('makes parent and worker session selectors keyboard-focusable and activates them with Enter/Space', async () => {
   const parent: SessionSummary = { ...summary([]), id: 'parent-session', title: 'Parent', conversationId: 'parent-chat', chatIds: ['parent-chat'] };
@@ -573,6 +586,19 @@ it.each(['compaction', 'blocked', 'worker'])('retires %s control status when lea
   expect(status.textContent).toBe('');
   release({ ok: true, data: controls }); await settle();
   expect(status.textContent).not.toBe('');
+});
+
+it('asks for the selected chat\'s background tab once per switch (#1249)', async () => {
+  const first = summary([]), second = { ...summary([]), id: '2026-09-02-test0002', title: 'Other session' };
+  const { w } = await boot([], true, [], [], { sessions: [first, second] });
+  const api = (w as any).api;
+  const followed: string[] = [];
+  api.followSessionTab = async (id: string) => { followed.push(id); return { ok: true, data: true }; };
+  const row = (id: string) => w.document.querySelector<HTMLElement>(`#sessionList [data-id="${id}"]`)!;
+  row(second.id).click();
+  row(second.id).click();
+  row(first.id).click();
+  expect(followed).toEqual([second.id, first.id]);
 });
 
 it('clears control projections on an existing-session switch and fences A to B to A responses', async () => {
@@ -847,6 +873,21 @@ it('identifies automatic Continue without user-task editing or reordering and ke
   expect(w.document.querySelectorAll('#finishQueue [aria-label="Edit queued task"]')).toHaveLength(2);
 });
 
+// #1402: the app's own fresh-turn continue is no one's typed message. Waiting, it shows as the
+// message it is; dropped, it raises no delivery notice, because the app tries again by itself.
+it('shows a fresh-turn continue while it waits and raises no notice when it is dropped', async () => {
+  const { w, live, append } = await boot([]);
+  const rotation: InputEntry = { id: 'fresh-turn', sessionId: summary([]).id, text: 'Continue the task from where you are.', mode: 'auto',
+    dueAt: 0, model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b', purpose: 'rotation' };
+  live.inputs.push(rotation);
+  await append([]);
+  expect(w.document.querySelector('#inputQueue [data-input-id="fresh-turn"]')?.textContent).toContain('Continue the task');
+  live.inputs[0] = { ...rotation, state: 'cancelled', error: 'Not sent: browser preparation timed out. This attempt was cancelled.' };
+  await append([]);
+  expect(w.document.querySelector('#inputQueue [data-input-id="fresh-turn"]')).toBeNull();
+  expect(w.document.getElementById('inputQueue')!.textContent).not.toContain('Not sent');
+});
+
 it('keeps a transport-deferred immediate upload visible with cancellation instead of an invalid task editor', async () => {
   const { w, live, append } = await boot([]);
   live.inputs.push({ id: 'native-correction', sessionId: summary([]).id, text: 'Waiting upload', mode: 'after-turn', requestedMode: 'auto',
@@ -1041,6 +1082,41 @@ it.each([false, true])('keeps retained image previews at the canonical row acros
   expect(w.document.querySelector('#inputQueue')!.textContent).not.toContain(row.text);
 });
 
+it('says why a queued message waits: no extension, or a running tool call', async () => {
+  const asked = Date.now() - 12_000;
+  const { w, live, append } = await boot([
+    { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'held-turn' },
+    { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'held-turn', messageId: 'q-now', message: text('Run the tests') }
+  ]);
+  const api = (w as any).api;
+  const chat = await import('../src/renderer/chat.js');
+  const state = (await api.getState()).data;
+  const present = (on: boolean) => chat.chatApply({ ...state, bridge: { ...state.bridge, present: on } });
+  const queued: InputEntry = { id: 'queued-one', sessionId: summary(live.events).id, state: 'queued', owner: 'page', text: 'After the tests',
+    mode: 'auto', model: null, reasoningEffort: null, dueAt: T0, createdAt: T0, conversationId: 'chat-a' };
+  const status = () => w.document.querySelector('#inputQueue .pending-message')!.textContent ?? '';
+  live.inputs.push(queued);
+  // No extension connected: nothing can leave yet.
+  present(false); await append([]);
+  expect(status()).toContain('Waiting for the browser extension to connect');
+  expect(w.document.querySelector('#inputQueue .pending-message')!.classList.contains('is-waiting')).toBe(true);
+  // Connected, with one of this chat's tool calls running: the message waits for it (#1231).
+  api.runningTools = () => Promise.resolve({ ok: true, data: [{ title: 'Running npm test', kind: 'run', since: Date.now() - 5_000 }] });
+  present(true); await append([]); await append([]);
+  expect(status()).toContain('Waiting for the running tool call to finish');
+  // A mid-turn send does not wait for calls, so it claims no such reason.
+  live.inputs[0] = { ...queued, directTurn: { id: 'held-turn', startedAt: asked } };
+  await append([]); await append([]);
+  expect(status()).not.toContain('Waiting for the running tool call');
+  // The call ended: back to the plain clock, with Queued as its label.
+  live.inputs[0] = queued;
+  api.runningTools = () => Promise.resolve({ ok: true, data: [] });
+  await append([]); await append([]);
+  expect(status()).not.toContain('Waiting for');
+  expect(w.document.querySelector('#inputQueue .pending-message-status')!.getAttribute('aria-label')).toBe('Queued');
+  expect(w.document.querySelector('#inputQueue .pending-message')!.classList.contains('is-waiting')).toBe(false);
+});
+
 it.each([false, true])('hands a delivered bubble to exact native history without a blank or duplicate (historyFirst=%s)', async historyFirst => {
   const { w, live, append } = await boot([]);
   const row: InputEntry = { id: 'delivery-one', sessionId: summary([]).id, state: 'browser', owner: 'page', text: 'Follow-up once',
@@ -1165,7 +1241,7 @@ it('keeps generated-image metadata visible when recording storage is full', asyn
   expect(row.querySelector('.generated-image-frame')).toBeTruthy();
   expect(row.querySelector('img')).toBeNull();
   expect(row.querySelector('.generated-image-frame')?.classList.contains('is-unavailable')).toBe(true);
-  expect(row.querySelector('button')?.textContent).toBe('Free image storage');
+  expect(row.querySelector('button')?.textContent).toBe('Free storage');
 });
 
 it('does not group images across an intervening authored message or another turn', async () => {
@@ -1324,6 +1400,108 @@ it('loads recorded tool images on expansion and hides truncated binary envelopes
   expect(tool.querySelector('img')?.getAttribute('src')).toBe('data:image/png;base64,YQ==');
 });
 
+// #1190: project headings come from the whole project list, chats from the newest page of all
+// history. A project whose chats are all older looked empty, and expanding it did nothing.
+async function olderProjectFixture(projectPages?: SessionSummary[][]) {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Older workspace', path: '/fixture', createdAt: 1 };
+  const recent = { ...summary([]), id: 'recent-unfiled', projectId: undefined, updatedAt: T0 + 400 };
+  const worker = { ...summary([]), id: 'older-worker', projectId: project.id, updatedAt: T0 + 3,
+    origin: { kind: 'worker' as const, fromSessionId: 'older-parent', agentId: 'worker-1', task: 'Inspect' } };
+  const parent = { ...summary([]), id: 'older-parent', conversationId: 'older-chat', projectId: project.id, updatedAt: T0 + 2 };
+  const unused = { ...summary([]), id: 'oldest-unfiled', projectId: undefined, updatedAt: T0 + 1 };
+  // The newest page of everything shows no chat of the project; the project's own pages do.
+  const all = [[recent], [unused]];
+  const own = projectPages ?? [[worker], [parent]];
+  const { w, append } = await boot([], false, [], [project], { sessions: [recent] });
+  const list = vi.fn(async (options: any) => {
+    const pages = options?.projectId === project.id ? own : all;
+    const index = options?.cursor ? pages.findIndex(rows => rows.at(-1)?.id === options.cursor.id) + 1 : 0;
+    const rows = pages[index] ?? [];
+    return { ok: true, data: { sessions: rows, total: 4, nextCursor: index < pages.length - 1 ? { updatedAt: rows.at(-1)!.updatedAt, id: rows.at(-1)!.id } : null,
+      activeId: null, pressure: [], blocked: [] } };
+  });
+  (w as any).api.listSessions = list;
+  await append([]); list.mockClear();
+  const heading = () => w.document.querySelector('.project-heading') as HTMLElement;
+  const projectCalls = () => list.mock.calls.map(([options]) => options).filter(options => options?.projectId);
+  return { w, list, heading, parent, worker, own, project, append, projectCalls };
+}
+
+it("shows a project's older chats when it is expanded, asking for that project's pages only", async () => {
+  const f = await olderProjectFixture(); f.heading().click(); await settle();
+  expect(f.w.document.querySelector('.project-group [data-id="older-parent"]')).not.toBeNull();
+  // A page of workers alone shows no chat, so the next page of the project follows.
+  expect(f.projectCalls()).toEqual([
+    { projectId: f.project.id, limit: 60 },
+    { projectId: f.project.id, limit: 60, cursor: { updatedAt: f.worker.updatedAt, id: f.worker.id } }
+  ]);
+  // The rest of the history is not paged for it, no chat is selected, and the project stays open.
+  expect(f.list.mock.calls.every(([options]) => !!options?.projectId)).toBe(true);
+  expect(f.w.document.querySelector('[data-id="oldest-unfiled"]')).toBeNull();
+  expect(f.w.document.querySelector('.sess.is-sel')).toBeNull();
+  expect((f.w.document.querySelector('.project-group') as HTMLDetailsElement).open).toBe(true);
+});
+
+it("keeps a project's older chats through the sidebar's next refresh", async () => {
+  const f = await olderProjectFixture(); f.heading().click(); await settle();
+  await f.append([]); await settle();
+  expect(f.w.document.querySelector('.project-group [data-id="older-parent"]')).not.toBeNull();
+  // Asked once: the refresh and another expand do not read the project again.
+  f.heading().click(); f.heading().click(); await settle();
+  expect(f.projectCalls()).toHaveLength(2);
+});
+
+it('stops reading a project when it is collapsed while a page is on its way', async () => {
+  const f = await olderProjectFixture();
+  let resolve!: (value: any) => void;
+  f.list.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  f.heading().click(); await settle();
+  expect(f.projectCalls()).toHaveLength(1);
+  f.heading().click();
+  resolve({ ok: true, data: { sessions: f.own[0], total: 4, nextCursor: { updatedAt: f.worker.updatedAt, id: f.worker.id }, activeId: null, pressure: [], blocked: [] } });
+  await settle();
+  expect(f.projectCalls()).toHaveLength(1);
+  expect((f.w.document.querySelector('.project-group') as HTMLDetailsElement).open).toBe(false);
+  // Expanding again continues where it stopped.
+  f.heading().click(); await settle();
+  expect(f.projectCalls()).toHaveLength(2);
+  expect(f.w.document.querySelector('.project-group [data-id="older-parent"]')).not.toBeNull();
+});
+
+it('does not loop when a project page cannot be read, and tries again on the next expand', async () => {
+  const f = await olderProjectFixture();
+  f.list.mockResolvedValueOnce({ ok: false, error: 'Fixture read failure' } as any);
+  f.heading().click(); await settle();
+  expect(f.projectCalls()).toHaveLength(1);
+  expect(f.w.document.querySelector('.project-group [data-id="older-parent"]')).toBeNull();
+  f.heading().click(); f.heading().click(); await settle();
+  expect(f.w.document.querySelector('.project-group [data-id="older-parent"]')).not.toBeNull();
+});
+
+it('asks an empty project once', async () => {
+  const f = await olderProjectFixture([[]]);
+  f.heading().click(); await settle();
+  f.heading().click(); f.heading().click(); await settle();
+  expect(f.projectCalls()).toEqual([{ projectId: f.project.id, limit: 60 }]);
+  expect(f.w.document.querySelectorAll('.project-group .sess')).toHaveLength(0);
+});
+
+it('continues with the project\'s older pages from "Show more"', async () => {
+  const task = (index: number): SessionSummary => ({ ...summary([]), id: `project-task-${index}`, conversationId: `chat-${index}`, title: `Task ${index}`,
+    projectId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', updatedAt: T0 + 100 - index });
+  const f = await olderProjectFixture([[0, 1, 2, 3, 4].map(task), [5, 6].map(task)]);
+  f.heading().click(); await settle();
+  const shown = () => [...f.w.document.querySelectorAll<HTMLElement>('.project-group .sess')].map(row => row.dataset.id);
+  expect(shown()).toHaveLength(5);
+  // Everything loaded is on screen, and the project has more: the button reads on from there.
+  const more = f.w.document.querySelector('.project-show-more') as HTMLElement;
+  expect(more).not.toBeNull();
+  more.click(); await settle();
+  expect(f.projectCalls()).toHaveLength(2);
+  expect(shown()).toEqual([0, 1, 2, 3, 4, 5, 6].map(index => `project-task-${index}`));
+  expect(f.w.document.querySelector('.project-show-more')).toBeNull();
+});
+
 it('pages project tasks as complete parent/worker groups and keeps the selected task visible after reordering', async () => {
   const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Paged', path: '/paged', createdAt: 1 };
   const tasks = Array.from({ length: 8 }, (_, index) => ({ ...summary([]), id: `project-task-${index}`, conversationId: `chat-${index}`, title: `Task ${index}`, projectId: project.id }));
@@ -1348,6 +1526,51 @@ it('pages project tasks as complete parent/worker groups and keeps the selected 
   expect(section().querySelector('.project-show-more')).toBeNull();
   await append([]);
   expect(section().querySelectorAll(':scope > .sess')).toHaveLength(8);
+});
+it('does not allocate hidden project chat rows on each activity refresh', async () => {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Busy project', path: '/project', createdAt: 1 };
+  const tasks = Array.from({ length: 240 }, (_, index): SessionSummary => ({
+    ...summary([]), id: `task-${index}`, conversationId: `chat-${index}`,
+    title: `Task ${index}`, projectId: project.id
+  }));
+  const { w, append } = await boot([], false, [], [project], { sessions: tasks });
+  expect(w.document.querySelectorAll('.project-group .sess')).toHaveLength(5);
+
+  // Count even detached nodes: simply inspecting the live sidebar misses the hundreds of
+  // rows allocated and discarded before the five visible project tasks are appended.
+  const created: Element[] = [];
+  const create = w.document.createElement.bind(w.document);
+  const spy = vi.spyOn(w.document, 'createElement').mockImplementation(((tag: string, options?: ElementCreationOptions) => {
+    const node = create(tag, options);
+    created.push(node);
+    return node;
+  }) as typeof w.document.createElement);
+  try { await append([]); }
+  finally { spy.mockRestore(); }
+
+  const sessionRows = created.filter(node => node.classList.contains('sess'));
+  expect(w.document.querySelectorAll('.project-group .sess')).toHaveLength(5);
+  expect(sessionRows).toHaveLength(5);
+});
+it('groups many projects without scanning the whole session list for each project', async () => {
+  let projectIdReads = 0;
+  const ids = Array.from({ length: 24 }, (_, index) => `00000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}`);
+  const projects: LocalProject[] = ids.map((id, index) => {
+    const project = { id, name: `Project ${index}`, path: `/project-${index}`, createdAt: 1 };
+    Object.defineProperty(project, 'id', { enumerable: true, get: () => { projectIdReads++; return id; } });
+    return project;
+  });
+  const tasks = Array.from({ length: 240 }, (_, index): SessionSummary => ({
+    ...summary([]), id: `session-${index}`, conversationId: `chat-${index}`,
+    projectId: ids[index % ids.length]!
+  }));
+  const { w, append } = await boot([], false, [], projects, { sessions: tasks });
+  expect(w.document.querySelectorAll('.project-group')).toHaveLength(24);
+  projectIdReads = 0;
+  await append([]);
+  // One lookup table per paint is fine; P complete scans of N rows followed by
+  // projects.find() for every comparison multiplies CPU work while the UI is busy.
+  expect(projectIdReads).toBeLessThan(tasks.length * 12);
 });
 it('shows five project chats initially and reveals eight more per click', async () => {
   const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Paged', path: '/paged', createdAt: 1 };
@@ -1519,7 +1742,7 @@ it.each([false, true])('removes a project group in one click, keeps its chats an
   const api = (w as any).api;
   const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
   (w.document.querySelector('.worker-toggle') as HTMLButtonElement).click();
-  projectMenu(w, project.id); (w.document.querySelector(`.row-menu [data-new-project="${project.id}"]`) as HTMLButtonElement).click();
+  (w.document.querySelector(`.project-heading > [data-new-project="${project.id}"]`) as HTMLButtonElement).click();
   input.value = 'Keep my draft';
   input.dispatchEvent(new w.Event('input', { bubbles: true }));
   if (selectedSkill) {
@@ -1579,21 +1802,23 @@ it('keeps the project visible when its removal fails, and lets the removal be tr
   expect((w as any).api.removeProject).toHaveBeenCalledTimes(2);
 });
 
-it('offers a project\'s actions in one menu: a new chat, its color as a submenu, and removal', async () => {
+it('offers a new chat beside a project\'s menu, and its color as a submenu and removal inside it', async () => {
   const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Workspace', path: 'C:\\workspace\\primary', createdAt: 1 };
   const { w } = await boot([], false, [], [project]);
   const group = w.document.querySelector<HTMLElement>(`.project-group[data-project-id="${project.id}"]`)!;
-  // No loose buttons on the row: one "⋯", and a right click opens the same menu.
-  expect(group.querySelector('.project-heading')!.querySelectorAll('button').length).toBe(1);
+  // Two buttons on the row: the primary new chat, then one "⋯"; a right click opens the same menu.
+  expect([...group.querySelector('.project-heading')!.querySelectorAll('button')].map(b => b.className)).toEqual(['btn row-menu-button project-new', 'btn row-menu-button project-menu']);
   const button = projectMenu(w, project.id);
   expect(button.getAttribute('aria-expanded')).toBe('true');
   const menu = w.document.querySelector<HTMLElement>('.row-menu')!;
   expect(menu.getAttribute('role')).toBe('menu');
-  expect([...menu.querySelectorAll<HTMLElement>('.row-menu-item')].map(item => item.dataset.rowAction)).toEqual(['new-chat', 'color', 'remove']);
+  expect([...menu.querySelectorAll<HTMLElement>('.row-menu-item')].map(item => item.dataset.rowAction)).toEqual(['color', 'remove']);
   expect(menuItem(w, 'remove').classList.contains('is-danger')).toBe(true);
-  expect(w.document.activeElement).toBe(menuItem(w, 'new-chat'));
-  // Keyboard: Down moves, Right opens the color submenu on the current choice, Left comes back.
+  expect(w.document.activeElement).toBe(menuItem(w, 'color'));
+  // Keyboard: Down and Up move, Right opens the color submenu on the current choice, Left comes back.
   menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  expect(w.document.activeElement).toBe(menuItem(w, 'remove'));
+  menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
   expect(w.document.activeElement).toBe(menuItem(w, 'color'));
   menu.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
   expect(w.document.querySelectorAll('.row-menu').length).toBe(2);
@@ -1612,8 +1837,10 @@ it('offers a project\'s actions in one menu: a new chat, its color as a submenu,
   expect(menuItem(w, 'color')).not.toBeNull();
   w.document.body.dispatchEvent(new w.Event('pointerdown', { bubbles: true }));
   expect(w.document.querySelector('.row-menu')).toBeNull();
-  // New chat in this project.
-  projectMenu(w, project.id); menuItem(w, 'new-chat').click(); await settle();
+  // New chat in this project: the row's own button, no longer a menu item.
+  expect(projectMenu(w, project.id) && menuItem(w, 'new-chat')).toBeNull();
+  w.document.body.dispatchEvent(new w.Event('pointerdown', { bubbles: true }));
+  (w.document.querySelector(`.project-heading > [data-new-project="${project.id}"]`) as HTMLButtonElement).click(); await settle();
   expect((w.document.getElementById('chatInput') as HTMLTextAreaElement).placeholder).toBe('Message in Workspace…');
 });
 
@@ -1793,7 +2020,7 @@ it('groups project chats and restores each project composer with its selected id
   expect([...groups].map(group => group.open)).toEqual([false, false]);
   expect(groups[0]!.querySelector('[data-id]')?.getAttribute('data-id')).toBe(summary([]).id);
   const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
-  const choose = (id: string) => { projectMenu(w, id); (w.document.querySelector(`.row-menu [data-new-project="${id}"]`) as HTMLButtonElement).click(); };
+  const choose = (id: string) => { (w.document.querySelector(`.project-heading > [data-new-project="${id}"]`) as HTMLButtonElement).click(); };
   choose(projects[0]!.id); expect(w.document.querySelector<HTMLDetailsElement>(`[data-project-id="${projects[0]!.id}"]`)!.open).toBe(true); input.value = 'Alpha draft';
   choose(projects[1]!.id); expect(w.document.querySelector<HTMLDetailsElement>(`[data-project-id="${projects[1]!.id}"]`)!.open).toBe(true); expect(input.value).toBe(''); input.value = 'Beta draft';
   (w.document.getElementById('newChat') as HTMLButtonElement).click();
@@ -2418,6 +2645,62 @@ it('says why a compaction died when the app abandoned it', async () => {
   expect(card.textContent).toContain('abandoned');
 });
 
+it('offers to open a new chat with the summary an abandoned compaction already saved (#1215)', async () => {
+  const [request, start, brief, end, handoff] = compaction(2);
+  const abandoned = { seq: 9, time: T0 + 9000, source: 'app', kind: 'note', continuation: TOKEN,
+    message: text('Compact & Resume abandoned — the new chat could not be opened') } as SessionEvent;
+  const { w, live } = await boot([request!, start!, brief!, end!, handoff!, abandoned]);
+  const card = w.document.querySelector<HTMLDetailsElement>('details.compaction')!;
+  expect(card.className).toContain('tone-bad');
+  const reuse = card.querySelector<HTMLButtonElement>('.compaction-reuse')!;
+  expect(reuse.textContent).toBe('Open a new chat with this summary');
+  reuse.click();
+  await vi.waitFor(() => expect(live.controlCalls).toContainEqual(
+    expect.objectContaining({ action: `resume:${(handoff as Extract<SessionEvent, { kind: 'handoff' }>).handoffId}` })));
+});
+
+it('offers no summary reuse when the abandoned run never saved a summary', async () => {
+  const [request, start, brief, end] = compaction(2);
+  const abandoned = { seq: 9, time: T0 + 9000, source: 'app', kind: 'note', continuation: TOKEN,
+    message: text('Compact & Resume abandoned — the summary was not written') } as SessionEvent;
+  const { w } = await boot([request!, start!, brief!, end!, abandoned]);
+  expect(w.document.querySelector('details.compaction')).not.toBeNull();
+  expect(w.document.querySelector('.compaction-reuse')).toBeNull();
+});
+
+it('takes the summary reuse off an abandoned run once a later Compact & Resume started (#1215)', async () => {
+  const [request, start, brief, end, handoff] = compaction(2);
+  const abandoned = { seq: 9, time: T0 + 9000, source: 'app', kind: 'note', continuation: TOKEN,
+    message: text('Compact & Resume abandoned — cancelled') } as SessionEvent;
+  const later = { seq: 10, time: T0 + 10000, source: 'extension', kind: 'user_message', messageId: 'm-later-bootstrap',
+    message: text('[[CLF-RESUME:tok_fedcba9876543210]] Continue from this brief: keep the loop running.') } as SessionEvent;
+  const { w } = await boot([request!, start!, brief!, end!, handoff!, abandoned, later]);
+  expect(w.document.querySelectorAll('details.compaction')).toHaveLength(2);
+  expect(w.document.querySelector('.compaction-reuse')).toBeNull();
+});
+
+it('puts a reopened run\'s saved summary in its own row (#1215)', async () => {
+  const [request, start, brief, end, handoff] = compaction(2);
+  const abandoned = { seq: 9, time: T0 + 9000, source: 'app', kind: 'note', continuation: TOKEN,
+    message: text('Compact & Resume abandoned — cancelled') } as SessionEvent;
+  const again = { seq: 10, time: T0 + 10000, source: 'app', kind: 'handoff', handoffId: 'h-2', chars: 26_333,
+    reason: 'compact and resume', continuation: 'tok_fedcba9876543210' } as SessionEvent;
+  const bootstrap = { seq: 11, time: T0 + 11000, source: 'extension', kind: 'user_message', messageId: 'm-again',
+    message: text('[[CLF-RESUME:tok_fedcba9876543210]] Continue from this brief: keep the loop running.') } as SessionEvent;
+  const { w } = await boot([request!, start!, brief!, end!, handoff!, abandoned, again, bootstrap]);
+  const timeline = w.document.getElementById('timeline')!;
+  expect([...timeline.children].map((row) => row.className)).toEqual(['ev ev-compaction', 'ev ev-compaction']);
+  const rows = [...timeline.querySelectorAll('details.compaction')];
+  expect(rows[1]!.querySelector('summary .state')!.textContent).toContain('26k characters');
+});
+
+it('offers no summary reuse once the new chat opened', async () => {
+  const [request, start, brief, end, handoff, resume] = compaction(2);
+  const { w } = await boot([request!, start!, brief!, end!, handoff!, resume!]);
+  expect(w.document.querySelector('details.compaction')).not.toBeNull();
+  expect(w.document.querySelector('.compaction-reuse')).toBeNull();
+});
+
 it('retains the open compaction disclosure and brief request while the summary streams and completes', async () => {
   const [request, start, original, , handoff, resume] = compaction(2);
   const brief = { ...original, origin: original!.seq, state: 'streaming', final: false } as Extract<SessionEvent, { kind: 'assistant_message' }>;
@@ -2491,7 +2774,8 @@ it('keeps an unfolded tool row as the same open node while the chat keeps append
   expect(detached.some(node => node === group || node === before || (node as Element).contains?.(before))).toBe(false);
   expect(timeline.querySelector('details.tool-group')).toBe(group);
   expect(group.open).toBe(false);
-  expect(group.querySelector('summary')!.textContent).toBe('Read README.md');
+  expect(group.querySelector('.activity-title')!.textContent).toBe('Read README.md');
+  expect(group.querySelector('.activity-count')!.textContent).toBe('4');
   expect(group.querySelector('summary')!.title).toContain('4 actions');
 });
 
@@ -2532,7 +2816,7 @@ it('colors removed lines separately from added lines without changing other tool
   expect(rows[1]!.querySelector('.edit-card .metric-removed')?.textContent).toBe('−7');
 });
 
-it('keeps mixed tool and agent activity in one latest-action disclosure between authored messages', async () => {
+it('opens a round with the ChatGPT caption and keeps its mixed tool and agent activity in one latest-action disclosure', async () => {
   const { w, append } = await boot([
     { seq: 1, time: T0, source: 'extension', kind: 'progress', message: text('Checking the implementation') },
     toolCall(2, 'first'),
@@ -2542,7 +2826,10 @@ it('keeps mixed tool and agent activity in one latest-action disclosure between 
   const timeline = w.document.getElementById('timeline')!;
   const group = timeline.querySelector<HTMLDetailsElement>('.tool-group')!;
   expect(group.open).toBe(false);
-  expect(group.querySelector('.activity-title')!.textContent).toBe('Checking the implementation');
+  // The caption is what ChatGPT said before the step: it stands as the round's opening line.
+  expect(timeline.children[0]!.className).toContain('ev-progress');
+  expect(timeline.children[0]!.textContent).toContain('Checking the implementation');
+  expect(group.querySelector('.activity-title')!.textContent).toBe(group.querySelector('.ev-tool_call:last-of-type .tool > summary b')!.textContent);
   expect(group.querySelector('.agent-communication summary')!.textContent).toContain('Message from worker-2');
   expect(group.querySelector('.agent-avatar')).not.toBeNull();
   expect(group.querySelectorAll('.ev')).toHaveLength(3);
@@ -2552,6 +2839,48 @@ it('keeps mixed tool and agent activity in one latest-action disclosure between 
   ]);
   expect(timeline.querySelectorAll('.tool-group')).toHaveLength(2);
   expect(timeline.children[0]!.className).toContain('ev-progress');
+});
+
+// The maintainer asked to answer ChatGPT's approval card from the app (2026-10-14): the row shows
+// the card's words and offers Deny and Allow once for exactly that card. Never "always".
+describe('ChatGPT\'s approval card in the timeline', () => {
+  const waitingRow = { seq: 1, time: T0, source: 'app', kind: 'progress', progressId: 'approval-wait:chat-a:1',
+    message: text('ChatGPT is waiting for you to allow or deny a tool call in this chat. Nothing continues until you answer it there.') } as SessionEvent;
+
+  it('shows the card\'s words with Deny and Allow once, and answers that exact card once', async () => {
+    let card: any = { id: 'card-1234567', lines: ['Gmail', 'Allow ChatGPT to use Gmail?', 'Creates a draft.'], allow: true, answer: null };
+    const answers: string[][] = [];
+    const { w } = await boot([waitingRow], true, [], [], {
+      approvalCard: () => card,
+      answerApproval: (_id, cardId, choice) => { answers.push([cardId, choice]); card = { ...card, answer: { choice, outcome: null } }; return { ok: true }; }
+    });
+    const timeline = w.document.getElementById('timeline')!;
+    await vi.waitFor(() => expect(timeline.querySelector('.approval-card')?.textContent).toContain('Allow ChatGPT to use Gmail?'));
+    // The recorded English is unchanged; the row now says the answer can be given here too.
+    expect(timeline.querySelector('.approval-wait')?.textContent).toContain('here or in the browser');
+    const buttons = () => [...timeline.querySelectorAll<HTMLButtonElement>('.approval-card button')];
+    expect(buttons().map(button => button.textContent)).toEqual(['Deny', 'Allow once']);
+    expect(buttons().every(button => !button.disabled)).toBe(true);
+    buttons()[1]!.click();
+    await vi.waitFor(() => expect(answers).toEqual([['card-1234567', 'allow']]));
+    expect(buttons().every(button => button.disabled)).toBe(true);
+    expect(timeline.querySelector('.approval-card')?.textContent).toContain('Sending your answer to ChatGPT');
+    // The page found a different card: nothing was pressed, and the row says so.
+    card = { ...card, answer: { choice: 'allow', outcome: 'card_changed' } };
+    await vi.waitFor(() => expect(timeline.querySelector('.approval-card')?.textContent).toContain('Nothing was pressed'), { timeout: 4000 });
+  });
+
+  it('offers only Deny where ChatGPT itself disabled Allow once', async () => {
+    const { w } = await boot([waitingRow], true, [], [], {
+      approvalCard: () => ({ id: 'card-7654321', lines: ['Gmail', 'Allow ChatGPT to use Gmail?', 'External app access is unavailable in this conversation'], allow: false, answer: null })
+    });
+    const timeline = w.document.getElementById('timeline')!;
+    await vi.waitFor(() => expect(timeline.querySelector('.approval-card button')).not.toBeNull());
+    const [deny, allow] = [...timeline.querySelectorAll<HTMLButtonElement>('.approval-card button')];
+    expect(deny!.disabled).toBe(false);
+    expect(allow!.disabled).toBe(true);
+    expect(timeline.querySelector('.approval-card')?.textContent).toContain('ChatGPT does not allow it in this chat');
+  });
 });
 
 it('never titles a tool group with the app\'s own recovery note', async () => {
@@ -2568,9 +2897,39 @@ it('never titles a tool group with the app\'s own recovery note', async () => {
   const title = group.querySelector('.activity-title')!.textContent;
   expect(title).not.toContain('Reloaded chat');
   expect(title).toBe(group.querySelector('.ev-tool_call:last-of-type .tool > summary b')?.textContent ?? title);
-  expect(group.classList.contains('has-activity-phase')).toBe(false);
   // The note itself stays in the transcript, in front of the group.
   expect(timeline.children[0]!.textContent).toContain('Reloaded chat to recover an interrupted response.');
+});
+
+it('closes a stopped turn with a line saying it stopped, after any late work, and keeps the request line', async () => {
+  // 2026-10-09: "ChatGPT has not yet confirmed that generation stopped" was the last word on a
+  // turn the page had already ended as stopped. The request stays where it was made; the end of
+  // the turn says it stopped once nothing runs any more.
+  const request = 'Stop requested. The finish hold was released; ChatGPT has not yet confirmed that generation stopped.';
+  const stoppedLine = 'Stopped. ChatGPT no longer shows this turn running.';
+  const { w, append } = await boot([
+    { seq: 1, time: T0, source: 'extension', kind: 'turn_start', turnId: 'g-stop' },
+    { ...toolCall(2, 'before-stop'), turnId: 'g-stop' } as SessionEvent,
+    { seq: 3, time: T0 + 3000, source: 'app', kind: 'progress', turnId: 'g-stop', progressId: 'finish-release:g-stop', message: text(request) }
+  ]);
+  const timeline = w.document.getElementById('timeline')!;
+  const lines = () => [...timeline.querySelectorAll('.ev')].map(row => row.textContent ?? '');
+  const last = () => lines().at(-1)!;
+  expect(lines().some(line => line.includes(stoppedLine))).toBe(false);
+  await append([{ seq: 4, time: T0 + 3200, source: 'extension', kind: 'turn_end', turnId: 'g-stop', outcome: 'stopped' }]);
+  expect(last()).toContain(stoppedLine);
+  expect(lines().filter(line => line.includes(request))).toHaveLength(1);
+  // A call ChatGPT dispatched before it obeyed reopens the turn: nothing says it stopped yet.
+  await append([
+    { ...toolCall(5, 'late'), time: T0 + 4000, turnId: 'g-stop' } as SessionEvent,
+    { seq: 6, time: T0 + 4000, source: 'app', kind: 'turn_start', turnId: 'g-stop' }
+  ]);
+  expect(lines().some(line => line.includes(stoppedLine))).toBe(false);
+  // The page ends it again: the line closes the turn, after the late call.
+  await append([{ seq: 7, time: T0 + 9000, source: 'extension', kind: 'turn_end', turnId: 'g-stop', outcome: 'stopped' }]);
+  expect(lines().filter(line => line.includes(stoppedLine))).toHaveLength(1);
+  expect(last()).toContain(stoppedLine);
+  expect(lines().filter(line => line.includes(request))).toHaveLength(1);
 });
 
 it('folds five consecutive status polls while retaining each exact tool row', async () => {
@@ -2706,25 +3065,56 @@ it('shows injection only for an exact active turn, never merely recent chat acti
   expect((w.document.getElementById('sendMode') as HTMLSelectElement).value).toBe('auto');
 });
 
-it('shows Send directly before MCP, keeps After this turn selected, and changes the visible menu after MCP', async () => {
+// A text for the running turn goes through ChatGPT's composer (#1231), so a running turn offers
+// Send directly alone; Inject now stays for a Pro turn, which keeps tool injection.
+it('shows Send directly alone for a running turn, keeps After this turn selected, and offers Inject now on a Pro turn', async () => {
   const { w, append } = await boot([]);
   const api = (w as any).api;
   const original = api.getSessionControls;
-  let tools = false;
+  let pro = false;
   api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data,
-    activeTurnId: 'plain-turn', canInject: tools, canSendDirectly: !tools, queueAtFinish: false } });
+    activeTurnId: 'plain-turn', canInject: pro, canSendDirectly: !pro, queueAtFinish: false } });
   await append([]);
   const options = w.document.getElementById('sendOptions')!;
   expect(options.hidden).toBe(false);
   expect(options.querySelector('[data-delivery="auto"]')!.textContent).toBe('Send directly');
-  expect((options.querySelector('[data-delivery="tool"]') as HTMLElement).hidden).toBe(false);
+  expect((options.querySelector('[data-delivery="tool"]') as HTMLElement).hidden).toBe(true);
+  await append([toolCall(1, 'first-mcp-call')]);
+  expect(options.querySelector('[data-delivery="auto"]')!.textContent).toBe('Send directly');
   (options.querySelector('[data-delivery="after-turn"]') as HTMLButtonElement).click();
   await append([]);
   expect((w.document.getElementById('sendMode') as HTMLSelectElement).value).toBe('after-turn');
-  tools = true;
-  await append([toolCall(1, 'first-mcp-call')]);
+  pro = true;
+  await append([toolCall(2, 'second-mcp-call')]);
+  expect((options.querySelector('[data-delivery="tool"]') as HTMLElement).hidden).toBe(false);
   expect(options.querySelector('[data-delivery="auto"]')!.textContent).toBe('Inject now');
   expect((w.document.getElementById('sendMode') as HTMLSelectElement).value).toBe('after-turn');
+});
+
+it("retires the running turn's lines when the turn ends after its rows were drawn (2026-10-12)", async () => {
+  // The turn's end reached the header ("Worked for") after the last rows were drawn; the timeline kept
+  // "Working for" and "Thinking" frozen under the finished answer until another event arrived.
+  const asked = Date.now() - 60_000;
+  const app = await boot([
+    { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'ending-turn' },
+    { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'ending-turn', messageId: 'q-end', message: text('Finish the step') }
+  ]);
+  const { w } = app;
+  const api = (w as any).api;
+  const original = api.getSessionControls;
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data, activeTurnId: 'ending-turn' } });
+  await app.append([{ seq: 3, time: asked + 50_000, source: 'extension', kind: 'assistant_message', turnId: 'ending-turn', messageId: 'a-end', final: true, message: text('Step finished.') },
+    { seq: 4, time: asked + 51_000, source: 'extension', kind: 'turn_end', turnId: 'ending-turn', outcome: 'completed' }]);
+  // The rows were drawn while the controls still said the turn runs.
+  expect(w.document.querySelector('#timeline .turn-status.is-working')).not.toBeNull();
+  api.getSessionControls = async (id: string) => ({ ok: true, data: { ...(await original(id)).data, activeTurnId: null } });
+  // An app state update re-reads only the controls, as the live app did when the turn ended.
+  const chat = await import('../src/renderer/chat.js');
+  chat.chatApply((await api.getState()).data);
+  await settle(); await settle();
+  expect(w.document.getElementById('chatState')!.textContent).toMatch(/^Worked for /);
+  expect(w.document.querySelector('#timeline .turn-status.is-working')).toBeNull();
+  expect(w.document.querySelector('#timeline .turn-now')).toBeNull();
 });
 
 it('shows elapsed work for the exact recorded turn without exposing lifecycle rows', async () => {
@@ -3272,6 +3662,32 @@ it('queues every generated stage in an existing session without Send and preserv
   expect(w.document.querySelectorAll('#finishQueue .queued-input')).toHaveLength(1);
   expect(w.document.getElementById('finishQueue')!.textContent).toContain('Verify it');
   expect(live.sent).toHaveLength(1);
+});
+
+// #1428: in a chat with nothing running, the plan used to be queued "at Session finish" right
+// away, and Session finish only comes at the end of a turn. Nothing started until the person
+// sent some other message.
+it('shows the plan in an idle chat and starts it with Enter, like in a new chat', async () => {
+  const { w, live } = await boot([]);
+  const api = (w as any).api;
+  api.getSessionControls = (id: string) => Promise.resolve({ ok: true, data: { sessionId: id, conversationId: 'chat-a', automation: 'off', activeTurnId: null, finishHeld: false, blocked: '', job: null } });
+  // Selected again, so the chat's state is read with nothing running.
+  w.document.getElementById('newChat')!.click(); await settle();
+  (w.document.querySelector(`[data-id="${summary([]).id}"]`) as HTMLButtonElement).click(); await settle();
+  api.draftTaskPlan = vi.fn(async () => ({ ok: true, data: ['Build foundation', 'Verify it'] }));
+  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = 'Build the whole task'; input.dispatchEvent(new w.Event('input'));
+  w.document.getElementById('createPlan')!.click(); w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { cancelable: true })); await settle();
+  // Written out for review, not queued behind a turn that will not come.
+  expect(live.sent).toHaveLength(0);
+  expect(w.document.querySelectorAll('.plan-stage')).toHaveLength(2);
+  expect(w.document.getElementById('chatSend')!.getAttribute('aria-label')).toBe('Start full plan');
+  expect(w.document.querySelector('.plan-stage-heading')!.getAttribute('title')).not.toMatch(/Session finish/);
+  input.focus();
+  input.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })); await settle();
+  expect(live.sent).toHaveLength(1);
+  expect(live.sent[0]).toMatchObject({ sessionId: summary([]).id, text: 'Build foundation', stages: ['Verify it'], objective: 'Build the whole task', authoredSource: 'objective', mode: 'auto' });
+  expect(w.document.querySelectorAll('.plan-stage')).toHaveLength(0);
 });
 
 it('retries a materialized finish checkpoint without recreating its already independent siblings', async () => {
@@ -4335,7 +4751,8 @@ it('retains the visible collapsed group beyond the normal resident target and st
   // One deliberate movement keeps filling the edge through collapsed batches.
   // Await the actual read result, including its animation-frame yields.
   pane.scrollTop = 0; pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 }));
-  await vi.waitFor(() => expect(timeline.querySelectorAll('.ev-tool_call')).toHaveLength(rows.length), { timeout: 5000 });
+  // 2.7 s here; the macOS x64 release runner stopped at 300–390 of 400 rows after 5 s (2026-10-15).
+  await vi.waitFor(() => expect(timeline.querySelectorAll('.ev-tool_call')).toHaveLength(rows.length), { timeout: 20_000 });
   expect(timeline.querySelector('.tool-group')).toBe(group);
   expect(timeline.querySelectorAll('.raw')).toHaveLength(0);
   for (let i = 0; i < 14; i++) {
@@ -4380,6 +4797,25 @@ it('clears a delivered check when later model activity arrives without a timer',
   expect(receipt.hidden).toBe(true);
 });
 
+
+// 2026-10-15, the user's Mac: three fresh-turn continues that failed ("the browser did not pick up
+// this message within 60 seconds") stayed at the end of the chat as its newest messages, even after
+// the work moved on. A failed automatic continue belongs to its time, like a cancelled one.
+it('keeps a failed fresh-turn continue at its creation time, not at the end of the chat', async () => {
+  const app = await boot([
+    { seq: 1, time: T0, source: 'extension', kind: 'user_message', messageId: 'before-rotation', message: text('Original work') },
+    { seq: 2, time: T0 + 2000, source: 'extension', kind: 'user_message', messageId: 'after-rotation', message: text('Later continuation') }
+  ]);
+  const { w, live } = app;
+  live.inputs.push({ id: 'failed-rotation', sessionId: summary([]).id, conversationId: 'chat-b', text: 'Continue the task from where you are.',
+    mode: 'auto', dueAt: T0 + 1000, createdAt: T0 + 1000, state: 'failed', owner: null, model: null, reasoningEffort: null, purpose: 'rotation',
+    error: 'Not sent: the browser did not pick up this message within 60 seconds.' });
+  await app.append([]);
+  const timeline = w.document.getElementById('timeline')!;
+  expect(timeline.querySelector('[data-input-id="failed-rotation"]')).not.toBeNull();
+  expect(w.document.getElementById('inputQueue')!.textContent).not.toContain('Continue the task from where you are.');
+  expect(timeline.textContent!.indexOf('Continue the task from where you are.')).toBeLessThan(timeline.textContent!.indexOf('Later continuation'));
+});
 
 it('keeps a cancelled automatic draft at its creation time as later messages arrive', async () => {
   const app = await boot([
@@ -4558,7 +4994,7 @@ it('ends the running turn with a row saying what it is doing now', async () => {
   expect(shown()?.[0]).toBe('Thinking');
 });
 
-it('says what a new chat\'s first turn is writing before ChatGPT publishes it (#942)', async () => {
+it('shows a new chat\'s first sentences in the timeline and keeps the live row for what happens now (#942)', async () => {
   const asked = Date.now() - 12_000;
   const { w, append } = await boot([
     { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'held-turn' },
@@ -4567,23 +5003,35 @@ it('says what a new chat\'s first turn is writing before ChatGPT publishes it (#
   const now = () => w.document.querySelector<HTMLElement>('#timeline .turn-now')!;
   const shown = () => now().hidden ? null : now().querySelector('.turn-now-text')!.textContent;
   const asks: string[][] = [];
-  (w as any).api.livePreview = (ids: string[]) => {
+  // ChatGPT shows the sentence long before it publishes a message for it; the turn's outline holds it.
+  (w as any).api.turnTraces = (_id: string, ids: string[]) => {
     asks.push(ids);
-    return Promise.resolve({ ok: true, data: 'First command printed one; now running the second.' });
+    return Promise.resolve({ ok: true, data: { 'held-turn': [{ kind: 'say', text: 'First command printed one; now running the second.', done: true },
+      ...(status ? [{ kind: 'now', text: status }] : [])] } });
   };
+  let status = '';
   await append([]); await append([]);
-  expect(asks.at(-1)).toEqual(['chat-b', 'chat-a']);
-  expect(shown()).toBe('First command printed one; now running the second.');
+  expect(asks.at(-1)).toEqual(['held-turn']);
+  const sentence = w.document.querySelector<HTMLElement>('#timeline .ev.is-interim')!;
+  expect(sentence.textContent).toContain('First command printed one; now running the second.');
+  // The sentence is the turn's own words, before the row that says what it does right now.
+  expect(sentence.compareDocumentPosition(now()) & w.Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(shown()).toBe('Thinking');
+  // ChatGPT's own phrase for what the turn is doing takes Thinking's place, with Thinking's sign.
+  status = 'Comparando três estruturas de projeto';
+  await append([]); await append([]);
+  expect(shown()).toBe('Comparando três estruturas de projeto');
   expect(now().classList.contains('is-thinking')).toBe(true);
-  // A call of this app that runs right now is what the turn is doing.
+  // A call of this app running meanwhile keeps ChatGPT's words and lends them its icon.
+  (w as any).api.runningTools = () => Promise.resolve({ ok: true, data: [{ title: 'Running echo one', kind: 'run', since: Date.now() }] });
+  await append([]); await append([]);
+  expect(shown()).toBe('Comparando três estruturas de projeto');
+  expect(now().classList.contains('is-thinking')).toBe(false);
+  status = '';
   (w as any).api.runningTools = () => Promise.resolve({ ok: true, data: [{ title: 'Running echo two', kind: 'run', since: Date.now() }] });
   await append([]); await append([]);
   expect(shown()).toBe('Running echo two');
-  // Once the page clears it, the row is back to its ordinary state.
-  (w as any).api.runningTools = () => Promise.resolve({ ok: true, data: [] });
-  (w as any).api.livePreview = () => Promise.resolve({ ok: true, data: null });
-  await append([]); await append([]);
-  expect(shown()).toBe('Thinking');
+  expect(w.document.querySelectorAll('#timeline .ev.is-interim')).toHaveLength(1);
 });
 
 it('shows a just-started turn working right after your message, never in the header first', async () => {
@@ -4715,6 +5163,7 @@ it('opens round participants in the existing dock without moving the prime reade
   expect(w.document.getElementById('inlineAgents')).toBeNull();
   expect(w.document.querySelectorAll('#chatBody .agent-panel')).toHaveLength(0);
   const indicators = [...w.document.querySelectorAll<HTMLButtonElement>('#timeline .activity-workers')];
+  // One pill per round, whatever the count: the team icon and how many workers it involved.
   expect(indicators.map(button => button.textContent)).toEqual(['2', '1']);
   expect(indicators[0]!.getAttribute('aria-label')).toBe('2 sub-agents in this round');
   // One worker reads as one, not "1 sub-agents" (seen on the 2.1.27 canary).
@@ -4998,4 +5447,371 @@ it('opens the next chat at its end after the reader scrolled away from a sent me
   // Its answer keeps growing: the reader who just opened it follows the end.
   await append([{ seq: 100, time: T0 + 100, source: 'extension', kind: 'assistant_message', messageId: 'grown', message: text('A new answer'), final: false }]);
   expect(pane.scrollTop).toBe(pane.scrollHeight);
+});
+
+/** Counts how often the running turn's two lines are taken out of the page and put back. */
+function lineMoves(w: JSDOM['window']): { stop: () => number } {
+  let moves = 0;
+  const watched = (node: Node) => node instanceof w.HTMLElement && (node.matches('.turn-status') || node.matches('.turn-now'));
+  const observer = new w.MutationObserver(records => {
+    for (const record of records) for (const node of [...record.addedNodes, ...record.removedNodes]) if (watched(node)) moves++;
+  });
+  observer.observe(w.document.getElementById('timelineContent')!, { childList: true, subtree: true });
+  return { stop: () => { observer.takeRecords().forEach(record => { for (const node of [...record.addedNodes, ...record.removedNodes]) if (watched(node)) moves++; }); observer.disconnect(); return moves; } };
+}
+
+it('keeps the working line under your message while a failed delivery notice stays in the queue (2026-10-12)', async () => {
+  // A failed "continue" kept its notice in the queue. Counted as a message on its way, it parked the
+  // running turn's line after the queue, below the question, and every repaint moved it again.
+  const asked = Date.now() - 12_000;
+  const app = await boot([
+    { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'held-turn' },
+    { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'held-turn', messageId: 'q-live', message: text('Finish the three steps') }
+  ]);
+  const { w } = app;
+  app.live.inputs.push({ id: 'failed-continue', sessionId: '2026-09-02-test0001', text: 'Continue from where you left off.',
+    mode: 'auto', dueAt: 0, model: null, reasoningEffort: null, state: 'failed', owner: null, createdAt: asked - 60_000,
+    conversationId: 'chat-b', error: 'Not injected: the selected turn ended before an eligible tool call.' });
+  await app.append([]);
+  expect(w.document.querySelector('#inputQueue .pending-message.is-delivery-error')).not.toBeNull();
+  const line = w.document.querySelector<HTMLElement>('.turn-status')!;
+  expect(line.closest('#timeline')).not.toBeNull();
+  expect(line.previousElementSibling?.matches('.ev-user_message')).toBe(true);
+  const moves = lineMoves(w);
+  await app.append([]); await app.append([]); await app.append([]);
+  expect(moves.stop()).toBe(0);
+});
+
+it("keeps a long running turn's line at the top of its loaded rows, not under its newest action (2026-10-12)", async () => {
+  // A 45-minute turn pushed its question out of the loaded rows. "Working for" fell to the bottom,
+  // after the newest action, and jumped back under the question whenever that was loaded again.
+  const asked = Date.now() - 45 * 60_000;
+  const calls = Array.from({ length: 220 }, (_, i): SessionEvent => ({ ...toolCall(i + 3, `long-${i}`), time: asked + (i + 1) * 1000, turnId: 'long-turn' }));
+  const app = await boot([
+    { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'long-turn' },
+    { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'long-turn', messageId: 'q-long', message: text('Build all thirty quests') },
+    ...calls
+  ]);
+  const { w } = app;
+  const timeline = w.document.getElementById('timeline')!;
+  expect(timeline.querySelector('.ev-user_message')).toBeNull();
+  const line = w.document.querySelector<HTMLElement>('.turn-status')!;
+  expect(line.closest('#timeline')).not.toBeNull();
+  const rows = [...timeline.querySelectorAll('[data-timeline-key], .turn-status, .turn-now')];
+  expect(rows[0]).toBe(line);
+  expect(rows.at(-1)?.matches('.turn-now')).toBe(true);
+  const moves = lineMoves(w);
+  await app.append([]); await app.append([]);
+  expect(moves.stop()).toBe(0);
+});
+
+it('keeps a running turn’s line under its question while a message sent into it waits (2026-10-12)', async () => {
+  // A message sent mid-round pulled the running turn's line below it, as if the chat had moved on to
+  // the new message; the rows jumped back once it was delivered or cancelled.
+  const asked = Date.now() - 200_000;
+  const app = await boot([
+    { seq: 1, time: asked - 100, source: 'extension', kind: 'turn_start', turnId: 'running-turn' },
+    { kind: 'user_message', seq: 2, origin: 2, time: asked, source: 'extension', turnId: 'running-turn', messageId: 'q-run', message: text('Port the reference client') },
+    { ...toolCall(3, 'mid-call'), turnId: 'running-turn' }
+  ]);
+  const { w } = app;
+  app.live.inputs.push({ id: 'mid-round', sessionId: '2026-09-02-test0001', text: 'Here is where the reference files are.',
+    mode: 'auto', dueAt: 0, model: null, reasoningEffort: null, state: 'browser', owner: 'page', createdAt: Date.now(), conversationId: 'chat-a' });
+  await app.append([]);
+  expect(w.document.querySelector('#inputQueue .pending-message:not(.is-delivery-error)')).not.toBeNull();
+  const line = w.document.querySelector<HTMLElement>('.turn-status')!;
+  expect(line.closest('#timeline')).not.toBeNull();
+  expect(line.previousElementSibling?.matches('.ev-user_message')).toBe(true);
+  const moves = lineMoves(w);
+  await app.append([]); await app.append([]);
+  expect(moves.stop()).toBe(0);
+});
+
+it('does not move a parked working line on every repaint', async () => {
+  // A turn with no row yet parks its line after the queue; repainting it in place used to re-insert
+  // it each time, restarting its shimmer and Thinking's breathing several times a second.
+  const app = await boot([]);
+  const { w } = app;
+  expect(w.document.querySelector('.turn-status')!.previousElementSibling?.id).toBe('inputQueue');
+  const moves = lineMoves(w);
+  await app.append([]); await app.append([]); await app.append([]);
+  expect(moves.stop()).toBe(0);
+  expect(w.document.querySelector('.turn-status')!.previousElementSibling?.id).toBe('inputQueue');
+});
+
+it("never hangs the running turn's clock under an older question read further up (2026-10-12)", async () => {
+  // Reading a page of history up the chat, its newest loaded question is an old, finished one. The live
+  // "Working for" went right under it, as if that old exchange were still running.
+  const rows = Array.from({ length: 360 }, (_, i): SessionEvent => ({ seq: i + 1, time: T0 + i,
+    source: 'extension', kind: 'user_message', messageId: `origin-${i}`, message: text(`Origin row ${i + 1}.`) }));
+  const { w } = await boot(rows);
+  const pane = w.document.getElementById('chatBody')!;
+  const timeline = w.document.getElementById('timeline')!;
+  Object.defineProperties(pane, { clientHeight: { value: 400 },
+    scrollHeight: { get: () => Math.max(400, timeline.querySelectorAll('[data-timeline-key]').length * 20) } });
+  w.HTMLElement.prototype.getBoundingClientRect = function () {
+    const index = [...timeline.querySelectorAll('[data-timeline-key]')].indexOf(this);
+    const top = index < 0 ? 0 : index * 20 - pane.scrollTop;
+    return { top, bottom: top + 20, height: 20 } as DOMRect;
+  };
+  // At the end the running turn's line sits under the newest question.
+  expect(w.document.querySelector('.turn-status')!.closest('#timeline')).not.toBeNull();
+  for (let index = 0; index < 8 && !timeline.textContent?.includes('Origin row 200.'); index++) {
+    pane.scrollTop = 0;
+    pane.dispatchEvent(new w.WheelEvent('wheel', { deltaY: -100 }));
+    await settleHistoryFrame(w);
+  }
+  expect(timeline.textContent).not.toContain('Origin row 360.');
+  expect(w.document.querySelector('#timeline .turn-status')).toBeNull();
+});
+
+// A long turn's answer was opened early and filled only at the end. The live update carrying the
+// finished answer was skipped as "an old revision owned by an older page", so the chat seemed to
+// stop at its last work heading with no summary.
+it("shows a long turn's final answer when it arrives live, at the end of the turn", async () => {
+  const TURN = 'g-long-0-1';
+  // Like the store, every row of the turn names its turn's start (`turnOrigin`).
+  const opened: SessionEvent = { seq: 2, time: T0 + 2000, source: 'extension', kind: 'assistant_message', messageId: 'answer', turnId: TURN, turnOrigin: 1, final: false, message: text('Restoring the fleet first.') };
+  const work = Array.from({ length: 120 }, (_, i) => ({ ...toolCall(3 + i, `call-${i}`), turnId: TURN, turnOrigin: 1 }) as SessionEvent);
+  const { w, live, append } = await boot([{ seq: 1, time: T0 + 1000, source: 'extension', kind: 'turn_start', turnId: TURN }, opened, ...work]);
+  const timeline = w.document.getElementById('timeline')!;
+  expect(timeline.textContent).not.toContain('Restoring the fleet first.');
+  // The store rewrites the same message: same origin, new sequence, final text.
+  live.events.splice(live.events.indexOf(opened), 1);
+  await append([
+    { seq: 123, origin: 2, contentSeq: 123, time: T0 + 2000, source: 'extension', kind: 'assistant_message', messageId: 'answer', turnId: TURN, turnOrigin: 1, final: true,
+      message: text('Restoring the fleet first. Done: 53 devices are back.') } as SessionEvent,
+    { seq: 124, time: T0 + 124_000, source: 'extension', kind: 'turn_end', turnId: TURN, turnOrigin: 1, outcome: 'completed' } as SessionEvent
+  ]);
+  expect(timeline.textContent).toContain('Done: 53 devices are back.');
+  const rows = [...timeline.querySelectorAll('[data-timeline-key]')];
+  const answerRow = rows.findIndex(row => row.textContent?.includes('Done: 53 devices are back.'));
+  const lastWork = rows.map((row, index) => row.matches('.tool-group, [data-timeline-key^="event:"][class*="tool"]') ? index : -1).reduce((a, b) => Math.max(a, b), -1);
+  expect(answerRow).toBeGreaterThan(lastWork);
+});
+
+// Like Codex's Steer: a message waiting for the end of the turn can be sent into it now.
+it('offers Send now on a queued message while the running turn can take it', async () => {
+  const { w, live, append } = await boot([]);
+  const api = (w as any).api;
+  let directly = false;
+  api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id,
+    activeTurnId: 'plain-turn', canInject: false, canSendDirectly: directly, queueAtFinish: false } });
+  live.inputs.push({ id: 'waiting', sessionId: summary([]).id, text: 'Also check the logs', mode: 'after-turn', dueAt: 0,
+    model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b' });
+  await append([]);
+  const sendNow = () => w.document.querySelector<HTMLButtonElement>('#finishQueue [aria-label="Send now"]:not([hidden])');
+  // A turn that cannot be joined (or no turn at all): the message just waits.
+  expect(sendNow()).toBeNull();
+
+  directly = true;
+  await append([]);
+  const steer = vi.fn(async () => { live.inputs[0]!.mode = 'auto'; return { ok: true, data: true }; });
+  api.sendQueuedInputNow = steer;
+  sendNow()!.click(); sendNow()?.click();
+  await settle();
+  expect(steer).toHaveBeenCalledTimes(1);
+  expect(steer).toHaveBeenCalledWith('waiting');
+});
+
+it('says so when a queued message can no longer join the running turn', async () => {
+  const { w, live, append } = await boot([]);
+  const api = (w as any).api;
+  api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id,
+    activeTurnId: 'plain-turn', canInject: false, canSendDirectly: true, queueAtFinish: false } });
+  live.inputs.push({ id: 'waiting', sessionId: summary([]).id, text: 'Also check the logs', mode: 'after-turn', dueAt: 0,
+    model: null, reasoningEffort: null, state: 'queued', owner: null, createdAt: 0, conversationId: 'chat-b' });
+  await append([]);
+  api.sendQueuedInputNow = async () => ({ ok: true, data: false });
+  w.document.querySelector<HTMLButtonElement>('#finishQueue [aria-label="Send now"]:not([hidden])')!.click();
+  await settle();
+  expect(w.document.body.textContent).toContain('The turn ended before this message could join it. It stays queued.');
+});
+
+// Codex's Find in chat: ⌘F (Ctrl+F) searches the open chat's whole recording, newest match first.
+it('finds in the open chat with Cmd/Ctrl+F, steps through matches and closes with Escape', async () => {
+  const rows: SessionEvent[] = [
+    { seq: 1, time: T0 + 1000, source: 'extension', kind: 'user_message', messageId: 'q1', message: text('Check the Windows installer') },
+    { seq: 2, time: T0 + 2000, source: 'extension', kind: 'assistant_message', messageId: 'a1', final: true, message: text('The windows installer builds.') },
+    { seq: 3, time: T0 + 3000, source: 'extension', kind: 'user_message', messageId: 'q2', message: text('Now the docs') }
+  ];
+  const { w } = await boot(rows);
+  const api = (w as any).api;
+  const find = vi.fn(async () => ({ ok: true, data: [
+    { seq: 1, kind: 'user_message', messageId: 'q1', position: 1 },
+    { seq: 2, kind: 'assistant_message', messageId: 'a1', position: 2 }
+  ] }));
+  api.findInChat = find;
+  const bar = w.document.getElementById('chatFind')!;
+  expect(bar.hidden).toBe(true);
+  // The app reads the platform as isMac() does: ⌘F there, Ctrl+F elsewhere; both keys at once is neither.
+  const mac = /^Mac/.test(globalThis.navigator.platform);
+  w.document.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'f', ctrlKey: true, metaKey: true, bubbles: true, cancelable: true }));
+  expect(bar.hidden).toBe(true);
+  w.document.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'f', ctrlKey: !mac, metaKey: mac, bubbles: true, cancelable: true }));
+  expect(bar.hidden).toBe(false);
+  const field = w.document.getElementById('chatFindField') as HTMLInputElement;
+  expect(w.document.activeElement).toBe(field);
+  field.value = 'windows installer';
+  field.dispatchEvent(new w.Event('input', { bubbles: true }));
+  await vi.waitFor(() => expect(w.document.getElementById('chatFindCount')!.textContent).toBe('2 of 2'));
+  expect(find).toHaveBeenCalledWith(summary(rows).id, 'windows installer');
+  field.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+  await vi.waitFor(() => expect(w.document.getElementById('chatFindCount')!.textContent).toBe('1 of 2'));
+  field.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true, cancelable: true }));
+  await vi.waitFor(() => expect(w.document.getElementById('chatFindCount')!.textContent).toBe('2 of 2'));
+  find.mockResolvedValueOnce({ ok: true, data: [] });
+  field.value = 'linux';
+  field.dispatchEvent(new w.Event('input', { bubbles: true }));
+  await vi.waitFor(() => expect(w.document.getElementById('chatFindCount')!.textContent).toBe('No matches'));
+  field.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+  expect(bar.hidden).toBe(true);
+});
+
+// Codex's "Follow-up behavior": messages typed while a turn runs join it, or wait for its end.
+// Cmd/Ctrl+Shift+Enter sends the other way.
+async function sendDuringTurn(followUp: 'steer' | 'queue' | undefined, keys: { metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean } = {}) {
+  const app = await boot([], true, [], [], followUp === undefined ? {} : { followUp });
+  const api = (app.w as any).api;
+  api.getSessionControls = async () => ({ ok: true, data: { sessionId: summary([]).id, activeTurnId: 'running-turn', canInject: false, canSendDirectly: true, queueAtFinish: false } });
+  await app.append([]);
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = 'Also check the logs';
+  input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  input.dispatchEvent(new app.w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true, ...keys }));
+  await vi.waitFor(() => expect(app.live.sent).toHaveLength(1));
+  return { app, sent: app.live.sent[0]! };
+}
+
+it('sends a message into the running turn by default', async () => {
+  const { app, sent } = await sendDuringTurn(undefined);
+  expect(sent.mode).toBe('auto');
+  expect((app.w.document.getElementById('sendMode') as HTMLSelectElement).value).toBe('auto');
+});
+
+it('queues a message for after the turn when that is the chosen follow-up behavior', async () => {
+  const { sent } = await sendDuringTurn('queue');
+  expect(sent.mode).toBe('after-turn');
+});
+
+it.each([
+  [{ metaKey: true }, undefined, 'after-turn'], [{ ctrlKey: true }, undefined, 'after-turn'],
+  [{ metaKey: true }, 'queue', 'auto'], [{ ctrlKey: true }, 'queue', 'auto']
+] as const)('sends the other way with %o + Shift + Enter (default %s)', async (modifier, followUp, mode) => {
+  expect((await sendDuringTurn(followUp, { ...modifier, shiftKey: true })).sent.mode).toBe(mode);
+});
+
+// Codex's slash commands, each opening what the app already has.
+async function slash(command: string, selectExisting = true) {
+  const app = await boot([], selectExisting);
+  (app.w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = `/${command}`; input.setSelectionRange(input.value.length, input.value.length);
+  input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  await settle();
+  const row = app.w.document.querySelector<HTMLElement>(`#skillPicker .slash-menu-option[title="/${command}"]`);
+  return { ...app, input, row };
+}
+
+it('lists the Codex slash commands in the composer menu', async () => {
+  const { w, input } = await slash('');
+  const listed = [...w.document.querySelectorAll<HTMLElement>('#skillPicker .slash-menu-option')].map(row => row.title);
+  expect(listed).toEqual(expect.arrayContaining(['/plan', '/goal', '/loop', '/compact', '/model', '/reasoning', '/new', '/rename', '/pin',
+    '/status', '/review', '/init', '/usage', '/plugins', '/pet', '/feedback']));
+  expect(input.value).toBe('/');
+});
+
+it('opens the model picker with /model (/reasoning opens the same picker)', async () => {
+  for (const command of ['model', 'reasoning']) {
+    const { w, row } = await slash(command);
+    row!.click(); await settle();
+    expect((w.document.getElementById('modelMenu') as HTMLDetailsElement).open).toBe(true);
+    break;
+  }
+});
+
+it('renames the open chat with /rename', async () => {
+  const { w, row, input } = await slash('rename');
+  row!.click(); await settle();
+  expect(w.document.querySelector('#sessionList .sess-rename')).not.toBeNull();
+  expect(input.value).toBe('');
+});
+
+it('pins the open chat with /pin', async () => {
+  const { w, row } = await slash('pin');
+  row!.click(); await settle();
+  expect(w.document.body.textContent).toContain('Chat pinned');
+});
+
+it('shows the context status with /status', async () => {
+  const { w, row } = await slash('status');
+  row!.click(); await settle();
+  expect(w.document.getElementById('contextMeterButton')!.getAttribute('aria-expanded')).toBe('true');
+});
+
+it('starts a review request with /review and keeps what was typed after it', async () => {
+  const app = await boot([]);
+  (app.w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = '/review'; input.setSelectionRange(7, 7); input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  await settle();
+  app.w.document.querySelector<HTMLElement>('#skillPicker .slash-menu-option[title="/review"]')!.click(); await settle();
+  expect(input.value).toMatch(/^Review the uncommitted changes in this project/);
+});
+
+it('opens New chat, Usage, Plugins, Pets and the diagnostics report from their commands', async () => {
+  const { w, row } = await slash('usage');
+  row!.click(); await settle();
+  expect(w.document.querySelector<HTMLElement>('.app')!.dataset.screen).toBe('settings');
+  expect(w.document.querySelector('[data-tab="usage"]')!.classList.contains('is-sel') || w.document.querySelector('[data-tab="usage"]')!.getAttribute('aria-selected') === 'true').toBe(true);
+});
+
+it('offers chat-only commands only while a chat is open', async () => {
+  const { w } = await slash('', false);
+  const listed = [...w.document.querySelectorAll<HTMLElement>('#skillPicker .slash-menu-option')].map(row => row.title);
+  expect(listed).toEqual(expect.arrayContaining(['/new', '/model', '/review']));
+  expect(listed).not.toEqual(expect.arrayContaining(['/rename']));
+  expect(listed).not.toContain('/pin');
+  expect(listed).not.toContain('/status');
+});
+
+// Codex's "Enter key behavior": Enter sends, or Cmd/Ctrl+Enter sends and Enter adds a line.
+async function pressInComposer(enterSends: boolean | undefined, keys: { metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean }) {
+  const app = await boot([], true, [], [], enterSends === undefined ? {} : { enterSends });
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = 'Run the tests';
+  input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  const event = new app.w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true, ...keys });
+  input.dispatchEvent(event);
+  await settle(300);
+  return { sent: app.live.sent.length, prevented: event.defaultPrevented };
+}
+
+it('sends with Enter by default', async () => {
+  expect(await pressInComposer(undefined, {})).toEqual({ sent: 1, prevented: true });
+});
+it('keeps Shift+Enter as a new line', async () => {
+  expect(await pressInComposer(undefined, { shiftKey: true })).toEqual({ sent: 0, prevented: false });
+});
+it('adds a line with Enter when Cmd/Ctrl+Enter is chosen to send', async () => {
+  expect(await pressInComposer(false, {})).toEqual({ sent: 0, prevented: false });
+});
+it.each([{ metaKey: true }, { ctrlKey: true }])('sends with %o + Enter when that is chosen', async modifier => {
+  expect(await pressInComposer(false, modifier)).toEqual({ sent: 1, prevented: true });
+});
+
+// Polish 2.1.37: the new Enter-key choice and the slash menu meet in the same keystroke.
+it.each([true, false])('runs the highlighted slash command with Enter whatever Enter sends (enterSends=%s)', async enterSends => {
+  const app = await boot([], true, [], [], { enterSends });
+  (app.w as any).api.skillLibrary = async () => ({ ok: true, data: { skills: [], roots: [], errors: [], includeInstructions: true } });
+  const input = app.w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = '/status'; input.setSelectionRange(7, 7); input.dispatchEvent(new app.w.Event('input', { bubbles: true }));
+  await settle();
+  const event = new app.w.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+  input.dispatchEvent(event);
+  await settle(300);
+  expect(event.defaultPrevented).toBe(true);
+  expect(app.live.sent).toHaveLength(0);
+  expect(app.w.document.getElementById('contextMeterButton')!.getAttribute('aria-expanded')).toBe('true');
+  expect(input.value).toBe('');
 });

@@ -27,7 +27,9 @@ import './i18n.js';
 
 const activeTabs = globalThis.chrome?.debugger ? createActiveTabs(chrome) : null;
 
-const PORTS = [8765, 8766, 8767, 8768, 8769];
+// The app's Auto order (src/shared/browser-bridge.ts): the primary range, then two fallback ranges
+// for when Windows reserves 8765-8769 (#1314). Refused local ports fail at once, so scanning is cheap.
+const PORTS = [8765, 8766, 8767, 8768, 8769, 18765, 18766, 18767, 18768, 18769, 38765, 38766, 38767, 38768, 38769];
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
 /** A journal receipt follows durable session writes, which can outlast an ordinary read. */
@@ -263,6 +265,20 @@ const COMMAND_TAB_PROTECTION_MS = 30 * 60_000;
  * and claim the other computer's calls until the app answers again. Null until the app says.
  */
 let connectorNames = null;
+/**
+ * This install's Core app as a page last listed it: `{ appId, name }`, name being the exact Core
+ * connector name at that moment. A fresh tab whose own plugin list has not arrived yet uses it for
+ * the Core mention, so a worker's first message does not go out without one (and, in a workspace
+ * shared with another computer, to that computer's plain Core).
+ */
+let ownCoreApp = null;
+
+function cleanOwnCoreApp(value) {
+  return value && typeof value === 'object' && typeof value.appId === 'string' &&
+    /^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(value.appId) && typeof value.name === 'string' &&
+    /^Chat On Steroids Core(?: \([\p{L}\p{N} ._-]{1,32}\))?$/u.test(value.name)
+    ? { appId: value.appId, name: value.name } : null;
+}
 
 /** The app's names, or null for anything that is not three plain "Chat On Steroids …" strings. */
 function cleanConnectorNames(value) {
@@ -276,6 +292,38 @@ function cleanConnectorNames(value) {
     names[surface] = name;
   }
   return names;
+}
+
+async function rememberOwnCoreApp(value) {
+  const next = cleanOwnCoreApp(value);
+  if (JSON.stringify(next) === JSON.stringify(ownCoreApp)) return;
+  ownCoreApp = next;
+  try { await chrome.storage.local.set({ ownCoreApp: next }); } catch { /* Kept in memory for this worker. */ }
+}
+
+/**
+ * This install's connector apps as the app proved them from its own served requests
+ * (connector-identity.ts): ChatGPT keeps an app's id across a rename, so pages recognize a renamed
+ * connector by these ids. At most four per surface, ids exact, names one short line.
+ */
+let connectorApps = null;
+function cleanConnectorApps(value) {
+  if (!value || typeof value !== 'object') return null;
+  const out = {};
+  for (const surface of ['core', 'desktop', 'plugins']) {
+    out[surface] = (Array.isArray(value[surface]) ? value[surface] : []).slice(0, 4)
+      .filter(app => app && typeof app.appId === 'string' && /^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(app.appId))
+      .map(app => ({ appId: app.appId,
+        linkId: typeof app.linkId === 'string' && /^link_[A-Za-z0-9_-]{1,160}$/.test(app.linkId) ? app.linkId : null,
+        name: typeof app.name === 'string' && app.name ? app.name.slice(0, 64) : null }));
+  }
+  return out;
+}
+async function rememberConnectorApps(value) {
+  const apps = cleanConnectorApps(value);
+  if (!apps || JSON.stringify(apps) === JSON.stringify(connectorApps)) return;
+  connectorApps = apps;
+  try { await chrome.storage.local.set({ connectorApps: apps }); } catch { /* Kept in memory for this worker. */ }
 }
 
 async function rememberConnectorNames(value) {
@@ -299,9 +347,12 @@ function load() {
 }
 
 async function loadOnce() {
-  const stored = await chrome.storage.local.get(['port', 'token', 'disconnected', 'deferredRevivals', 'commandAckOutbox', 'inputOpenings', 'desktopInputTabs', 'stopOpenings', 'browserId', 'connectorNames']);
+  const stored = await chrome.storage.local.get(['port', 'token', 'disconnected', 'deferredRevivals', 'commandAckOutbox', 'inputOpenings', 'desktopInputTabs', 'stopOpenings', 'browserId', 'connectorNames', 'ownCoreApp', 'connectorApps', 'backgroundPlacement']);
   port = typeof stored.port === 'number' ? stored.port : null;
   connectorNames = cleanConnectorNames(stored.connectorNames);
+  setBackgroundPlacement(stored.backgroundPlacement);
+  ownCoreApp = cleanOwnCoreApp(stored.ownCoreApp);
+  connectorApps = cleanConnectorApps(stored.connectorApps);
   // Tells this browser apart from another one paired with the same app, so a new chat is opened
   // and sent in one browser only. Random, local, and never tied to the profile or the user.
   browserId = typeof stored.browserId === 'string' && /^[a-z0-9]{16,64}$/.test(stored.browserId) ? stored.browserId : '';
@@ -1064,7 +1115,9 @@ function versionHeaders() {
     ...(workerStampValue ? { 'x-extension-build': workerStampValue } : {}),
     ...(browserId ? { 'x-extension-browser': browserId } : {}),
     // The app tells the person's own browser apart from the CoS browser's copy of this extension.
-    'x-extension-host': globalThis.__cosBrowserWorker ? 'cos' : 'browser'
+    'x-extension-host': globalThis.__cosBrowserWorker ? 'cos' : 'browser',
+    // Firefox updates its add-on itself; the app neither offers its folder nor asks for a reload.
+    ...(typeof chrome.runtime.getBrowserInfo === 'function' ? { 'x-extension-engine': 'gecko' } : {})
   };
 }
 
@@ -1315,7 +1368,10 @@ async function redeemCommand(id, client, conversationId = null, projectEntry = f
     retryable: result.status === 0 || result.status === 429 || result.status >= 500
   };
   const command = result.data && result.data.command ? result.data.command : null;
-  return { ok: true, command };
+  // A tab the app opened runs its command before its first status reply. Without this install's
+  // names it would take the plain "Chat On Steroids Core" for its own, which on a computer with a
+  // suffix is the other computer's, and mention that Core in the bootstrap.
+  return { ok: true, command, ...(command ? { identity: { connectorNames, connectorApps, ownCoreApp } } : {}) };
 }
 
 function commandAckPayload(id, status, error, conversationId, agent, client, turnId, detail) {
@@ -1432,12 +1488,17 @@ async function retireFailedCommandTab(entry) {
   if (!ownsDocument(source)) return;
   try {
     const tab = await chrome.tabs.get(source.tab);
-    if (!tab || tab.pinned || tab.pendingUrl || conversationFromUrl(tab.url) || !ownsDocument(source)) return;
+    if (!tab || tab.pinned || tab.pendingUrl || !ownsDocument(source)) return;
+    // The only chat a failed command's tab may show is the source the app opened to follow its
+    // Project link (?clf=<id>&clf_project=1); a failed Project entry left that tab open every time.
+    const conversation = conversationFromUrl(tab.url) || null;
+    const marked = new URL(tab.url);
+    if (conversation && !(marked.searchParams.get('clf') === entry.id && marked.searchParams.get('clf_project') === '1')) return;
     const url = tab.url;
-    const proof = await tabReply(source.tab, { type: 'clf-tab-close-check', conversationId: null,
+    const proof = await tabReply(source.tab, { type: 'clf-tab-close-check', conversationId: conversation,
       failedCommand: { id: entry.id, client: entry.client } }, { documentId: source.documentId });
     const latest = await chrome.tabs.get(source.tab);
-    if (proof?.safe === true && proof.conversationId === null && proof.navigationEpoch === source.navigationEpoch &&
+    if (proof?.safe === true && proof.conversationId === conversation && proof.navigationEpoch === source.navigationEpoch &&
         latest && !latest.pinned && !latest.pendingUrl && latest.url === url && ownsDocument(source)) await chrome.tabs.remove(source.tab);
   } catch { /* A busy, edited, replaced or unreadable page stays open. */ }
 }
@@ -1834,22 +1895,188 @@ async function noteTabConversation(source, value) {
  */
 let backgroundWindowFlight = null;
 let backgroundWindowBounds = { width: 800, height: 600 };
+/**
+ * Where background tabs go (#128): the app's own minimized window, or a collapsed tab group in the
+ * user's last-focused window. The app publishes it in `/status`; it is kept in local storage so a
+ * wake that arrives before this worker's first status pass already places tabs the chosen way.
+ * Anything but 'group', including an app that does not send it, means the window.
+ */
+let backgroundPlacement = 'window';
+function setBackgroundPlacement(value) {
+  const next = value === 'group' ? 'group' : 'window';
+  const changed = next !== backgroundPlacement;
+  backgroundPlacement = next;
+  return changed;
+}
+async function rememberBackgroundPlacement(value) {
+  if (!setBackgroundPlacement(value)) return;
+  try { await chrome.storage.local.set({ backgroundPlacement }); } catch { /* Kept in memory for this worker. */ }
+}
+/** Group mode needs the setting and the browser's tab-group API; anything else uses the window. */
+function groupsAvailable() {
+  return backgroundPlacement === 'group' && typeof chrome.tabs?.group === 'function' &&
+    typeof chrome.tabGroups?.get === 'function' && typeof chrome.tabGroups?.update === 'function' &&
+    typeof chrome.tabGroups?.query === 'function' && typeof chrome.windows?.getLastFocused === 'function' &&
+    typeof chrome.windows?.getAll === 'function';
+}
 /** One serialized owner for window adoption, consolidation and new tab placement. */
 function inBackgroundWindow(work) {
   const flight = (backgroundWindowFlight || Promise.resolve()).catch(() => undefined).then(work);
   backgroundWindowFlight = flight;
   return flight.finally(() => { if (backgroundWindowFlight === flight) backgroundWindowFlight = null; });
 }
+/**
+ * The app's Background chats window. Session storage loses it whenever the extension reloads,
+ * which every self-update does, so it is mirrored to local storage. Window ids are only valid
+ * for one browser session: onStartup drops the mirror, and the mirror is adopted only while
+ * that window still holds nothing but ChatGPT tabs, never one of the user's own windows.
+ */
+const BACKGROUND_WINDOW_MIRROR = 'chatBackgroundWindowMirror';
+async function rememberBackgroundWindow(id) {
+  await chrome.storage.session.set({ chatBackgroundWindow: id });
+  await chrome.storage.local.set({ [BACKGROUND_WINDOW_MIRROR]: id });
+}
+async function forgetBackgroundWindow() {
+  await chrome.storage.session.remove('chatBackgroundWindow');
+  await chrome.storage.local.remove(BACKGROUND_WINDOW_MIRROR);
+}
 async function storedBackgroundWindow() {
-  const { chatBackgroundWindow: id } = await chrome.storage.session.get('chatBackgroundWindow');
+  const { chatBackgroundWindow: current } = await chrome.storage.session.get('chatBackgroundWindow');
+  const mirrored = Number.isInteger(current) ? null : (await chrome.storage.local.get(BACKGROUND_WINDOW_MIRROR))[BACKGROUND_WINDOW_MIRROR];
+  const id = Number.isInteger(current) ? current : mirrored;
   if (!Number.isInteger(id)) return null;
-  try { return await chrome.windows.get(id); }
-  catch { await chrome.storage.session.remove('chatBackgroundWindow'); return null; }
+  try {
+    const window = await chrome.windows.get(id, { populate: !Number.isInteger(current) });
+    if (!Number.isInteger(current)) {
+      const tabs = Array.isArray(window?.tabs) ? window.tabs : [];
+      if (window?.type !== 'normal' || !tabs.length || tabs.some(tab => !isChatGptUrl(tab.pendingUrl || tab.url || ''))) {
+        await chrome.storage.local.remove(BACKGROUND_WINDOW_MIRROR);
+        return null;
+      }
+      await chrome.storage.session.set({ chatBackgroundWindow: id });
+    }
+    return window;
+  }
+  catch { await forgetBackgroundWindow(); return null; }
+}
+/**
+ * The app's tab group in tab-group mode (#128). Like the window, its id is kept in session storage
+ * and mirrored to local storage, because every self-update reloads this worker. A mirrored id is
+ * only trusted while the group still carries the app's title: group ids are per browser session,
+ * onStartup drops the mirror, and a group the user renamed is theirs now.
+ */
+const BACKGROUND_GROUP_TITLE = 'Chat On Steroids';
+const BACKGROUND_GROUP_MIRROR = 'chatBackgroundGroupMirror';
+async function rememberBackgroundGroup(id) {
+  await chrome.storage.session.set({ chatBackgroundGroup: id });
+  await chrome.storage.local.set({ [BACKGROUND_GROUP_MIRROR]: id });
+}
+async function forgetBackgroundGroup() {
+  await chrome.storage.session.remove('chatBackgroundGroup');
+  await chrome.storage.local.remove(BACKGROUND_GROUP_MIRROR);
+}
+async function storedBackgroundGroup() {
+  const { chatBackgroundGroup: current } = await chrome.storage.session.get('chatBackgroundGroup');
+  const id = Number.isInteger(current) ? current : (await chrome.storage.local.get(BACKGROUND_GROUP_MIRROR))[BACKGROUND_GROUP_MIRROR];
+  if (!Number.isInteger(id)) return null;
+  try {
+    const group = await chrome.tabGroups.get(id);
+    if (!Number.isInteger(group?.windowId)) throw new Error('group_without_window');
+    if (!Number.isInteger(current)) {
+      if (group.title !== BACKGROUND_GROUP_TITLE) { await chrome.storage.local.remove(BACKGROUND_GROUP_MIRROR); return null; }
+      await chrome.storage.session.set({ chatBackgroundGroup: id });
+    }
+    return group;
+  } catch { await forgetBackgroundGroup(); return null; }
+}
+/**
+ * Where a new group or a chat for the user goes: the user's last-focused normal window, never the app's own background
+ * window and never an incognito one. Chrome can name the app's own window as last-focused
+ * (measured on macOS), so the fallback is the eligible window whose tab was used most recently,
+ * then the lowest id; with none, window mode.
+ */
+async function groupTargetWindow() {
+  const excluded = (await storedBackgroundWindow())?.id;
+  const eligible = window => Number.isInteger(window?.id) && window.type === 'normal' && window.incognito !== true && window.id !== excluded;
+  try {
+    const last = await chrome.windows.getLastFocused({ windowTypes: ['normal'] });
+    if (eligible(last)) return last.id;
+  } catch { /* No focused window yet; fall through to any eligible one. */ }
+  const all = await chrome.windows.getAll({ windowTypes: ['normal'] }).catch(() => []);
+  const candidates = (Array.isArray(all) ? all : []).filter(eligible);
+  if (!candidates.length) return null;
+  const tabs = await chrome.tabs.query({}).catch(() => []);
+  const used = id => Math.max(0, ...(Array.isArray(tabs) ? tabs : [])
+    .filter(tab => tab.windowId === id && Number.isFinite(tab.lastAccessed)).map(tab => tab.lastAccessed));
+  const [first] = candidates.sort((a, b) => used(b.id) - used(a.id) || a.id - b.id);
+  return first.id;
+}
+/**
+ * A chat the user should see goes into their own window, never an incognito one (#1524): with the
+ * extension allowed in incognito, Chrome put it in whichever window was last focused, and ChatGPT
+ * is signed out there. Without a regular window it opens one.
+ */
+async function createUserWindowTab(url, active) {
+  // Firefox for Android has no windows to choose from (and no incognito window beside them).
+  if (typeof chrome.windows?.getLastFocused !== 'function' || typeof chrome.windows?.getAll !== 'function') {
+    return chrome.tabs.create({ url, active });
+  }
+  const windowId = await groupTargetWindow();
+  if (Number.isInteger(windowId)) return chrome.tabs.create({ url, windowId, active });
+  const window = await chrome.windows.create({ url, type: 'normal', incognito: false, focused: active });
+  if (!Number.isInteger(window?.id) || !window.tabs?.[0]) throw new Error('chat_window_not_ready');
+  return window.tabs[0];
+}
+/**
+ * One inactive tab in the app's group, creating the group collapsed the first time. Only a group
+ * made here is collapsed: collapsing one that holds the window's active tab would switch the
+ * user's tab. Null hands the tab to window mode before anything was created.
+ */
+async function createGroupedTab(url) {
+  let group = await storedBackgroundGroup();
+  const windowId = group ? group.windowId : await groupTargetWindow();
+  if (!Number.isInteger(windowId)) return null;
+  const members = group ? await chrome.tabs.query({ groupId: group.id }).catch(() => []) : [];
+  const indexes = (Array.isArray(members) ? members : []).filter(tab => tab.windowId === windowId && Number.isInteger(tab.index)).map(tab => tab.index);
+  const tab = await chrome.tabs.create({ url, windowId, active: false, ...(indexes.length ? { index: Math.max(...indexes) + 1 } : {}) });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      if (group) {
+        await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
+        return { ...tab, windowId: group.windowId };
+      }
+      const created = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId ?? windowId } });
+      await rememberBackgroundGroup(created);
+      const titled = await chrome.tabGroups.update(created, { title: BACKGROUND_GROUP_TITLE, color: 'grey', collapsed: true });
+      return { ...tab, windowId: titled?.windowId ?? tab.windowId ?? windowId };
+    } catch {
+      // The group vanished or moved under us. Start one fresh in the tab's window, once.
+      await forgetBackgroundGroup().catch(() => undefined);
+      group = null;
+    }
+  }
+  return moveToBackgroundWindow(tab);
+}
+/** Last resort for a tab grouping could not place: the app's minimized window, never the user's strip. */
+async function moveToBackgroundWindow(tab) {
+  const existing = await storedBackgroundWindow();
+  if (existing) {
+    await chrome.tabs.move(tab.id, { windowId: existing.id, index: -1 });
+    return { ...tab, windowId: existing.id };
+  }
+  const window = await chrome.windows.create({ tabId: tab.id, type: 'normal', ...backgroundWindowBounds, focused: false });
+  if (!Number.isInteger(window?.id)) throw new Error('background_window_not_ready');
+  await rememberBackgroundWindow(window.id);
+  await chrome.windows.update(window.id, { state: 'minimized', focused: false });
+  return { ...tab, windowId: window.id };
 }
 /** Reconstruct ownership from the app's existing tab policy after extension reload or
  * OS browser startup. A cached window id alone never survives a browser restart. */
 async function reconcileBackgroundWindow(policy) {
-  if (policy.background !== true) return;
+  const grouped = groupsAvailable();
+  // Helper tabs (model catalog, successor chats) are background even with Background chats off,
+  // so group mode re-finds its group either way. Window mode keeps today's gate.
+  if (policy.background !== true && !grouped) return;
   const managed = new Set((Array.isArray(policy.managedConversations) ? policy.managedConversations : []).map(cleanConversationId).filter(Boolean));
   const inputIds = new Set((Array.isArray(policy.inputs) ? policy.inputs : []).map(input => input?.id).filter(id => typeof id === 'string'));
   const owns = tab => {
@@ -1864,6 +2091,9 @@ async function reconcileBackgroundWindow(policy) {
       return (inputId && inputIds.has(inputId)) || catalogHelper;
     } catch { return false; }
   };
+  // #128: group mode never moves tabs. Tabs the user dragged out stay out, and nothing is pulled
+  // into or out of the user's own window; only the group itself is re-found.
+  if (grouped) return inBackgroundWindow(() => adoptBackgroundGroup(owns));
   return inBackgroundWindow(async () => {
     let window = await storedBackgroundWindow();
     const tabs = await chrome.tabs.query({});
@@ -1875,7 +2105,7 @@ async function reconcileBackgroundWindow(policy) {
       for (const id of ids) {
         if (tabs.some(tab => tab.windowId === id && !owns(tab))) continue;
         try { window = await chrome.windows.get(id); } catch { continue; }
-        await chrome.storage.session.set({ chatBackgroundWindow: id });
+        await rememberBackgroundWindow(id);
         break;
       }
     }
@@ -1893,10 +2123,38 @@ async function reconcileBackgroundWindow(policy) {
     return true;
   });
 }
+/** Re-finds the app's group after an extension reload or a browser restart that restored it. */
+async function adoptBackgroundGroup(owns) {
+  if (await storedBackgroundGroup()) return true;
+  let groups = [];
+  try { groups = await chrome.tabGroups.query({ title: BACKGROUND_GROUP_TITLE }); } catch { return false; }
+  const tabs = await chrome.tabs.query({});
+  // Chrome matches the title as a pattern; only the exact title counts, and the oldest group wins.
+  for (const group of (Array.isArray(groups) ? groups : []).filter(group => group?.title === BACKGROUND_GROUP_TITLE).sort((a, b) => a.id - b.id)) {
+    const members = tabs.filter(tab => tab.groupId === group.id);
+    // Any tab the app does not own makes it the user's group.
+    if (!members.length || members.some(tab => tab.incognito === true || !owns(tab))) continue;
+    const window = await chrome.windows.get(group.windowId).catch(() => null);
+    if (window?.type !== 'normal' || window.incognito === true) continue;
+    await rememberBackgroundGroup(group.id);
+    return true;
+  }
+  return false;
+}
+/** Whether this tab sits in the app's own tab group, where Chrome pauses it once collapsed (#128). */
+async function inAppGroup(tab) {
+  if (!groupsAvailable() || !Number.isInteger(tab?.groupId) || tab.groupId < 0) return false;
+  return (await storedBackgroundGroup())?.id === tab.groupId;
+}
 /** Only app-owned windows are sized; no tab placement changes window focus/state. */
 async function createChatTab(url, background = false, active = !background) {
-  if (!background) return chrome.tabs.create({ url, active });
+  if (!background) return createUserWindowTab(url, active);
   return inBackgroundWindow(async () => {
+    if (groupsAvailable()) {
+      // A grouped tab is always inactive: selecting it would switch the user's own window.
+      const grouped = await createGroupedTab(url);
+      if (grouped) return grouped;
+    }
     const existing = await storedBackgroundWindow();
     if (existing) {
       return chrome.tabs.create({ url, windowId: existing.id, active });
@@ -1905,7 +2163,7 @@ async function createChatTab(url, background = false, active = !background) {
     // unfocused restore size first, then minimize only this newly owned window.
     const window = await chrome.windows.create({ url, type: 'normal', ...backgroundWindowBounds, focused: false });
     if (!Number.isInteger(window?.id) || !window.tabs?.[0]) throw new Error('background_window_not_ready');
-    await chrome.storage.session.set({ chatBackgroundWindow: window.id });
+    await rememberBackgroundWindow(window.id);
     await chrome.windows.update(window.id, { state: 'minimized', focused: false });
     return window.tabs[0];
   });
@@ -2011,7 +2269,27 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
       await elect(input.id, { tab: tab.id, stage: 'ready', conversationId: target });
       elected = elections[input.id];
     }
+    const projectInput = !target && typeof input.project === 'string' && /^g-p-[0-9a-f]{32}$/.test(input.project) ? input.project : null;
+    // An opening made for another Project (the person retried after the earlier one was gone)
+    // is spent on that one; this Project gets its own tab.
+    if (projectInput && elected && elected.project !== projectInput) {
+      delete elections[input.id];
+      await persistLive();
+      elected = null;
+    }
     if (elected?.tab != null) tab = candidates.find(candidate => candidate.id === elected.tab);
+    // The tab opened on this linked Project's page for this new chat finished on ChatGPT's home,
+    // its marker gone: ChatGPT sends a deleted or unavailable Project there (measured 2026-10-10).
+    // Say so instead of leaving the message waiting with nothing on screen.
+    if (projectInput && !tab && elected?.stage === 'ready' && elected.project === projectInput && Number.isInteger(elected.tab)) {
+      const landed = tabs.find(row => row.id === elected.tab);
+      let home = false;
+      try { const url = new URL(landed?.url || ''); home = url.origin === 'https://chatgpt.com' && url.pathname === '/' && !url.search && !url.hash; } catch {}
+      if (landed && !landed.pendingUrl && landed.status === 'complete' && home) {
+        await call('/project-create', { method: 'POST', body: JSON.stringify({ action: 'gone', inputId: input.id, chatgptId: projectInput }) });
+        continue;
+      }
+    }
     // A prepare receipt can be lost after its exact document changes nothing. Do
     // not replay from elapsed time: only the still-elected, still-owned document
     // can prove that it is idle again and therefore no old preparation is live.
@@ -2060,8 +2338,13 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
       // unresponsive elected document never grants another opening attempt.
       if (elections[input.id] && !recoveredReuse) continue;
       if (Object.keys(elections).length >= 1000) continue;
-      const url = target ? `https://chatgpt.com/c/${encodeURIComponent(target)}` : `https://chatgpt.com/?${input.lifetime === 'temporary-planner' ? 'temporary-chat=true&' : ''}${marker}#${marker}`;
-      if (!target && input.lifetime !== 'temporary-planner') {
+      // A new chat of a project with a native ChatGPT Project opens on that Project's own page;
+      // borrowing another tab would go through ChatGPT's New chat, which is the root.
+      const project = projectInput;
+      const url = target ? `https://chatgpt.com/c/${encodeURIComponent(target)}`
+        : project ? `https://chatgpt.com/g/${project}/project?${marker}#${marker}`
+        : `https://chatgpt.com/?${input.lifetime === 'temporary-planner' ? 'temporary-chat=true&' : ''}${marker}#${marker}`;
+      if (!target && !project && input.lifetime !== 'temporary-planner') {
         const reusable = new Set(reusableConversations);
         const choices = tabs.filter(candidate => !candidate.pinned && !candidate.pendingUrl && modelCatalogTarget?.tab !== candidate.id &&
           (recoveredReuse ? candidate.id === recoveredReuse.tab :
@@ -2120,14 +2403,15 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
         }
         if (elections[input.id]) continue;
       }
-      await elect(input.id, { tab: null, stage: 'opening', conversationId: target });
+      await elect(input.id, { tab: null, stage: 'opening', conversationId: target, ...(project ? { project } : {}) });
       tab = await createChatTab(url, background);
       await protectCreatedTab(tab);
-      await elect(input.id, { tab: tab.id, stage: 'ready', conversationId: target });
+      await elect(input.id, { tab: tab.id, stage: 'ready', conversationId: target, ...(project ? { project } : {}) });
       tabs.push(tab);
       continue;
     }
     offerDesktopInput(tab.id, { type: 'clf-desktop-input', id: input.id, conversationId: target,
+      ...(!target && typeof input.project === 'string' && /^g-p-[0-9a-f]{32}$/.test(input.project) ? { project: input.project } : {}),
       ...(input.recovery ? { recovery: input.recovery } : {}),
       ...(input.silenceTurnId ? { silenceTurnId: input.silenceTurnId } : {}),
       ...(input.directTurn ? { directTurn: input.directTurn } : {}), ...(input.lifetime ? { lifetime: input.lifetime } : {}) });
@@ -2238,6 +2522,65 @@ function pluginSettingsRoute(url) {
 function pluginRefreshMarker(tab) {
   try { const url = new URL(tab?.pendingUrl || tab?.url || ''); return pluginSettingsRoute(url) ? url.searchParams.get('cos-plugin-refresh') : null; } catch { return null; }
 }
+/**
+ * A new CoS project's native ChatGPT Project, created in one helper tab through ChatGPT's own
+ * dialog. The tab is in the foreground: the dialog needs a laid-out page, and the person has just
+ * added the project. One request at a time; the tab is closed once its request is no longer
+ * pending and the page proves it holds nothing of the person's.
+ */
+let projectCreateFlight = null;
+/** A helper the person closed is opened again, but not more often than this. */
+const PROJECT_CREATE_REOPEN_MS = 120_000;
+function inspectProjectCreates(requests) {
+  if (projectCreateFlight) return projectCreateFlight;
+  // A page that just finished a creation answers after the app has already asked for the next pass,
+  // which this flight then turned away; so a flight that asked a page runs one more pass itself, or a
+  // second project added right after the first waited for an unrelated wake (measured 2026-10-10).
+  let asked = false;
+  projectCreateFlight = (async () => {
+    const list = (Array.isArray(requests) ? requests : [])
+      .filter(request => request && /^[a-f0-9-]{36}$/i.test(String(request.id)) && typeof request.name === 'string' && request.name);
+    const owner = (await chrome.storage.session.get('projectCreateOwner')).projectCreateOwner;
+    if (owner && !list.some(request => request.id === owner.id)) {
+      const tab = await chrome.tabs.get(owner.tab).catch(() => null);
+      if (tab && !tab.pinned && !tab.pendingUrl) {
+        let timer;
+        const proof = await Promise.race([chrome.tabs.sendMessage(tab.id, { type: 'clf-project-create-state', id: owner.id }).catch(() => null),
+          new Promise(resolve => { timer = setTimeout(() => resolve(null), 3000); })]).finally(() => clearTimeout(timer));
+        if (proof?.safe === true) await chrome.tabs.remove(tab.id).catch(() => undefined);
+      }
+      await chrome.storage.session.remove('projectCreateOwner');
+    }
+    // Not maintenance: the person just added the project, so this opens its helper even when
+    // maintenance may not open tabs (browserOnly).
+    if (!list.length) return;
+    // One at a time: the helper's own request while its page works on it, otherwise the first
+    // one nobody holds. A claim whose page is gone (no helper here) does not block the others;
+    // it comes back as `requested` when it lapses.
+    const owned = owner ? list.find(request => request.id === owner.id) : null;
+    if (owned && owned.state !== 'requested') return;
+    const request = owned || list.find(candidate => candidate.state === 'requested');
+    if (!request) return;
+    const mine = owner && owner.id === request.id ? owner : null;
+    const tab = mine ? await chrome.tabs.get(mine.tab).catch(() => null) : null;
+    if (!tab) {
+      // A helper the person closed comes back, at most every two minutes: never a tab on every
+      // status pass, and never a request left waiting for good.
+      if (mine && Date.now() - (mine.openedAt ?? 0) < PROJECT_CREATE_REOPEN_MS) return;
+      const created = await createChatTab(`https://chatgpt.com/?cos-project-create=${request.id}`, false);
+      await chrome.storage.session.set({ projectCreateOwner: { id: request.id, tab: created.id, openedAt: Date.now() } });
+      return;
+    }
+    let timer;
+    try {
+      asked = true;
+      await Promise.race([chrome.tabs.sendMessage(tab.id, { type: 'clf-project-create', request: { id: request.id, name: request.name } }).catch(() => undefined),
+        new Promise(resolve => { timer = setTimeout(resolve, 30000); })]);
+    } finally { clearTimeout(timer); }
+  })().catch(() => undefined).finally(() => { projectCreateFlight = null; if (asked) void maintain(); });
+  return projectCreateFlight;
+}
+
 function inspectRequestedPluginRefresh(publications, background, browserOnly = false) {
   if (pluginRefreshFlight || !Array.isArray(publications) || !publications.length) return pluginRefreshFlight;
   pluginRefreshFlight = (async () => {
@@ -2275,10 +2618,11 @@ function inspectRequestedPluginRefresh(publications, background, browserOnly = f
     if (!held) {
       if (browserOnly) return;
       try {
-        const tab = await createChatTab(request.appId
-          // The old hash still redirects to the app's page on the newer shell; without an App Id
-          // it now lands on the home page, so the installed list is opened by its own path.
-          ? `https://chatgpt.com/?cos-plugin-refresh=${request.id}#settings/Plugins/plugin_${request.appId}`
+        const tab = await createChatTab(request.appId && request.observeOnly !== true
+          // Open the native route directly: the retired hash can land on ChatGPT's home page
+          // instead of this app's settings, leaving the elected helper unable to inspect it.
+          ? `https://chatgpt.com/settings/plugins-settings/plugin_${request.appId}?cos-plugin-refresh=${request.id}`
+          // An observation first proves that its enrolled App Id is still visibly installed.
           : `https://chatgpt.com/settings/plugins-settings?cos-plugin-refresh=${request.id}`, background);
         await chrome.storage.session.set({ pluginRefreshOwner: { id: request.id, tab: tab.id } });
       }
@@ -2326,7 +2670,7 @@ function inspectRequestedModels(request) {
     if (!current()) return;
     // Bounded machine reasons, never page text. Progress cannot publish model choices.
     const known = ['generating', 'input_busy', 'draft', 'attachments', 'composer_missing', 'composer_hidden',
-      'inspection_busy', 'page_unreachable', 'page_changed', 'opening', 'inspecting', 'inspection_failed', 'result_unconfirmed'];
+      'inspection_busy', 'page_unreachable', 'page_changed', 'opening', 'inspecting', 'inspection_failed', 'result_unconfirmed', 'picker_unreadable'];
     try { await call('/models', { method: 'POST', body: JSON.stringify({ nonce: wanted.nonce, waiting: known.includes(reason) ? reason : 'inspection_failed' }) }); }
     catch { /* The original app deadline still owns a broken transport. */ }
   };
@@ -2355,7 +2699,8 @@ function inspectRequestedModels(request) {
     if (wanted && !current()) return;
     if (!wanted && !tab) return;
     if (!tab) {
-      const blocked = ['generating', 'input_busy', 'draft', 'attachments', 'composer_hidden'];
+      // A chat on a model the account no longer lists cannot be read; Refresh opens a fresh page instead.
+      const blocked = ['generating', 'input_busy', 'draft', 'attachments', 'composer_hidden', 'picker_unreadable'];
       const proof = owner?.nonce === wanted.nonce ? proofs[tabs.findIndex(candidate => candidate.id === owner.tab)] : proofs[0];
       await waiting(proof?.reason || 'page_unreachable');
       // Only an explicit Refresh may bypass positively identified busy user pages.
@@ -2686,6 +3031,69 @@ async function runImageExports(jobs) {
   }
 }
 
+/**
+ * Keeps the app's grouped pages from being paused (#128).
+ *
+ * Chrome freezes the tabs of a collapsed tab group within seconds, and a frozen page neither
+ * sends nor records. A page told to keep awake holds a Web Lock, which Chrome's freezing rules
+ * exempt. This pass tells each ChatGPT page in the app's group to hold it and each page that
+ * left the group (or a placement switched back to the window) to let go, once per document.
+ * A page Chrome froze before it could take the lock cannot hear anything, so the group is opened
+ * for it (which unfreezes it); once every grouped page holds its lock, a group opened that way
+ * is collapsed again unless the user is reading one of its tabs.
+ */
+let keepAwakeTabs = null;
+let groupOpenedForWake = null;
+async function keepAwakeState() {
+  if (!keepAwakeTabs) {
+    const stored = (await chrome.storage.session.get('keepAwakeTabs')).keepAwakeTabs;
+    keepAwakeTabs = stored && typeof stored === 'object' ? stored : {};
+  }
+  return keepAwakeTabs;
+}
+async function noteKeepAwake(tabId, documentId, on) {
+  const told = await keepAwakeState();
+  if (on) told[String(tabId)] = documentId;
+  else delete told[String(tabId)];
+  await chrome.storage.session.set({ keepAwakeTabs: told });
+}
+async function syncKeepAwake(tabs, everyTab = true) {
+  const told = await keepAwakeState();
+  const group = groupsAvailable() ? await storedBackgroundGroup() : null;
+  let waiting = false;
+  for (const tab of tabs) {
+    if (!Number.isInteger(tab?.id)) continue;
+    const key = String(tab.id);
+    const documentId = tabDocuments[key];
+    const want = Boolean(group) && tab.groupId === group.id;
+    if (want && (!documentId || told[key] !== documentId)) {
+      if (tab.frozen === true || !documentId) {
+        waiting = true;
+        if (tab.frozen === true && group.collapsed === true && groupOpenedForWake === null) {
+          await chrome.tabGroups.update(group.id, { collapsed: false }).then(() => { groupOpenedForWake = group.id; }, () => undefined);
+        }
+        continue;
+      }
+      const reply = await tabReply(tab.id, { type: 'clf-keep-awake', on: true }, { documentId });
+      if (reply?.ok === true) await noteKeepAwake(tab.id, documentId, true);
+      else waiting = true;
+    } else if (!want && told[key] !== undefined) {
+      if (documentId && told[key] === documentId) await tabReply(tab.id, { type: 'clf-keep-awake', on: false }, { documentId });
+      await noteKeepAwake(tab.id, null, false);
+    }
+  }
+  if (everyTab) {
+    for (const key of Object.keys(told)) if (!tabs.some(tab => String(tab.id) === key)) await noteKeepAwake(key, null, false);
+  }
+  if (everyTab && groupOpenedForWake !== null && !waiting) {
+    const id = groupOpenedForWake;
+    groupOpenedForWake = null;
+    if (group?.id === id && !tabs.some(tab => tab.groupId === id && tab.active === true)) {
+      await chrome.tabGroups.update(id, { collapsed: true }).catch(() => undefined);
+    }
+  }
+}
+
 async function revealChats(ids) {
   if (!Array.isArray(ids)) return;
   for (const raw of ids.slice(0, 5)) {
@@ -2695,13 +3103,31 @@ async function revealChats(ids) {
     const [tab] = tabs.filter(candidate => conversationForTab(candidate) === conversationId).sort((a, b) => a.id - b.id);
     const shown = tab
       ? await chrome.tabs.update(tab.id, { active: true })
-      : await chrome.tabs.create({ url: `https://chatgpt.com/c/${conversationId}`, active: true });
+      : await createUserWindowTab(`https://chatgpt.com/c/${conversationId}`, true);
     const windowId = shown?.windowId ?? tab?.windowId;
     if (!Number.isInteger(windowId)) continue;
     // A worker tab can sit in the app's minimized background window; the user asked to see it.
     const window = await chrome.windows.get(windowId).catch(() => null);
     await chrome.windows.update(windowId, window?.state === 'minimized' ? { state: 'normal', focused: true } : { focused: true });
   }
+}
+
+/**
+ * The chat selected in the app becomes the selected tab of the app's Background chats window
+ * (#1249). Selecting a tab never focuses its window, and nothing is opened or moved: a chat
+ * without a tab there, or a tab in the user's own windows, is left as it is.
+ */
+async function followChat(raw) {
+  // #128: in tab-group mode a selection in the app never changes the user's window.
+  if (backgroundPlacement === 'group') return;
+  const conversationId = cleanConversationId(raw);
+  if (!conversationId) return;
+  const window = await storedBackgroundWindow();
+  if (!Number.isInteger(window?.id)) return;
+  const tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS, windowId: window.id });
+  const [tab] = tabs.filter(candidate => candidate.windowId === window.id && conversationForTab(candidate) === conversationId)
+    .sort((a, b) => a.id - b.id);
+  if (tab && !tab.active) await chrome.tabs.update(tab.id, { active: true });
 }
 
 let extensionReloadPending = false;
@@ -2711,8 +3137,18 @@ let extensionReloadPending = false;
  * an idle browser kept the old build after the app updated, and nothing said which check held it.
  */
 let extensionUpdateHold = null;
+/**
+ * Firefox runs the signed add-on installed from its .xpi and updates it through its own update
+ * manifest; the folder the app keeps for Chromium is not what Firefox loads, so reloading would
+ * only reload the same build. `runtime.getBrowserInfo` exists only in Firefox.
+ */
+function updatedByBrowser() {
+  return typeof chrome.runtime.getBrowserInfo === 'function';
+}
+
 async function reloadForExtensionUpdate(offer, liveOpenings, liveCommands) {
   if (extensionReloadPending) return;
+  if (updatedByBrowser()) { extensionUpdateHold = offer ? 'browser-updates-itself' : null; return; }
   if (!offer || typeof offer.build !== 'string' || !/^[0-9a-f]{12}$/.test(offer.build)) { extensionUpdateHold = null; return; }
   await workerStampReady;
   if (!workerStampValue || workerStampValue === offer.build) { extensionUpdateHold = null; return; }
@@ -2771,17 +3207,24 @@ async function maintainOnce() {
     .filter((tab) => tab && (tab.discarded === true || tab.frozen === true))
     .map(conversationForTab)
     .filter(Boolean))];
+  // Without access to chatgpt.com no content script runs, so nothing on a page could ever answer:
+  // a revoked Firefox permission, or Chrome's site access "On click". The app says so in Setup.
+  const chatgptAccess = typeof chrome.permissions?.contains === 'function'
+    ? await chrome.permissions.contains({ origins: ['https://chatgpt.com/*'] }).catch(() => undefined) : undefined;
+  if (intent !== connectionEpoch || !token || disconnected) return;
   const reply = await call('/status', { method: 'POST', body: JSON.stringify({ openConversations, stalledConversations, canReveal: true, canExportImages: true,
-    chatGptSignedIn: chatGptSignedInState,
+    chatGptSignedIn: chatGptSignedInState, ...(typeof chatgptAccess === 'boolean' ? { chatgptAccess } : {}),
     ...(extensionUpdateHold ? { updateHold: extensionUpdateHold } : {}) }) });
   if (intent !== connectionEpoch || !token || disconnected) return;
   if (!reply.ok || !reply.data) { await activeTabs?.revoke(); return; }
+  await rememberBackgroundPlacement(reply.data.backgroundPlacement);
   const liveChats = new Set(Array.isArray(reply.data.nonDiscardableConversations) ? reply.data.nonDiscardableConversations : []);
   const liveOpenings = new Set(Array.isArray(reply.data.inputOpeningIds) ? reply.data.inputOpeningIds : []);
   const liveCommands = new Set(Array.isArray(reply.data.commandIds) ? reply.data.commandIds : []);
   void reloadForExtensionUpdate(reply.data.extensionUpdate, liveOpenings, liveCommands).catch(() => undefined);
   void followApp(reply.data).catch(() => undefined);
   void revealChats(reply.data.reveals).catch(() => undefined);
+  void followChat(reply.data.follow).catch(() => undefined);
   void runImageExports(reply.data.imageExports).catch(() => undefined);
   const renderingWanted = tab => {
     if (intent !== connectionEpoch || !token || disconnected) return false;
@@ -2839,6 +3282,7 @@ async function maintainOnce() {
       token: entry && typeof entry.token === 'string' ? entry.token : '',
       reason: typeof entry?.reason === 'string' ? entry.reason : '',
       requiresClaim: entry?.requiresClaim === true,
+      continueFollows: entry?.continueFollows === true,
       suspended: entry?.reason === 'stalled',
       focus: Boolean(entry && entry.focus === true)
     }))
@@ -2857,13 +3301,16 @@ async function maintainOnce() {
       ...(Number.isInteger(bounds.left) && Number.isInteger(bounds.top) ? { left: bounds.left, top: bounds.top } : {}) };
   }
   const backgroundReady = await reconcileBackgroundWindow(reply.data);
+  await syncKeepAwake(observedTabs).catch(() => undefined);
   if (reply.data.placement) {
     await placeSuccessorChat(reply.data.placement, null);
     await refreshRendering();
   }
   inspectRequestedModels(reply.data.modelCatalogRequest);
   await rememberConnectorNames(reply.data.connectorNames);
+  await rememberConnectorApps(reply.data.connectorApps);
   inspectRequestedPluginRefresh(reply.data.pluginRefreshRequests, reply.data.background === true, reply.data.browserOnly === true);
+  void inspectProjectCreates(reply.data.projectCreateRequests);
   const repairConversations = new Set(repairs.map(entry => entry.conversationId));
   // Reloading the same document races its final input offer. Repair it now; the
   // still-durable app row is offered on the next status pass after the reload.
@@ -2962,7 +3409,7 @@ function repairChangeDetail(latest) {
 }
 
 async function performBrowserRepairs(repairs, policy) {
-  for (const { conversationId, token, reason, focus, requiresClaim, suspended } of repairs) {
+  for (const { conversationId, token, reason, focus, requiresClaim, continueFollows, suspended } of repairs) {
     // Re-scanned per repair rather than reused from above. Earlier entries in this same batch
     // may have created a tab, and the scan has to be the state immediately before the action or
     // the duplicate rule below is deciding on a tab list that no longer exists.
@@ -2995,7 +3442,10 @@ async function performBrowserRepairs(repairs, policy) {
       if (!target && policy.browserOnly === true) continue;
       // Select the working tab within Chrome without stealing OS focus from the
       // desktop app. Tab selection and window activation are separate operations.
-      if (target && focus) {
+      // In tab-group mode the tab sits in the user's own window, where selecting it would switch
+      // what they are looking at (#128); only the app's background window is ours to select in.
+      if (target && focus && (backgroundPlacement !== 'group' ||
+          target.windowId === (await storedBackgroundWindow().catch(() => null))?.id)) {
         await chrome.tabs.update(target.id, { active: true });
       }
       // The tab scan can yield while attribution recovers or a final/new question
@@ -3078,6 +3528,22 @@ async function performBrowserRepairs(repairs, policy) {
           continue;
         }
         if (reason === 'assistant-error' && status?.ok === true && status.assistantError === false) {
+          await call(`/status?repaired=${encodeURIComponent(token)}&repairAction=preserved`);
+          continue;
+        }
+      }
+      if (target && reason === 'silence' && continueFollows) {
+        // A silent chat whose page still shows ChatGPT's own transport error ("Connection
+        // interrupted. Waiting for the complete answer", a delivery timeout) is not helped by a
+        // reload: on 2026-10-12 each such reload left the prime on the same card or ran into
+        // ChatGPT's history limit ("this conversation could not be loaded"), while Stop and a
+        // Continue got it working at once. The app files that Continue when this repair is
+        // confirmed, and its delivery presses Stop first when ChatGPT still shows it, so the
+        // page is left as it is. Only when the app says that Continue will follow: with automatic
+        // recovery off and no Goal nothing is filed, and the reload stays the chat's one chance.
+        const status = await tabReply(target.id, { type: 'clf-page-status' },
+          documentId ? { documentId } : undefined);
+        if (status?.ok === true && status.assistantError === true) {
           await call(`/status?repaired=${encodeURIComponent(token)}&repairAction=preserved`);
           continue;
         }
@@ -3306,16 +3772,18 @@ const tabOperationQueues = new Map();
 const COMPACT_CHECKPOINT_FLAGS = [
   'sourceAttempt',
   'sourceDispatch',
+  'sourceUndelivered',
   'sourceLost',
   'destinationAttempt',
   'destinationDispatch',
   'destinationLost'
 ];
-const COMPACT_CHECKPOINT_TEXT = ['summary', 'sourceMessageId', 'destinationMessageId', 'sourceError'];
+const COMPACT_CHECKPOINT_TEXT = ['summary', 'sourceMessageId', 'destinationMessageId', 'sourceError', 'before', 'newestUserMessage'];
 // Not a checkpoint of its own: it qualifies `sourceMessageId` by saying how far that exact
 // marked response has grown. Sent only alongside the field it describes, so a bare count can
-// never move a deadline by itself.
-const COMPACT_CHECKPOINT_COUNTS = { sourceProgress: 'sourceMessageId' };
+// never move a deadline by itself. `documentSince` likewise only qualifies the newest message a
+// document reports for `sourceUndelivered`.
+const COMPACT_CHECKPOINT_COUNTS = { sourceProgress: 'sourceMessageId', documentSince: 'newestUserMessage' };
 
 function compactCheckpointFields(message) {
   if (!message || typeof message.token !== 'string') return {};
@@ -3371,7 +3839,39 @@ async function bindPendingInputProject(message, source, conversationId) {
   return { ok: true, projectBound: claim.id };
 }
 
+/**
+ * The approval card's words and an answer's outcome, as this document reported them (2.1.38): the
+ * person answers ChatGPT's card in the app, and only the page that shows the card presses it.
+ * Bounded and reshaped here, so a page can send nothing else through these two parameters.
+ */
+function approvalQuery(message) {
+  let query = '';
+  const card = message.approvalCard;
+  if (card && typeof card === 'object' && typeof card.id === 'string' && Array.isArray(card.lines)) {
+    const lines = card.lines.filter(line => typeof line === 'string').slice(0, 8).map(line => line.slice(0, 300));
+    query += `&approvalCard=${encodeURIComponent(JSON.stringify({ id: card.id.slice(0, 64), lines, allow: card.allow === true }))}`;
+  }
+  const result = message.approvalResult;
+  if (result && typeof result === 'object' && typeof result.token === 'string' && typeof result.outcome === 'string')
+    query += `&approvalResult=${encodeURIComponent(JSON.stringify({ token: result.token.slice(0, 64), outcome: result.outcome.slice(0, 20) }))}`;
+  return query;
+}
+
 const HANDLERS = {
+  // Only the tab this worker opened for that exact request may report on it. Creating the Project
+  // navigates that tab to the Project's own page, which drops the marker, so the owner is kept.
+  async project_create(message, _sender, source) {
+    if (!ownsDocument(source) || !/^[a-f0-9-]{36}$/i.test(String(message.id || '')) || !source.documentId) return { ok: false };
+    if (!['claim', 'arm', 'done', 'fail'].includes(message.action)) return { ok: false };
+    const owner = (await chrome.storage.session.get('projectCreateOwner')).projectCreateOwner;
+    if (!owner || owner.id !== message.id || owner.tab !== source.tab || !ownsDocument(source)) return { ok: false };
+    const body = JSON.stringify({ action: message.action, id: message.id, client: String(source.documentId).slice(0, 64),
+      ...(typeof message.chatgptId === 'string' ? { chatgptId: message.chatgptId } : {}),
+      ...(typeof message.error === 'string' ? { error: message.error.slice(0, 500) } : {}) });
+    const result = await call('/project-create', { method: 'POST', body });
+    if (['done', 'fail'].includes(message.action) && result.ok && result.data?.ok) void maintain();
+    return result;
+  },
   async plugin_refresh(message, _sender, source) {
     if (!ownsDocument(source) || !/^[a-f0-9-]{36}$/i.test(String(message.id || ''))) return { ok: false };
     const tab = await chrome.tabs.get(source.tab);
@@ -3401,12 +3901,39 @@ const HANDLERS = {
     const result = await call('/models', { method: 'POST', body });
     return result;
   },
+  /**
+   * This page shows ChatGPT's "could not be loaded" surface for its chat. Its Retry (pressed by the
+   * page's own recovery or by the user) can take the tab to ChatGPT's home page; that chat leaving
+   * this document is then not the user deciding to close it (#1086, 2026-10-06). Recorded like a
+   * borrowed tab, so the departure reaches the app as non-manual and recovery is not paused.
+   */
+  async load_failure(message, _sender, source) {
+    await load();
+    const conversationId = cleanConversationId(message.conversationId);
+    const key = String(source.tab);
+    if (!conversationId || !ownsDocument(source) || tabConversations[key] !== conversationId) return { ok: false };
+    tabReuses[key] = { documentId: source.documentId, conversationId, at: Date.now() };
+    tabReuses = Object.fromEntries(Object.entries(tabReuses).slice(-200));
+    void persistLive().catch(() => undefined);
+    return { ok: true };
+  },
   async core_plugin(message, _sender, source) {
     if (!ownsDocument(source)) return { ok: false };
     // The complete plugins list without this install's Core: the app takes its proof back.
-    if (message.missing === true) return call('/core-plugin', { method: 'POST', body: JSON.stringify({ missing: true }) });
+    if (message.missing === true) {
+      await rememberOwnCoreApp(null);
+      return call('/core-plugin', { method: 'POST', body: JSON.stringify({ missing: true }) });
+    }
     if (typeof message.appId !== 'string' || !/^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(message.appId)) return { ok: false };
+    // The page reports only the app listed under this install's own Core name.
+    if (connectorNames?.core) await rememberOwnCoreApp({ appId: message.appId, name: connectorNames.core });
     return call('/core-plugin', { method: 'POST', body: JSON.stringify({ appId: message.appId }) });
+  },
+  // A page read ChatGPT's own `conversation_deleted` answer for this chat (usage.js).
+  async conversation_deleted(message, _sender, source) {
+    const conversationId = String(message.conversationId || '').toLowerCase();
+    if (!ownsDocument(source) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(conversationId)) return { ok: false };
+    return call('/conversation-deleted', { method: 'POST', body: JSON.stringify({ conversationId }) });
   },
   async usage_observation(message, _sender, source) {
     if (!ownsDocument(source) || !Array.isArray(message.rows) || message.rows.length > 80) return { ok: false };
@@ -3442,7 +3969,7 @@ const HANDLERS = {
     }
     if (message.recoveryAction && message.owner !== owner) return { ok: false };
     const result = await call(typeof message.partial === 'string' ? '/input/progress' : typeof message.response === 'string' ? '/input/answer' : message.fail === true ? '/input/fail' : message.ack === true ? '/input/ack' : '/input/claim', {
-      method: 'POST', body: JSON.stringify({ id, owner, conversationId, recoveryAction: ['stop', 'stopped'].includes(message.recoveryAction) ? message.recoveryAction : undefined, silenceBusyTurnId: typeof message.silenceBusyTurnId === 'string' ? message.silenceBusyTurnId : undefined, recoveryVeto: message.recoveryVeto === 'page-final' ? 'page-final' : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, detail: typeof message.detail === 'string' && /^[a-z-]{1,40}$/.test(message.detail) ? message.detail : undefined, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined })
+      method: 'POST', body: JSON.stringify({ id, owner, conversationId, recoveryAction: ['stop', 'stopped'].includes(message.recoveryAction) ? message.recoveryAction : undefined, silenceBusyTurnId: typeof message.silenceBusyTurnId === 'string' ? message.silenceBusyTurnId : undefined, recoveryVeto: message.recoveryVeto === 'page-final' ? 'page-final' : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, detail: typeof message.detail === 'string' && /^[a-z-]{1,40}$/.test(message.detail) ? message.detail : undefined, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined, project: typeof message.project === 'string' && /^g-p-[0-9a-f]{32}$/.test(message.project) ? message.project : undefined })
     });
     if (typeof message.response === 'string' && message.lifetime === 'temporary-planner' && result.ok && result.data?.ok === true && ownsDocument(source)) {
       // Acceptance retires this exact helper immediately. Fresh page proof still
@@ -3484,7 +4011,14 @@ const HANDLERS = {
     return messages ? { ok: true, messages } : { ok: false };
   },
   async register_document(_message, sender) {
-    const result = await registerDocument(sender, _message);
+    let result = await registerDocument(sender, _message);
+    if (result?.ok === true) {
+      // A page in the app's tab group holds its keep-awake lock from the start (#128).
+      const tab = await chrome.tabs.get(result.tab).catch(() => null);
+      const keepAwake = await inAppGroup(tab).catch(() => false);
+      if (keepAwake) await noteKeepAwake(result.tab, result.documentId, true);
+      result = { ...result, keepAwake };
+    }
     if (result?.ok === true) void maintain(true).catch(() => undefined);
     if (result && result.ok === true) void recoverDeferredRevivals().catch(() => undefined);
     return result;
@@ -3557,6 +4091,8 @@ const HANDLERS = {
       paired: token !== null,
       disconnected,
       connectorNames,
+      connectorApps,
+      ownCoreApp,
       pending: journal.length,
       pendingCommandAcks: commandAckOutbox.length,
       compatible: found ? found.compatible !== false : null,
@@ -3825,7 +4361,8 @@ const HANDLERS = {
       // Forward only the helper states this document may report; these are diagnostics.
       (['absent', 'empty', 'ok'].includes(message.fiber) ? `&fiber=${message.fiber}` : '') +
       (typeof message.generating === 'boolean' ? `&generating=${message.generating ? 1 : 0}` : '') +
-      (typeof message.approval === 'boolean' ? `&approval=${message.approval ? 1 : 0}` : '');
+      (typeof message.approval === 'boolean' ? `&approval=${message.approval ? 1 : 0}` : '') +
+      approvalQuery(message);
     const result = await call(`/activity${query}`);
     if (ownsDocument(source) && result.ok && result.data && await acceptBrowserRevivals(result.data)) {
       await recoverDeferredRevivals();
@@ -3836,16 +4373,6 @@ const HANDLERS = {
       await placeSuccessorChat(result.data.placement, source.tab);
     }
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
-  },
-  /** The running turn's newest unpublished sentence (#942), as a live caption in the app. */
-  async live_preview(message, _sender, source) {
-    await load();
-    const conversationId = cleanConversationId(message.conversationId);
-    const text = message.text === null ? null
-      : typeof message.text === 'string' && message.text.length > 0 && message.text.length <= 300 ? message.text : undefined;
-    if (!conversationId || text === undefined) return { ok: false, status: 400, error: 'bad_live_preview' };
-    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
-    return call('/live-preview', { method: 'POST', body: JSON.stringify({ conversationId, text }) });
   },
   /** Reads one already-recorded call only for the exact currently bound page document. */
   async activity_detail(message, _sender, source) {
@@ -3998,6 +4525,12 @@ const HANDLERS = {
     if (!registeredConversation) {
       await noteTabConversation(source, conversationId);
       if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    }
+    // A page in the app's tab group sits in the user's own window (#128): selecting it would
+    // switch what they are looking at, so the courtesy is skipped there.
+    const placed = await chrome.tabs.get(source.tab).catch(() => null);
+    if (await inAppGroup(placed).catch(() => false)) {
+      return ownsDocument(source) ? { ok: true, focused: false } : { ok: false, error: 'stale_document' };
     }
     try {
       await chrome.tabs.update(source.tab, { active: true });
@@ -4193,6 +4726,79 @@ const HANDLERS = {
   }
 };
 
+/** This browser's own name and version, for the diagnostics report; nothing else about it. */
+async function browserIdentity() {
+  const clean = (name, version) => /^[A-Za-z0-9 ._-]{1,40}$/.test(String(name || '')) && /^[0-9][0-9.]{0,30}$/.test(String(version || ''))
+    ? { name: String(name), version: String(version) } : null;
+  try {
+    // Firefox answers for itself; Chrome-family browsers have no such call.
+    if (typeof browser !== 'undefined' && typeof browser.runtime?.getBrowserInfo === 'function') {
+      const info = await browser.runtime.getBrowserInfo();
+      const named = clean(info?.name, info?.version);
+      if (named) return named;
+    }
+  } catch { /* Fall through to the Chrome-family brands. */ }
+  try {
+    const data = navigator.userAgentData;
+    const values = data && typeof data.getHighEntropyValues === 'function' ? await data.getHighEntropyValues(['fullVersionList']) : null;
+    const brands = (Array.isArray(values?.fullVersionList) ? values.fullVersionList : Array.isArray(data?.brands) ? data.brands : [])
+      .filter(entry => !/not.?a.?brand/i.test(String(entry?.brand || '')));
+    // "Chromium" is listed by every Chrome-family browser; the other brand says which one it is.
+    const entry = brands.find(item => item.brand !== 'Chromium') || brands[0];
+    const named = entry && clean(entry.brand, entry.version);
+    if (named) return named;
+  } catch { /* Unknown below. */ }
+  return { name: 'unknown', version: null };
+}
+
+/**
+ * Browser and ChatGPT tab facts for the diagnostics report (2026-10-15): the browser's name and
+ * version, ChatGPT tabs counted by state, and which of ChatGPT's controls the most recently used
+ * awake tab still has. Counts and booleans only.
+ */
+async function environmentDiagnostics() {
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS }); } catch { tabs = []; }
+  if (!Array.isArray(tabs)) tabs = [];
+  const backgroundWindow = await storedBackgroundWindow().catch(() => null);
+  const count = test => tabs.filter(test).length;
+  const awake = tabs.filter(tab => Number.isInteger(tab.id) && tab.status === 'complete' && tab.discarded !== true && tab.frozen !== true && tab.incognito !== true)
+    .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+  let page = null;
+  if (awake.length) {
+    try {
+      const reply = await tabReply(awake[0].id, { type: 'clf-page-checks' });
+      if (reply && typeof reply === 'object') {
+        page = {
+          composer: reply.composer === true, sendArea: reply.sendArea === true, modelMenu: reply.modelMenu === true, plusMenu: reply.plusMenu === true,
+          language: typeof reply.language === 'string' && /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(reply.language) ? reply.language : null
+        };
+      }
+    } catch { page = null; }
+  }
+  return {
+    browser: await browserIdentity(),
+    tabs: {
+      open: tabs.length,
+      discarded: count(tab => tab.discarded === true),
+      frozen: count(tab => tab.frozen === true),
+      loading: count(tab => tab.status === 'loading'),
+      grouped: count(tab => Number.isInteger(tab.groupId) && tab.groupId >= 0),
+      inBackgroundWindow: Number.isInteger(backgroundWindow?.id) ? count(tab => tab.windowId === backgroundWindow.id) : 0
+    },
+    page
+  };
+}
+
+/** The snapshot is published on every maintenance pass; a page is asked at most once a minute. */
+let environmentCache = null;
+async function cachedEnvironmentDiagnostics() {
+  if (environmentCache && Date.now() - environmentCache.at < 60_000) return environmentCache.value;
+  const value = await environmentDiagnostics().catch(() => null);
+  environmentCache = { at: Date.now(), value };
+  return value;
+}
+
 /** Snapshot sent only to the current paired bridge; it does not grant work or recovery. */
 async function companionDiagnosticSnapshot(found) {
   const preferences = await chrome.storage.local.get([RENDER_STREAM_KEY, SHOW_TIMES_KEY]);
@@ -4217,7 +4823,8 @@ async function companionDiagnosticSnapshot(found) {
     preferences: { overwrite: preferences[RENDER_STREAM_KEY] !== false, durations: preferences[SHOW_TIMES_KEY] === true },
     // Defaults on a fresh install are not choices; the app keeps only values someone stored.
     preferencesStored: RENDER_STREAM_KEY in preferences || SHOW_TIMES_KEY in preferences,
-    tab: await HANDLERS.tabStatus()
+    tab: await HANDLERS.tabStatus(),
+    environment: await cachedEnvironmentDiagnostics()
   };
 }
 
@@ -4249,13 +4856,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'desktop_input',
     'model_catalog',
     'plugin_refresh',
+    'project_create',
     'core_plugin',
+    'load_failure',
+    'conversation_deleted',
     'usage_observation',
     'events',
     'bind',
     'activity',
     'activity_detail',
-    'live_preview',
     'correlate',
     'closed',
     'compact',
@@ -4362,6 +4971,10 @@ chrome.tabs.onUpdated.addListener((id, changeInfo, tab) => {
     const rendering = activeTabs?.owns(id);
     void sameDocument.then(async same => {
       if (documentId && tabDocuments[String(id)] !== documentId) return;
+      // The page's own once-a-second check can run far less often in a hidden tab (Firefox's
+      // minimized window for app-opened chats, 2026-10-15); a Send waiting there on its new
+      // chat's address learns it now. Messages reach such a page at once; its timers do not.
+      if (same) void tabReply(id, { type: 'clf-route-changed' }, { documentId }).catch(() => undefined);
       await activeTabs?.navigation(id, same ? tab : null);
       if (rendering && same) return maintain(true);
     }).catch(() => undefined);
@@ -4664,7 +5277,10 @@ async function placeSuccessorChat(raw, tabId) {
   const query = [marker];
   if (model) query.push(`model=${encodeURIComponent(model)}`);
   if (reasoningEffort) query.push(`reasoning_effort=${encodeURIComponent(reasoningEffort)}`);
-  const create = { url: `${base}?${query.join('&')}#${marker}`, windowId: home.windowId, active: raw.active !== false };
+  // A chat in the app's own tab group sits in the user's window (#128): its successor joins that
+  // group without being selected, since selecting it would switch what the user is looking at.
+  const grouped = await inAppGroup(home).catch(() => false);
+  const create = { url: `${base}?${query.join('&')}#${marker}`, windowId: home.windowId, active: !grouped && raw.active !== false };
   // Directly after the chat it continues, so a handoff reads as one piece of work instead of a
   // tab appended to the far end of a long strip.
   if (typeof home.index === 'number') create.index = home.index + 1;
@@ -4674,6 +5290,10 @@ async function placeSuccessorChat(raw, tabId) {
   } catch (error) {
     await failPlacement(`successor_tab_create_failed: ${placementError(error)}`);
     return;
+  }
+  if (grouped && Number.isInteger(created?.id)) {
+    // A group gone in between leaves the tab beside its home, inactive; nothing else changes.
+    await chrome.tabs.group({ groupId: home.groupId, tabIds: [created.id] }).catch(() => undefined);
   }
   try {
     await protectCreatedTab(created, id);
@@ -4800,8 +5420,9 @@ function recoverDeferredRevivals() {
       const url = deferredRevivalUrl(entry);
       if (!url) continue;
       try {
-        // A worker revival is background work; do not select its tab in the user's window.
-        const created = await chrome.tabs.create({ url, active: false });
+        // A worker revival is background work; do not select its tab in the user's window. In
+        // tab-group mode it joins the app's group like every other background tab (#128).
+        const created = groupsAvailable() ? await createChatTab(url, true) : await createUserWindowTab(url, false);
         if (created && typeof created.id === 'number') tabs.push({ ...created, url });
       } catch {
         // Opening authority stays spent even if Chrome rejects creation. The app's command
@@ -4943,6 +5564,10 @@ chrome.runtime.onInstalled.addListener(() => {
 
 if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 'function') {
   chrome.runtime.onStartup.addListener(() => {
+    // A new browser session numbers its windows afresh; an old background window id means nothing.
+    void chrome.storage.local.remove(BACKGROUND_WINDOW_MIRROR).catch(() => undefined);
+    // Tab-group ids are per browser session too (#128).
+    void chrome.storage.local.remove(BACKGROUND_GROUP_MIRROR).catch(() => undefined);
     void load()
       .then(() => drainCommandAcks())
       .then(() => drain())
@@ -4955,9 +5580,34 @@ if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 
   });
 }
 
+/**
+ * Archives one retired worker chat the app has queued (#1460), from any ChatGPT page of this
+ * extension: the archive is an account-level request, so it needs no tab of that chat. At most
+ * one per pass. Without such a page the app hears `deferred`, which costs no attempt.
+ */
+async function drainWorkerArchive() {
+  await load();
+  const next = await call('/worker-archive/next', { method: 'POST', body: '{}' });
+  const conversationId = next.ok ? cleanConversationId(next.data?.conversationId) : null;
+  if (!conversationId) return;
+  let outcome = 'deferred';
+  for (const tab of await chrome.tabs.query({ url: ['https://chatgpt.com/*'] })) {
+    const documentId = tab.id === undefined ? null : tabDocuments[String(tab.id)];
+    if (!documentId) continue;
+    let reply;
+    try { reply = await chrome.tabs.sendMessage(tab.id, { type: 'clf-archive-chat', conversationId }, { documentId }); }
+    catch { continue; } // that document is gone; another page may still do it
+    outcome = reply?.outcome === 'archived' ? 'archived' : 'failed';
+    break;
+  }
+  await call('/worker-archive/result', { method: 'POST', body: JSON.stringify({ conversationId, outcome }) });
+}
+
 if (chrome.alarms && chrome.alarms.onAlarm && typeof chrome.alarms.onAlarm.addListener === 'function') {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (!alarm || alarm.name !== RETRY_ALARM) return;
+    // Independent of the command passes below: a failure in either never holds up the other.
+    void drainWorkerArchive().catch(() => undefined);
     void drainCommandAcks()
       .then(() => drain())
       .then(() => drainCloses())
@@ -5148,6 +5798,12 @@ if (!globalThis.__cosBrowserWorker) {
     if (changeInfo.status === 'complete' && signInStage(tab?.url || '') === 'done') void reportPresence();
   });
 }
+// A tab moved into or out of the app's tab group is told at once: Chrome pauses a collapsed
+// group's tabs within seconds, long before the next maintenance pass (#128).
+chrome.tabs.onUpdated.addListener((_id, changeInfo, tab) => {
+  if (changeInfo.groupId === undefined || !tab || !isChatGptUrl(tab.pendingUrl || tab.url || '')) return;
+  void load().then(() => syncKeepAwake([tab], false)).catch(() => undefined);
+});
 
 void load()
   .then(() => ensurePaired())

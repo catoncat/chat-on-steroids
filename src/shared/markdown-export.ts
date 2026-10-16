@@ -4,7 +4,8 @@ import { continuationMarkerOf, workSequence, type SessionEvent, type StoredText 
    decides where the actions appear) and main (which reads full texts and writes files) agree on
    exactly which messages a turn's answer or a session transcript contains. */
 
-export type TranscriptEntry = { role: 'user' | 'assistant'; stored: StoredText; turnId: string | null; seq: number };
+/** `html`: an answer's recorded drawing, which can hold what its Markdown left out (#1477). */
+export type TranscriptEntry = { role: 'user' | 'assistant'; stored: StoredText; turnId: string | null; seq: number; html?: StoredText };
 
 type Said = Extract<SessionEvent, { kind: 'user_message' | 'assistant_message' }>;
 
@@ -37,7 +38,8 @@ export function transcriptEntries(events: readonly SessionEvent[]): TranscriptEn
     .filter(({ latest }) => !continuationMarkerOf(latest.message.text) && spoken(latest).text.trim())
     .sort((a, b) => a.place - b.place || a.latest.seq - b.latest.seq)
     .map(({ latest }) => ({ role: latest.kind === 'user_message' ? 'user' as const : 'assistant' as const,
-      stored: spoken(latest), turnId: latest.turnId ?? null, seq: latest.seq }));
+      stored: spoken(latest), turnId: latest.turnId ?? null, seq: latest.seq,
+      ...(latest.kind === 'assistant_message' && latest.renderedHtml ? { html: latest.renderedHtml } : {}) }));
 }
 
 /** Turns the page reported as completed; only these offer copy and export. */
@@ -84,7 +86,8 @@ export function sessionMarkdown(title: string, entries: readonly { role: 'user' 
 
 /** A file name from a chat title that every desktop file system accepts. */
 export function markdownFileName(title: string, suffix = ''): string {
+  // The 80-unit limit must not leave half a surrogate pair in the saved filename.
   const base = title.normalize('NFC').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim()
-    .replace(/[. ]+$/, '').slice(0, 80).trim() || 'chat';
+    .replace(/[. ]+$/, '').slice(0, 80).replace(/[\uD800-\uDBFF]$/, '').trim() || 'chat';
   return `${base}${suffix}.md`;
 }
