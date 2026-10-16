@@ -14,6 +14,7 @@ import type { SessionSearchLocation, SessionSearchReply, SessionSearchResult, Se
 import { positionOf } from '../../shared/chronology.js';
 import { transcriptEntries } from '../../shared/markdown-export.js';
 import { indexedSessions, readEvents, readOverflowText, sessionSearchIndexPath } from './store.js';
+import { providerEntitiesAsMarkdown } from '../../shared/content-reference.js';
 import { logWarn } from '../logger.js';
 
 /** Plenty for a long chat's words; a runaway transcript is cut, not stored whole. */
@@ -72,9 +73,9 @@ async function transcriptText(id: string): Promise<string> {
   const parts: string[] = [];
   let size = 0;
   for (const entry of transcriptEntries(events)) {
-    const text = entry.stored.truncated && entry.stored.assetId
+    const text = providerEntitiesAsMarkdown(entry.stored.truncated && entry.stored.assetId
       ? (await readOverflowText(id, entry.stored.assetId)) ?? entry.stored.text
-      : entry.stored.text;
+      : entry.stored.text);
     const clean = text.replace(/\s+/g, ' ').trim();
     if (!clean) continue;
     parts.push(clean);
@@ -175,28 +176,42 @@ export async function searchSessions(query: string, limit = MAX_SEARCH_RESULTS):
   startIndexing();
   const indexed = summaries.filter(summary => current.get(summary.id) === stampOf(summary)).length;
   if (!terms.length) return { results: [], indexed, total: summaries.length };
-  const byTitle: SessionSearchResult[] = [], byText: SessionSearchResult[] = [];
+  const results: SessionSearchResult[] = [];
+  const textCandidates: Array<{ summary: SessionSummary; title: string }> = [];
+  const resultFor = (summary: SessionSummary, title: string): SessionSearchResult => {
+    const titleMatches = matchRanges(title, terms);
+    return { id: summary.id, title: summary.title, projectId: summary.projectId ?? null, ...(titleMatches.length ? { titleMatches } : {}) };
+  };
+  // Rank the entire title catalog before touching text. An early text cutoff previously
+  // hid older title matches, while common title queries allocated every matching result.
   for (const summary of summaries) {
     const title = foldCase(summary.title);
-    const titleMatches = matchRanges(title, terms);
-    const result: SessionSearchResult = { id: summary.id, title: summary.title, projectId: summary.projectId ?? null, ...(titleMatches.length ? { titleMatches } : {}) };
-    if (terms.every(term => title.includes(term))) { byTitle.push(result); continue; }
+    if (terms.every(term => title.includes(term))) {
+      results.push(resultFor(summary, title));
+      if (results.length > limit) return { results: results.slice(0, limit), indexed, total: summaries.length, limited: true };
+    } else textCandidates.push({ summary, title });
+  }
+  for (const { summary, title } of textCandidates) {
+    const stamp = stampOf(summary);
+    // An old cache entry is not evidence of what a revised chat currently says. Until
+    // its new index commits, it belongs only to the indexing progress, not the results.
+    if (current.get(summary.id) !== stamp) continue;
     let entry = cache.get(summary.id);
-    if (!entry && current.has(summary.id)) {
+    if (!entry || entry.stamp !== stamp) {
       // Indexed earlier but pushed out of memory: read the stored index again.
-      const text = await storedIndex(summary.id, current.get(summary.id)!);
-      if (text !== null) entry = remember(summary.id, current.get(summary.id)!, text);
+      const text = await storedIndex(summary.id, stamp);
+      if (current.get(summary.id) !== stamp) continue;
+      entry = text !== null ? remember(summary.id, stamp, text) : undefined;
     }
     if (!entry) continue;
     // A word may be in the title and the rest in the text.
     if (terms.every(term => title.includes(term) || entry!.lower.includes(term))) {
       const inText = terms.filter(term => entry!.lower.includes(term));
-      byText.push({ ...result, snippet: snippetFor(entry.text, entry.lower, inText) });
+      results.push({ ...resultFor(summary, title), snippet: snippetFor(entry.text, entry.lower, inText) });
     }
-    if (byTitle.length + byText.length >= limit * 2) break;
+    if (results.length > limit) break;
   }
-  const found = byTitle.length + byText.length;
-  return { results: [...byTitle, ...byText].slice(0, limit), indexed, total: summaries.length, ...(found > limit ? { limited: true } : {}) };
+  return { results: results.slice(0, limit), indexed, total: summaries.length, ...(results.length > limit ? { limited: true } : {}) };
 }
 
 /** Waits for background indexing to finish; for tests. */
@@ -208,6 +223,36 @@ export function resetSessionSearchForTests(): void {
   cache.clear(); cachedChars = 0; current.clear(); indexingWanted = false;
 }
 
+/** Most matches one find returns; a chat with more is searched with a longer phrase. */
+const MAX_FIND_RESULTS = 500;
+
+/**
+ * Find in chat (Codex's ⌘F): every message of one chat holding the phrase, in the order they were
+ * said. Case and runs of white space do not matter. Read from the whole recording, so a match far
+ * above the page the window holds is found too.
+ */
+export async function findInSession(id: string, query: string): Promise<SessionSearchLocation[]> {
+  const phrase = foldCase(query.replace(/\s+/g, ' ').trim());
+  if (!phrase) return [];
+  const events = await readEvents(id, { kinds: ['user_message', 'assistant_message'] });
+  const found: SessionSearchLocation[] = [];
+  for (const entry of transcriptEntries(events)) {
+    const text = entry.stored.truncated && entry.stored.assetId
+      ? (await readOverflowText(id, entry.stored.assetId)) ?? entry.stored.text
+      : entry.stored.text;
+    if (!foldCase(text.replace(/\s+/g, ' ')).includes(phrase)) continue;
+    const event = events.find(candidate => candidate.seq === entry.seq);
+    if (!event || (event.kind !== 'user_message' && event.kind !== 'assistant_message')) continue;
+    const messageId = event.messageId ?? null;
+    const position = Math.min(...events
+      .filter(other => other === event || (messageId !== null && other.kind === event.kind && other.messageId === messageId))
+      .map(other => positionOf(other)));
+    found.push({ seq: event.seq, kind: event.kind, messageId, position });
+    if (found.length >= MAX_FIND_RESULTS) break;
+  }
+  return found;
+}
+
 /**
  * The first message of a chat holding any of the query's words: where its snippet came from, so the
  * chat can open there instead of at its end. Read only when a result is opened, from the recording.
@@ -217,9 +262,9 @@ export async function locateSearchMatch(id: string, query: string): Promise<Sess
   if (!terms.length) return null;
   const events = await readEvents(id, { kinds: ['user_message', 'assistant_message'] });
   for (const entry of transcriptEntries(events)) {
-    const text = entry.stored.truncated && entry.stored.assetId
+    const text = providerEntitiesAsMarkdown(entry.stored.truncated && entry.stored.assetId
       ? (await readOverflowText(id, entry.stored.assetId)) ?? entry.stored.text
-      : entry.stored.text;
+      : entry.stored.text);
     const lower = foldCase(text.replace(/\s+/g, ' '));
     if (!terms.some(term => lower.includes(term))) continue;
     const event = events.find(candidate => candidate.seq === entry.seq);

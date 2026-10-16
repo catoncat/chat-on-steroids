@@ -27,7 +27,7 @@ import { localhostHostValidation, localhostOriginValidation, toNodeHandler } fro
 import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
 import { buildServer, resetToolClock, type ToolContext } from './tools.js';
-import { SURFACE_IDS, surfaceDefinition, type SurfaceId } from './surfaces.js';
+import { SURFACE_IDS, configuredConnectorName, type SurfaceId } from './surfaces.js';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
@@ -260,9 +260,11 @@ export function forgetExposedSurface(): void {
   surfaceExposure.clear();
 }
 
-export async function startMcpServer(getContext: () => ToolContext): Promise<McpEndpoint> {
+export async function startMcpServer(getContext: () => ToolContext, kept: Partial<Record<SurfaceId, string>> = {}): Promise<McpEndpoint> {
   // A per-session token in the path is what authorises callers. It is regenerated on
-  // every app start, so a URL that leaks stops working when the app restarts.
+  // every app start, so a URL that leaks stops working when the app restarts, unless the
+  // user opted into keeping it (`mcp.persistentUrls`, see persistent-paths.ts): then the
+  // caller passes each surface's stored token, and only a well-formed one is used.
   requestSeenAt = null;
   surfaceRequestAt.clear();
   resetToolClock();
@@ -274,7 +276,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   // Desktop" and "give me everything" the same act.
   const surfacePaths = SURFACE_IDS.map((id) => ({
     id,
-    basePath: `/mcp/${id}/${randomBytes(32).toString('base64url')}`
+    basePath: `/mcp/${id}/${kept[id] && /^[A-Za-z0-9_-]{43}$/.test(kept[id]!) ? kept[id] : randomBytes(32).toString('base64url')}`
   }));
 
   // ChatGPT can keep a cached tools/list snapshot for the lifetime of a connector
@@ -388,7 +390,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     if (prmRoute) {
       if (!checkHost(req, res)) return;
       if (!checkOrigin(req, res)) return;
-      const body = protectedResourceMetadata(prmRoute.url, surfaceDefinition(prmRoute.id).connectorName);
+      const body = protectedResourceMetadata(prmRoute.url, configuredConnectorName(prmRoute.id));
       res.writeHead(200, {
         'content-type': 'application/json',
         'cache-control': 'no-store',
@@ -443,7 +445,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
       };
       res.once('finish', release);
       res.once('close', release);
-      withInboundRequestId(requestId, () => void route.handler(req, res, body), timing, publication);
+      withInboundRequestId(requestId, () => void route.handler(req, res, body), timing, publication, !selfTest && !tunnelProbe);
     };
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       void readBoundedJsonBody(req).then((parsed) => {

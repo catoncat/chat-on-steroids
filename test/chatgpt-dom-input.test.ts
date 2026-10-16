@@ -528,6 +528,44 @@ describe('native Project entry readiness', () => {
     expect(failure).toHaveBeenCalledWith('transition-timeout:last=source-route');
   });
 
+  it('clicks again when ChatGPT rewrites the source route under the first click', async () => {
+    // Measured 2026-10-10: a replacement tab opens /c/<id>; ChatGPT rewrites it to /g/<id>/c/<chat>
+    // and then to /g/<id>-<name>/c/<chat>. A click between the two was taken by the router and
+    // dropped by the second rewrite, so the entry timed out on the source chat (8 of 14 attempts).
+    const link = sourceLink(`<a href="/g/${entry.id}/project"><span>Homelab</span></a>`);
+    box.textContent = '';
+    let clicks = 0;
+    link.addEventListener('click', event => {
+      event.preventDefault(); clicks++;
+      if (clicks === 1) {
+        // The router's own rewrite takes this click away.
+        dom.window.setTimeout(() => dom.reconfigure({ url: `https://chatgpt.com/g/${entry.id}-homelab/c/${entry.sourceConversationId}` }), 200);
+        return;
+      }
+      dom.reconfigure({ url: projectUrl });
+    });
+    const entered = api.enterProject(entry);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await entered).toBe(true);
+    expect(clicks).toBe(2);
+  });
+
+  it('stops clicking after two rewrites and still gives up within the transition deadline', async () => {
+    const link = sourceLink(`<a href="/g/${entry.id}/project"><span>Homelab</span></a>`);
+    box.textContent = '';
+    let clicks = 0;
+    link.addEventListener('click', event => {
+      event.preventDefault(); clicks++;
+      dom.window.setTimeout(() => dom.reconfigure({ url: `https://chatgpt.com/g/${entry.id}-v${clicks}/c/${entry.sourceConversationId}` }), 100);
+    });
+    const failure = vi.fn();
+    const entered = api.enterProject(entry, undefined, failure);
+    await vi.advanceTimersByTimeAsync(12_500);
+    expect(await entered).toBe(false);
+    expect(clicks).toBe(3);
+    expect(failure).toHaveBeenCalledWith(expect.stringMatching(/^transition-timeout:last=source-route/));
+  });
+
   it('reports a Project route whose editor never becomes ready after the one click', async () => {
     const link = sourceLink();
     box.textContent = '';
@@ -781,6 +819,26 @@ describe('Core app mention on app-owned sends (#861)', () => {
     expect(token.getAttribute('data-prompt-link-label')).toBe('$chat-on-steroids-core');
     expect(clicked.textContent!.trim().startsWith('Exact app prompt')).toBe(true);
     expect(api.messages().find(message => message.role === 'user')?.text).toBe('Exact app prompt');
+  });
+  it('clicks Send once the editor drew the token while this page\'s timers are held back', async () => {
+    // 2026-10-15, Firefox: in the minimized window that holds app-opened chats, a 0 ms timer
+    // fired 25 s late. The editor had drawn the token at once; the wait for one task was the delay.
+    (dom.window as unknown as { MessageChannel: typeof MessageChannel }).MessageChannel = MessageChannel;
+    let clicked = false;
+    button.addEventListener('click', () => {
+      clicked = true;
+      dom.reconfigure({ url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' });
+      mentionedUser('Exact app prompt'); box.replaceChildren();
+    });
+    const result = api.send({ mention });
+    // Real tasks pass; no timer of this page fires.
+    for (let task = 0; task < 5 && !clicked; task++) await new Promise(resolve => {
+      const channel = new MessageChannel();
+      channel.port1.onmessage = () => { channel.port1.close(); resolve(null); };
+      channel.port2.postMessage(null);
+    });
+    expect(clicked).toBe(true);
+    expect(await result).toBe(true);
   });
   it('removes its own token again when Send is not accepted', async () => {
     const result = api.send({ mention, acceptanceTimeoutMs: 1000 });
@@ -1084,6 +1142,37 @@ describe('native image readiness', () => {
     expect(await draft.clear()).toBe(true);
     expect(api.hasComposerAttachments()).toBe(false); draft.dispose();
   });
+  it.each(['Quitar', 'Remove', '削除'])('accepts the current two-button file tile before authorizing Send (%s)', async removeLabel => {
+    const input = upload(); input.accept = '';
+    const draft = api.captureComposerDraft('Exact app prompt');
+    input.addEventListener('change', () => {
+      const host = document.createElement('div'); host.setAttribute('data-composer-attachments', '');
+      host.innerHTML = `<span><span><span>notes.zip</span><button type="button" aria-label="notes.zip"></button></span><button type="button" aria-label="${removeLabel} notes.zip"></button></span>`;
+      document.querySelector('form')!.append(host);
+    });
+    const file = new dom.window.File(['exact bytes'], 'notes.zip', { type: 'application/zip' });
+    const uploaded = api.uploadImages([], () => true, draft, [file]);
+    let ready = false; void uploaded.then(value => { ready = value; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ready).toBe(true);
+    expect(await uploaded).toBe(true);
+    expect(api.hasComposerAttachments()).toBe(true);
+    expect(draft.current()).toBe(true);
+    const authorize = vi.fn(async () => true);
+    button.addEventListener('click', () => user('Exact app prompt'));
+    expect(await api.send({ beforeSend: authorize })).toBe(true);
+    expect(authorize).toHaveBeenCalledTimes(1);
+    draft.dispose();
+  });
+  it.each(['extra action', 'wrong filename', 'outside attachments'])('refuses an ambiguous current file tile (%s)', change => {
+    const host = document.createElement('div'); host.setAttribute('data-composer-attachments', '');
+    host.innerHTML = '<span><span><span>notes.zip</span><button type="button" aria-label="notes.zip"></button></span><button type="button" aria-label="Quitar notes.zip"></button></span>';
+    if (change === 'extra action') host.firstElementChild!.append(document.createElement('button'));
+    if (change === 'wrong filename') host.querySelector('span span span')!.textContent = 'other.zip';
+    if (change === 'outside attachments') host.removeAttribute('data-composer-attachments');
+    document.querySelector('form')!.append(host);
+    expect(api.hasComposerAttachments()).toBe(false);
+  });
   it.each([false, true])('uses the current composer upload kind with dynamic ids (files=%s)', async files => {
     const input = upload(); input.id = '_r_photo_';
     if (files) { input.id = '_r_file_'; input.accept = ''; }
@@ -1276,6 +1365,74 @@ describe('native image readiness', () => {
   });
 });
 
+
+describe('transport failures in German', () => {
+  // Measured 2026-10-14 on a German account: a long answer whose stream broke showed
+  // "Verbindung unterbrochen…" after every reload, and its end the delivery timeout alert with
+  // "Erneut versuchen". Neither was a failure, so each recovery reload claimed a phantom turn.
+  it('recognises the delivery timeout alert with its localized Retry', () => {
+    const alert = document.createElement('div');
+    alert.setAttribute('role', 'alert');
+    alert.innerHTML = '<p>Zeitüberschreitung bei der Übermittlung der Nachricht. Bitte versuche es erneut.</p><button>Erneut versuchen</button>';
+    document.body.append(alert);
+    expect(api.errors()).toEqual([expect.objectContaining({ recoverable: true })]);
+    alert.remove();
+  });
+
+  it('recognises the interrupted-connection notice', () => {
+    const card = document.createElement('div');
+    card.innerHTML = '<p>Verbindung unterbrochen. Warten auf die vollständige Antwort.</p><button>Erneut versuchen</button>';
+    document.body.append(card);
+    expect(api.errors()).toEqual([
+      expect.objectContaining({ text: 'Verbindung unterbrochen. Warten auf die vollständige Antwort.', recoverable: true })
+    ]);
+    card.remove();
+  });
+
+  it('still ignores other German announcements', () => {
+    for (const text of ['Einstellungen gespeichert', 'Die Verbindung wurde unterbrochen, als ich den Server neu startete.']) {
+      const alert = document.createElement('div');
+      alert.setAttribute('role', 'alert');
+      alert.textContent = text;
+      document.body.append(alert);
+      expect(api.errors(), text).toEqual([]);
+      alert.remove();
+    }
+  });
+});
+
+describe('transport failures in Portuguese', () => {
+  // Measured 2026-10-12 on a pt-BR account: a send ChatGPT could not deliver showed this alert with
+  // its Retry button, and the dropped answer "Conexão interrompida…". Read only in English, neither
+  // was a failure, so the undelivered message counted as sent and nothing retried it.
+  it('recognises the delivery timeout alert with its localized Retry', () => {
+    const alert = document.createElement('div');
+    alert.setAttribute('role', 'alert');
+    alert.innerHTML = '<p>A entrega da mensagem atingiu o tempo limite. Tente novamente.</p><button>Tentar novamente</button>';
+    document.body.append(alert);
+    expect(api.errors()).toEqual([expect.objectContaining({ recoverable: true })]);
+    alert.remove();
+  });
+
+  it('recognises the interrupted-connection card by its Retry control', () => {
+    const card = document.createElement('div');
+    card.innerHTML = '<p>Conexão interrompida. Aguardando a resposta completa </p><button>Tentar novamente</button>';
+    document.body.append(card);
+    expect(api.errors()).toEqual([
+      expect.objectContaining({ text: 'Conexão interrompida. Aguardando a resposta completa', recoverable: true })
+    ]);
+    card.remove();
+  });
+
+  it('still ignores other Portuguese announcements', () => {
+    const alert = document.createElement('div');
+    alert.setAttribute('role', 'alert');
+    alert.textContent = 'Configurações salvas';
+    document.body.append(alert);
+    expect(api.errors()).toEqual([]);
+    alert.remove();
+  });
+});
 
 describe('transport-card scan cost', () => {
   it('skips hundreds of sidebar buttons without reading innerText and still finds the real card', () => {
@@ -1543,5 +1700,29 @@ describe('locale-independent provider composer evidence', () => {
     expect(tool.getAttribute('data-clf-native-hidden')).toBe('1');
     expect(disclosure.getAttribute('data-clf-native-hidden')).toBe('1');
     expect(action.closest('[data-clf-native-hidden]')).toBeNull();
+  });
+});
+
+// 2026-10-15: the diagnostics report says which of ChatGPT's controls the extension still finds,
+// so a report after ChatGPT changed its page says what broke without a follow-up question.
+describe('page checks for the diagnostics report', () => {
+  type Checks = { composer: boolean; sendArea: boolean; modelMenu: boolean; plusMenu: boolean; language: string | null };
+  const checks = () => (api as unknown as { pageChecks(): Checks }).pageChecks();
+
+  it('finds the composer, its send area and the model menu on a normal page, and names the page language', () => {
+    document.documentElement.lang = 'de-DE';
+    const plus = document.createElement('button'); plus.id = 'composer-plus-btn'; document.querySelector('form')!.prepend(plus);
+    expect(checks()).toEqual({ composer: true, sendArea: true, modelMenu: true, plusMenu: true, language: 'de-DE' });
+    // Measured 2026-10-15: the current composer's + button has no id, only its navigation target.
+    plus.removeAttribute('id'); plus.setAttribute('data-composer-navigation-target', 'add-context');
+    expect(checks().plusMenu).toBe(true);
+    plus.remove();
+    expect(checks().plusMenu).toBe(false);
+  });
+
+  it('says what is missing when ChatGPT moved things, and reports no text from the page', () => {
+    document.querySelector('form')!.remove();
+    document.documentElement.lang = 'en <script>';
+    expect(checks()).toEqual({ composer: false, sendArea: false, modelMenu: false, plusMenu: false, language: null });
   });
 });

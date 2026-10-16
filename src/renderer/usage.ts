@@ -1,7 +1,9 @@
 import { currentLanguage, ui, t } from './i18n.js';
 import { $, el, run } from './dom.js';
 import { DEFAULT_USAGE_FORMULA, usageDateKey as dateKey, usageEstimate, usageMessageTotals, usageModelGroups, usageRate, usageWeekStart, type UsageFormula, type UsageOverview } from '../shared/usage.js';
+import type { ProviderUsage } from '../shared/provider-usage.js';
 let snapshot: UsageOverview | null = null;
+let otherAppsGeneration = 0;
 let loadGeneration = 0;
 const FORMULA_KEY = 'usage-formula-v1';
 const WEEK_START_KEY = 'cos.usage.weekStart';
@@ -13,7 +15,9 @@ function saveFormula(): void {
 
 // In the app's language, like every other number on this page, not the system region's: an English
 // page read "4.082,99 $" and "8,5 Mrd." on a German Mac. Created per call so a language change applies.
-const count = { format: (value: number) => new Intl.NumberFormat(currentLanguage(), { notation: 'compact', maximumFractionDigits: 1 }).format(value) };
+// Token counts are estimates with fractions; whole numbers first. Compact notation abbreviates
+// thousands in English ("307.4K") but not in German, which showed "307.373,5" tokens.
+const count = { format: (value: number) => new Intl.NumberFormat(currentLanguage(), { notation: 'compact', maximumFractionDigits: 1 }).format(Math.round(value)) };
 const money = { format: (value: number) => new Intl.NumberFormat(currentLanguage(), { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(value) };
 const featureLabels: Record<string, string> = { deep_research: "Deep research", file_upload: "File uploads", paste_text_to_file: "Pasted text files", image_gen: "Image generation" };
 function usageHint(node: HTMLElement, text: string | (() => string)): void {
@@ -52,9 +56,10 @@ function paintMessages(): void {
   ui($('usageMessagePeriod'), 'textContent', period);
   ui(select, 'title', () => `${t('Change start day')}\n${period()}`);
 }
-export async function refreshUsage(): Promise<void> {
+export async function refreshUsage(fresh = false): Promise<void> {
   document.getElementById('usageTooltip')?.remove();
   const generation = ++loadGeneration;
+  void refreshOtherApps(fresh);
   $('refreshUsage').setAttribute('disabled', '');
   const status = $('usageStatus');
   ui(status, 'textContent', () => t("Updating usage in the background. After an update, this can take a few minutes. You can keep using the app."));
@@ -120,7 +125,9 @@ function dayLabel(key: string): string {
 function paintCost(): void {
   if (!snapshot) return;
   const total = usageEstimate(snapshot.models, formula);
-  const costText = (estimate: ReturnType<typeof usageEstimate>) => estimate.unpricedTokens > 0 ? t("{0} + unpriced", [money.format(estimate.cost)]) : money.format(estimate.cost);
+  // Tokens without a rate make the priced sum a lower bound: "≥ $0.29", which fits the card on one
+  // line and reads in every language; the hint and the sentence below name the unpriced tokens.
+  const costText = (estimate: ReturnType<typeof usageEstimate>) => estimate.unpricedTokens > 0 ? `≥ ${money.format(estimate.cost)}` : money.format(estimate.cost);
   const costSummary = document.getElementById('usageTotalCost');
   if (costSummary) {
     ui(costSummary.querySelector('strong')!, 'textContent', () => costText(total));
@@ -143,9 +150,11 @@ function paintCost(): void {
   const grid = el('div', 'heat-grid'); grid.setAttribute('role', 'group');
   grid.style.gridTemplateColumns = `var(--heat-label) repeat(${weeks}, minmax(0, 1fr))`;
   const place = (node: HTMLElement, row: number, column: string) => { node.style.gridRow = String(row); node.style.gridColumn = column; grid.append(node); };
-  for (let row = 0; row < 7; row += 2) {
+  // Every row owns its label cell, named on every other day: the column stays opaque while a
+  // narrow window scrolls the weeks underneath it.
+  for (let row = 0; row < 7; row += 1) {
     const label = el('span', 'heat-day'); label.setAttribute('aria-hidden', 'true');
-    ui(label, 'textContent', () => new Date(2026, 8, 21 + row).toLocaleDateString(currentLanguage(), { weekday: 'short' }));
+    if (row % 2 === 0) ui(label, 'textContent', () => new Date(2026, 8, 21 + row).toLocaleDateString(currentLanguage(), { weekday: 'short' }));
     place(label, row + 2, '1');
   }
   // Label each of the twelve months, including a month starting in the current week.
@@ -177,6 +186,8 @@ function paintCost(): void {
   for (let level = 0; level <= 4; level++) { const swatch = el('span', 'heat-cell'); swatch.dataset.level = String(level); legend.append(swatch); }
   legend.append(el('span', '', () => t('More')));
   heat.append(grid, legend);
+  // The newest weeks are the ones worth seeing; a narrow window scrolls the year sideways.
+  setTimeout(() => { const box = heat.parentElement; if (box && box.scrollWidth > box.clientWidth) box.scrollLeft = box.scrollWidth; }, 0);
   ui($('usageHeatmapCaption'), 'textContent', () => t("Estimated context processed per tool call · last 52 weeks"));
   ui($('usageFormula'), 'textContent', () => t("Final frontend context (capped at {2} tokens for this estimate) × unique tool calls ÷ {0} × each model’s cached-input rate ÷ 1M × {1}.", [formula.divisor, formula.multiplier, snapshot!.contextTokenCap.toLocaleString(currentLanguage())]));
   ui($('usageCost'), 'textContent', () => t("{0} estimated equivalent. {1}This is a comparison, not a bill.", [costText(total), total.unpricedTokens ? t("{0} tokens have no rate. ", [Math.round(total.unpricedTokens).toLocaleString(currentLanguage())]) : '']));
@@ -220,6 +231,75 @@ function paintCost(): void {
   daySection.append(breakdown);
   $('usageDays').replaceChildren(modelSection, daySection);
 }
+/** A limit row in the page's own shape: a name with a note, then the value, its reset and a bar. */
+function limitRow(name: () => string, note: (() => string) | null, value: () => string, small: () => string, remainingPercent: number | null): HTMLElement {
+  const row = el('div', 'usage-limit');
+  const title = el('div'); title.append(el('strong', '', name));
+  if (note) title.append(el('small', 'muted', note));
+  const detail = el('div'); detail.append(el('b', '', value), el('small', 'muted', small));
+  if (remainingPercent !== null) {
+    const progress = document.createElement('progress'); progress.max = 100; progress.value = remainingPercent;
+    ui(progress, 'aria-label', () => t("{0}: {1}% remaining", [name(), Math.round(remainingPercent)]));
+    detail.append(progress);
+  }
+  row.append(title, detail);
+  return row;
+}
+
+const codexWindowName = (minutes: number) => minutes === 10080 ? t("Weekly limit") : minutes % 60 === 0 ? t("{0}-hour limit", [minutes / 60]) : t("{0}-minute limit", [minutes]);
+/** Codex's reason codes for a reached limit, as a sentence; an unknown code stays readable as it is. */
+const codexReason = (code: string): string =>
+  code === 'workspace_owner_credits_depleted' ? t("The workspace's Codex credits are used up") : code.replace(/_/g, ' ');
+const when = (time: number) => new Date(time).toLocaleString(currentLanguage(), { dateStyle: 'short', timeStyle: 'short' });
+
+/**
+ * Codex's and Claude Code's usage (#482). What an app's provider reported is kept apart from what
+ * was counted from the logs here, and a window that has reset since its reading says so instead of
+ * showing an old percentage as current.
+ */
+export async function refreshOtherApps(fresh = false): Promise<void> {
+  const generation = ++otherAppsGeneration;
+  const host = $('otherAppsUsage');
+  let value: ProviderUsage | null | undefined;
+  try { value = await run(window.api.getProviderUsage(fresh)); } catch { value = null; }
+  if (generation !== otherAppsGeneration) return;
+  host.replaceChildren();
+  if (!value) { host.append(el('p', 'muted', () => t("Usage of other apps could not be read. Try Refresh."))); return; }
+  if (!value.enabled) { host.append(el('p', 'muted', () => t("Off. Nothing is read from other apps."))); return; }
+  const now = Date.now();
+  const lastWeek = (tokens: number[]) => tokens.reduce((sum, value) => sum + value, 0);
+  if (!value.codex) host.append(el('p', 'muted', () => t("No Codex logs on this computer.")));
+  else {
+    for (const limit of value.codex.limits) {
+      const as = () => t("Reported by Codex {0}", [when(limit.observedAt)]);
+      for (const window of limit.windows) {
+        const reset = window.resetsAt !== null && window.resetsAt <= now;
+        const remaining = Math.max(0, 100 - window.usedPercent);
+        host.append(limitRow(() => `Codex · ${codexWindowName(window.windowMinutes)}`, as,
+          () => reset ? t("Reset since this reading") : t("{0}% remaining", [Math.round(remaining)]),
+          () => window.resetsAt === null ? t("Reset not reported") : reset ? t("Codex reports again with its next answer") : t("Resets {0}", [when(window.resetsAt)]),
+          reset ? null : remaining));
+      }
+      if (limit.reached && !limit.windows.length) host.append(limitRow(() => `Codex · ${limit.id}`, as, () => t("Limit reached"), () => codexReason(limit.reached!), null));
+    }
+    const days = value.codex.days;
+    const today = days.at(-1);
+    host.append(limitRow(() => t("Codex · tokens"), () => t("Counted from Codex's logs on this computer"),
+      () => t("{0} today", [count.format(today ? today.input + today.output : 0)]),
+      () => t("{0} in 7 days", [count.format(lastWeek(days.map(day => day.input + day.output)))]), null));
+  }
+  if (!value.claude) host.append(el('p', 'muted', () => t("No Claude Code logs on this computer.")));
+  else {
+    const total = (day: NonNullable<ProviderUsage['claude']>['days'][number]) =>
+      day.models.reduce((sum, model) => sum + model.input + model.cacheWrite + model.cacheRead + model.output, 0);
+    const days = value.claude.days;
+    const today = days.at(-1);
+    host.append(limitRow(() => t("Claude Code · tokens"), () => t("Plan limits not reported: Claude Code shows them in its own /usage"),
+      () => t("{0} today", [count.format(today ? total(today) : 0)]),
+      () => t("{0} in 7 days", [count.format(lastWeek(days.map(total)))]), null));
+  }
+}
+
 export function initUsage(): void {
   try {
     const saved = localStorage.getItem(WEEK_START_KEY);
@@ -253,5 +333,5 @@ export function initUsage(): void {
     const input = $<HTMLInputElement>(id); input.value = String(formula[key]);
     input.addEventListener('input', () => { if (input.value !== '' && input.validity.valid && Number.isFinite(input.valueAsNumber)) { formula[key] = input.valueAsNumber; saveFormula(); paintCost(); } });
   }
-  $('refreshUsage').addEventListener('click', () => void refreshUsage());
+  $('refreshUsage').addEventListener('click', () => void refreshUsage(true));
 }

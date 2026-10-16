@@ -32,7 +32,7 @@ import type {
 } from '../../shared/session.js';
 import { estimateTokens, originTitle } from '../../shared/session.js';
 import { chatErrorMessageKey } from '../../shared/chat-error.js';
-import { overlappingRequestTurns, recordedRequestTurn, responseTurnId } from '../../shared/chronology.js';
+import { continuedRequestTurn, overlappingRequestTurns, recordedRequestTurn, responseTurnId, turnOpenAt } from '../../shared/chronology.js';
 import { getConfig } from '../config.js';
 import { logInfo, logWarn } from '../logger.js';
 import { redactCredentialText } from '../redaction.js';
@@ -66,7 +66,8 @@ import {
   upsertMessageEvent,
   upsertNativeImageEvent,
   writeAsset,
-  writeOverflowText
+  writeOverflowText,
+  writeTurnTrace
 } from './store.js';
 import {
   awaitRequestCorrelation,
@@ -1307,7 +1308,16 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       // Preserve the second document's observation long enough for the store to
       // record their exact same-request relation. A later question/ended response
       // still cannot steal this request from its original owner.
-      if (owner !== undefined && !(owner && target.turnId &&
+      // The one exception is a request that continued past its turn's end (#1301): a call that
+      // started after that end belongs to the live turn that began then.
+      const continued = owner ? continuedRequestTurn(stored?.timelineTurns, owner.turnId, target.turnId, input.startedAt) : undefined;
+      // And a late result of a call that started before the request continued keeps the turn
+      // that was open when it started.
+      const ownerStart = owner ? stored?.timelineTurns?.[responseTurnId(stored?.timelineTurns, owner.turnId)]?.time : undefined;
+      const earlier = owner && ownerStart !== undefined && input.startedAt < ownerStart ? turnOpenAt(stored?.timelineTurns, input.startedAt) : undefined;
+      if (earlier && owner && continuedRequestTurn(stored?.timelineTurns, earlier, owner.turnId, Number.MAX_SAFE_INTEGER) === responseTurnId(stored?.timelineTurns, owner.turnId)) {
+        target = { ...target, turnId: earlier };
+      } else if (!continued && owner !== undefined && !(owner && target.turnId &&
           overlappingRequestTurns(stored?.timelineTurns, owner.turnId, target.turnId, stored?.requestTurns, input.requestId))) {
         target = { ...target, turnId: owner?.turnId ?? null };
       }
@@ -1363,7 +1373,8 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
           ? 'recording storage limit reached'
           : message === 'Session image exceeds the recording limit' ? 'recording image size limit' : 'recording write failed';
         imageRecordingReasons.add(reason);
-        logWarn(`session image not stored: ${reason}`);
+        // The store reports being full once, as a state (#1406); other reasons keep their line.
+        if (message !== 'Global session asset quota exceeded') logWarn(`session image not stored: ${reason}`);
       }
     }
 
@@ -1724,11 +1735,15 @@ export interface ChatObservation {
     | 'assistant_message'
     | 'native_image'
     | 'page_tool'
+    | 'turn_trace'
     | 'turn_start'
     | 'turn_end'
     | 'chat_error'
-    | 'tool_evidence';
+    | 'tool_evidence'
+    | 'app_sightings';
   time: number;
+  /** app_sightings only: connector result rows as the page saw them (connector-identity.ts). */
+  apps?: import('../connector-identity.js').AppSighting[];
   /** Current native selection evidence, not a historical message or requested worker model. */
   model?: string;
   reasoningEffort?: import('../../shared/session.js').ReasoningEffort;
@@ -1766,6 +1781,10 @@ export interface ChatObservation {
   previewError?: 'not_loaded' | 'ambiguous' | 'tainted' | 'oversized' | 'invalid' | 'quota';
   previewDataUrl?: string;
   turnId?: string;
+  /** A `turn_trace` observation's round outline (shared/turn-trace.ts). */
+  trace?: import('../../shared/turn-trace.js').TurnTrace;
+  /** On `turn_trace`: the user message that opened the page turn it was read from (#1301). */
+  question?: string;
   final?: boolean;
   state?: 'streaming' | 'final';
   /** Internal React conversation id used only to cross-check the URL conversation id. */
@@ -1773,6 +1792,8 @@ export interface ChatObservation {
   outcome?: TurnOutcome;
   /** Thinking failed closes input; stream_gone only files a recoverable transport episode. */
   reason?: 'thinking_failed' | 'stream_gone';
+  /** On `turn_end`: a message sent into the running answer ended this turn and the response went on (#1301). */
+  continued?: true;
   detail?: string;
   /** Browser terminal proof; app-owned Goal policy is applied only after this is durable. */
   goalEligible?: boolean;
@@ -1780,6 +1801,8 @@ export interface ChatObservation {
   recoverable?: boolean;
   /** chat_error only: the DOM classifier identified a provider access limit, in any language. */
   blocking?: boolean;
+  /** chat_error only: provider Retry-After deadline for loading this exact conversation history. */
+  retryAt?: number;
   /** tool_evidence only: the connector requests this turn's message model holds. */
   calls?: PageCallEvidence[];
 }
@@ -2306,6 +2329,11 @@ async function recordChatObservationsNow(
         stored += await recordNativeImage(sessionId, item, base);
         continue;
       }
+      case 'turn_trace': {
+        // Presentation beside the log: no event, no activity, no work or completion evidence.
+        if (item.turnId && item.trace && await writeTurnTrace(sessionId, item.turnId, item.trace, item.question)) notifyChanged(sessionId);
+        continue;
+      }
       case 'page_tool': {
         const newlyObserved = !!live && !!item.messageId && !live.pageTools.has(pageToolKey(item.messageId));
         const written = await recordPageTool(sessionId, live, item, base);
@@ -2335,6 +2363,17 @@ async function recordChatObservationsNow(
         const text = chatErrorMessageKey(item.text ?? '', item.recoverable === true);
         const question = item.recoverable === true ? await readLatestUserMessage(sessionId) : undefined;
         const recent = await readRecentEvents(sessionId, 32, { kinds: ['chat_error'], maxBytes: 256 * 1024 });
+        // A history limit that keeps answering the same way is one notice, not one per retry: on
+        // 2026-10-11 a throttled history wrote eight identical blocking notices in eight minutes. The
+        // same limit is said again only after another blocking error came in between, or after half an
+        // hour. A passing transport failure (a stream 404) does not change the limit, and repeating it
+        // after each one still stacked the same notice (2026-10-12). Only the history limit (it carries
+        // its Retry-After): the provider access dialog keeps being recorded again after 30 s, as before.
+        const newest = recent.reduce<SessionEvent | undefined>((latest, event) =>
+          event.kind === 'chat_error' && event.blocking === true && (!latest || event.seq > latest.seq) ? event : latest, undefined);
+        if (item.blocking === true && Number.isFinite(item.retryAt) && newest?.kind === 'chat_error' && newest.blocking === true &&
+            item.time - newest.time <= 30 * 60_000 &&
+            chatErrorMessageKey(newest.message.text, newest.recoverable === true) === text) continue;
         if (recent.some(event => event.kind === 'chat_error' &&
             ((question && event.recoverable === true && event.seq > (question.origin ?? question.seq)) ||
             ((Math.abs(item.time - event.time) <= 30_000 ||
@@ -2350,6 +2389,9 @@ async function recordChatObservationsNow(
           ...(item.reason === 'thinking_failed' || item.reason === 'stream_gone' ? { reason: item.reason } : {}),
           ...(typeof item.recoverable === 'boolean' ? { recoverable: item.recoverable } : {}),
           ...(typeof item.blocking === 'boolean' ? { blocking: item.blocking } : {}),
+          // The same bounds the bridge applies before it honors a Retry-After.
+          ...(item.blocking === true && Number.isFinite(item.retryAt) && item.retryAt! > item.time &&
+            item.retryAt! - item.time <= 24 * 60 * 60_000 ? { retryAt: item.retryAt } : {}),
           message: await storeText(sessionId, item.text ?? '', 2000)
         });
         activity.meaningful = true;
@@ -2414,7 +2456,8 @@ async function recordChatObservationsNow(
           outcome: item.outcome ?? 'unknown',
           ...(item.outcome === 'completed' && item.providerMessageId ? { providerMessageId: item.providerMessageId } : {}),
           ...(item.outcome === 'failed' && item.reason === 'thinking_failed' ? { reason: item.reason } : {}),
-          ...(item.detail ? { detail: item.detail } : {})
+          ...(item.detail ? { detail: item.detail } : {}),
+          ...(item.continued === true ? { continued: true as const } : {})
         });
         // As above, durable journal state owns idempotency; in-memory state follows it.
         if (live) {
@@ -2590,7 +2633,8 @@ export async function recordHandoff(
   sessionId: string,
   handoffId: string,
   chars: number,
-  reason: string
+  reason: string,
+  continuation?: string
 ): Promise<void> {
   await appendEvent(sessionId, {
     time: Date.now(),
@@ -2598,7 +2642,8 @@ export async function recordHandoff(
     kind: 'handoff',
     handoffId,
     chars,
-    reason
+    reason,
+    ...(continuation ? { continuation } : {})
   });
   notifyChanged(sessionId);
 }
@@ -2616,11 +2661,12 @@ export async function ensureHandoffRecorded(
   sessionId: string,
   handoffId: string,
   chars: number,
-  reason: string
+  reason: string,
+  continuation?: string
 ): Promise<boolean> {
   const existing = await readEvents(sessionId, { kinds: ['handoff'] });
   if (existing.some((event) => event.kind === 'handoff' && event.handoffId === handoffId)) return false;
-  await recordHandoff(sessionId, handoffId, chars, reason);
+  await recordHandoff(sessionId, handoffId, chars, reason, continuation);
   return true;
 }
 

@@ -195,6 +195,13 @@
   function rememberCleanup(cleanup) {
     stopCleanups.push(cleanup);
   }
+  // An identical attribute write still queues a mutation record for every observer on the page,
+  // this script's and ChatGPT's own. The once-a-second render rewrote ~60 unchanged attributes a
+  // second on an idle chat (measured 2026-10-09), so the hot paths write only on a change.
+  function setAttr(node, name, value) { if (node.getAttribute(name) !== value) node.setAttribute(name, value); }
+  function setData(node, key, value) { if (node.dataset[key] !== value) node.dataset[key] = value; }
+  function setHidden(node, hidden) { if (node.hidden !== hidden) node.hidden = hidden; }
+
   function listen(target, type, listener, options) {
     target.addEventListener(type, listener, options);
     rememberCleanup(() => target.removeEventListener(type, listener, options));
@@ -264,6 +271,9 @@
   }
 
   let conversationId = null;
+  /** Chats ChatGPT said it deleted (`cos-conversation-deleted`, below). The same text is in src/shared/chat-error.ts. */
+  const CONVERSATION_DELETED = 'This chat was deleted in ChatGPT. Start a new chat to continue.';
+  const deletedConversations = new Set();
   let agent = null;
   /** The worker this chat is, as the app's durable session origin names it; label only. */
   let bootstrapAgent = null;
@@ -386,6 +396,10 @@
   const errorFirstSeen = new WeakMap();
   /** The last label sent for each identified ChatGPT-native tool row of this generation. */
   const pageToolsReported = new Map();
+  /** The last round outline sent for each local turn, newest last (`turnTraceOf`). */
+  const tracesReported = new Map();
+  /** When this document first showed each call of a turn it ran live, by ChatGPT's call id. */
+  const traceCallsSeen = new Map();
   /** Last metadata ownership emitted for each exact provider-message/generated-asset tuple. */
   const nativeImagesReported = new Map();
   /** Disposable pixel-capture state. Durable receipt/storage remains in the browser journal/app. */
@@ -502,6 +516,8 @@
    * it is a generation. See claimUnrecordedGeneration.
    */
   let unrecordedGeneratingSince = 0;
+  /** The native finals Fiber had reported when that generation was first seen (#1226). */
+  let finalsBeforeUnrecorded = null;
   /**
    * This document has adopted an identified chat whose durable state the app has not answered
    * for yet: neither "is one of my turns still open?" nor "which user messages do I already
@@ -878,8 +894,10 @@
    */
   const SENT_REQUEST_MS = 10_000;
   const sentRequests = [];
-  function sentRequestSince(since) {
-    const sent = sentRequests.find(entry => entry.epoch === epoch && entry.at >= since);
+  // A Send started in this document's earlier epoch keeps its request when the first route of
+  // the chat it opened advances the epoch (submittedSendLifetime holds that send through it).
+  function sentRequestSince(since, sendEpoch = epoch) {
+    const sent = sentRequests.find(entry => entry.epoch === sendEpoch && entry.at >= since);
     return sent && sent.at - since <= SENT_REQUEST_MS ? { id: sent.id } : null;
   }
   /** Temporary-planner-only fallback for an accepted user row left on the immediately older Fiber scan. */
@@ -925,6 +943,8 @@
   // Every Core-like app the page lists, by name: this install picks its own (with this
   // computer's suffix, if any) when it inserts the mention, whenever the app's names arrived.
   let coreCandidates = [];
+  // This install's Core as another tab of this browser last saw it listed (background `status`).
+  let knownOwnCore = null;
   window.addEventListener('message', (event) => {
     if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-core-mention') return;
     const valid = (path) => typeof path === 'string' && /^app:\/\/asdk_app_[A-Za-z0-9_-]{1,160}$/.test(path) ? path : null;
@@ -945,18 +965,49 @@
   let corePluginList = false;
   let ownNamesKnown = false;
   function reportCorePlugin() {
-    const core = currentCoreMention();
-    const report = core ? core.path : corePluginList && ownNamesKnown && !coreCandidates.some(entry => entry.name === CLF_DOM.connectorNames()[0]) ? 'missing' : null;
+    // What this page itself lists is the evidence; a remembered sighting is not a new report.
+    const core = pageCoreMention();
+    const report = core ? core.path : corePluginList && ownNamesKnown && !ownCoreCandidate() ? 'missing' : null;
     if (!report || report === reportedCorePlugin) return;
     reportedCorePlugin = report;
     const message = report === 'missing' ? { type: 'core_plugin', missing: true } : { type: 'core_plugin', appId: report.slice('app://'.length) };
     void ask(message).catch(() => { reportedCorePlugin = null; });
   }
-  /** This install's Core app as the page lists it, or null when it is missing or ambiguous. */
-  function currentCoreMention() {
+  /** This install's proven Core apps (`app://asdk_app_…`), from the app's status; may be empty. */
+  function provenCorePaths() {
+    return CLF_DOM.connectorApps().filter(app => app.surface === 'core').map(app => `app://${app.appId}`);
+  }
+  /**
+   * This install's Core in the page's app list: a proven app id first (it survives a rename in
+   * ChatGPT), else the configured name. Once a Core app is proven, a same-named app with another
+   * id is somebody else's. Until the app has said its names, the plain name stands in only as a
+   * default: on a computer with a suffix it is the other computer's Core, so nothing matches by
+   * name before then.
+   */
+  function ownCoreCandidate() {
+    const proven = provenCorePaths();
+    const byId = coreCandidates.find(entry => entry.path && proven.includes(entry.path));
+    if (byId) return byId;
+    if (!ownNamesKnown) return null;
     const own = CLF_DOM.connectorNames()[0];
-    const match = coreCandidates.find(entry => entry.name === own);
+    const byName = coreCandidates.find(entry => entry.name === own);
+    return byName && (!proven.length || (byName.path && proven.includes(byName.path))) ? byName : null;
+  }
+  /** This install's Core app as this page itself lists it, or null when missing or ambiguous. */
+  function pageCoreMention() {
+    const match = ownCoreCandidate();
     return match?.path ? { path: match.path, name: match.name } : null;
+  }
+  function currentCoreMention() {
+    if (ownCoreCandidate()) return pageCoreMention();
+    // A fresh tab can send before its own plugin list arrives; then this browser's last sighting of
+    // this install's Core stands in. Never once this page's complete list says the Core is missing,
+    // and never against a proven Core id: a sighting is only as good as the names it was taken under.
+    const own = CLF_DOM.connectorNames()[0];
+    const proven = provenCorePaths();
+    if (corePluginList || !knownOwnCore ||
+        (proven.length ? !proven.includes(knownOwnCore.path) : !ownNamesKnown || knownOwnCore.name !== own)) return null;
+    return { path: knownOwnCore.path, name: knownOwnCore.name };
   }
   /**
    * Whether the user's own prompts carry the Core mention (the app's ui.mentionCore, on unless off).
@@ -968,8 +1019,9 @@
    */
   let mentionCore = true;
   function sendSubmittedText(stillCurrent, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null,
-                             matchesUser = matchesSubmittedUser, receiptTimeoutMs = null, explain = null, mention = currentCoreMention(), sentRequest = null) {
-    return CLF_DOM.send({ stillCurrent, clearAcceptedDraft, beforeSend, acceptUserReceipt, matchesUser, receiptTimeoutMs, mention, explain, sentRequest,
+                             matchesUser = matchesSubmittedUser, receiptTimeoutMs = null, explain = null, mention = currentCoreMention(), sentRequest = null,
+                             whileGenerating = false) {
+    return CLF_DOM.send({ stillCurrent, clearAcceptedDraft, beforeSend, acceptUserReceipt, matchesUser, receiptTimeoutMs, mention, explain, sentRequest, whileGenerating,
       observeEvidence: check => { pageViewChecks.add(check); return () => pageViewChecks.delete(check); } });
   }
   const GOAL_MARKER_INSTRUCTION = '\n\nFor this Goal session only: at the end of each final reply, write exactly one separate last line: [[COS_GOAL:COMPLETE]] if the entire requested task is finished, or [[COS_GOAL:CONTINUE]] if requested work remains. Do not claim completion for partial work. If user input is required, explain it and omit both markers.';
@@ -1308,6 +1360,35 @@
     }
   }
 
+  /**
+   * Keeps this page from being paused while it sits in the app's own tab group (#128).
+   *
+   * Chrome freezes the tabs of a collapsed group, and a frozen page neither sends nor records:
+   * measured on Chrome 154, 2 of 7 sends stalled for minutes. Chrome never freezes a page that
+   * holds a Web Lock, so this page holds one, under a name nothing else uses, for exactly as
+   * long as the worker says the tab is in that group. The worker turns it off when the tab
+   * leaves the group or the mode changes; the browser drops it with the document.
+   */
+  let keepAwakeRelease = null;
+  let keepAwakeRegistration = null;
+  function setKeepAwake(on) {
+    const locks = globalThis.navigator && globalThis.navigator.locks;
+    if (on && !keepAwakeRelease && locks && typeof locks.request === 'function') {
+      const name = `chat-on-steroids-keep-awake-${Math.random().toString(36).slice(2, 12).padEnd(8, '0')}`;
+      let release = null;
+      const held = new Promise((resolve) => { release = resolve; });
+      keepAwakeRelease = release;
+      Promise.resolve(locks.request(name, () => held)).catch(() => {
+        if (keepAwakeRelease === release) keepAwakeRelease = null;
+      });
+    } else if (!on && keepAwakeRelease) {
+      const release = keepAwakeRelease;
+      keepAwakeRelease = null;
+      release();
+    }
+    return Boolean(keepAwakeRelease);
+  }
+
   /** Talks to the service worker. Returns null once the extension is reloaded. */
   async function ask(message, current = null) {
     // A new/reloaded document claims its browser-supplied MessageSender.documentId before
@@ -1315,7 +1396,15 @@
     // across external navigation and still admit the genuinely new page, without accepting
     // delayed IPC from the dead one merely because both share a numeric tab id.
     if (!documentReady) documentReady = sendToWorker({ type: 'register_document', navigationEpoch: epoch });
-    const registered = await documentReady;
+    const registration = documentReady;
+    const registered = await registration;
+    // A tab the app placed in its own tab group starts awake: Chrome pauses tabs in a collapsed
+    // group within seconds, often before the worker's next pass could say so (#128). Once per
+    // registration, so a later `clf-keep-awake` off is never undone by a cached reply.
+    if (registered && registered.keepAwake === true && keepAwakeRegistration !== registration) {
+      keepAwakeRegistration = registration;
+      setKeepAwake(true);
+    }
     if (!registered || registered.ok !== true) {
       // A sleeping/reloading service worker is transient. Keep the document unregistered
       // (and therefore fail closed) for this call, but let the next observer tick retry.
@@ -1405,6 +1494,17 @@
           entry.agent === queued.agent &&
           entry.event?.kind === 'assistant_message' &&
           entry.event?.messageId === messageId
+      );
+      if (prior >= 0) removeQueueEntry(prior);
+    }
+    // A turn's outline is whole each time; only the newest unsent one matters.
+    if (queued.event.kind === 'turn_trace' && typeof queued.event.turnId === 'string') {
+      const prior = queue.findIndex(
+        (entry) =>
+          !queueGapKeys.has(entry) &&
+          entry.conversationId === queued.conversationId &&
+          entry.event?.kind === 'turn_trace' &&
+          entry.event?.turnId === queued.event.turnId
       );
       if (prior >= 0) removeQueueEntry(prior);
     }
@@ -1637,6 +1737,7 @@
     }
     if (!unrecordedGeneratingSince) {
       unrecordedGeneratingSince = Date.now();
+      finalsBeforeUnrecorded = new Set(knownFinals);
       return null;
     }
     const settledAt = unrecordedGeneratingSince + (settled ? SETTLED_REGENERATION_MS : TURN_SETTLE_MS);
@@ -1653,6 +1754,28 @@
       return null;
     }
     return newest;
+  }
+
+  /**
+   * The finals that are history for a turn claimUnrecordedGeneration() opened for `questionId`,
+   * or null when the question is not on the page and every known final stays history.
+   *
+   * A claimed turn has no Send baseline, and ChatGPT can finish inside the settle window: Fiber
+   * then carries the turn's own final before its section mounts. Settling that final too left
+   * the turn open until the ten-minute watchdog (#1226). History is what Fiber had reported
+   * before the generation was first seen, plus every final drawn above the claimed question —
+   * a reloaded page can receive its first Fiber reply only after the window began.
+   */
+  function claimedHistoryFinals(questionId) {
+    const observed = CLF_DOM.turns();
+    const at = observed.findIndex(turn => turn.role === 'user' && CLF_DOM.messagesIn(turn).some(message => message.id === questionId));
+    if (at < 0) return null;
+    const history = new Set(finalsBeforeUnrecorded ?? []);
+    for (const turn of observed.slice(0, at)) {
+      const final = fiberTurnFor(turn)?.endMessageId;
+      if (final) history.add(final);
+    }
+    return history;
   }
 
   function adoptOpenTurn(open, questionId = null) {
@@ -1889,6 +2012,8 @@
     baselineSections = [];
     baselineMarks = [];
     stopRequestedAt = 0;
+    stoppedEnd = null;
+    resumedFromStop = null;
     stallReported = false;
     fiberTerminalMessageId = null;
     // The settle window names a turn in the conversation being left behind. Carrying it
@@ -1921,6 +2046,52 @@
   }
 
   const stoppedAppCommands = new Set();
+  /**
+   * The turn this document last ended as stopped, while it stays this document's turn.
+   *
+   * ChatGPT can still deliver a call it dispatched before it obeyed Stop, and recorder.ts then
+   * reopens the turn because the same request kept calling tools after the page's end. Only
+   * this page can tell whether ChatGPT is really running that turn again: see
+   * resumeStoppedTurn() and the idle branch of stopAppTurn().
+   */
+  let stoppedEnd = null;
+  /**
+   * A stopped turn this document follows again because exact work proved it reopened. The
+   * user's Stop still stands: ChatGPT going quiet without a final answer ends it as stopped
+   * (endOutcome), while a final answer still completes it and running keeps it open.
+   */
+  let resumedFromStop = null;
+  function resumeStoppedTurn(recordedQuestionId) {
+    const resumed = turnId;
+    stopRequestedAt = 0;
+    if (!adoptOpenTurn(resumed, recordedQuestionId)) return false;
+    resumedFromStop = resumed;
+    return true;
+  }
+  function restateStoppedEnd() {
+    if (!stoppedEnd || stoppedEnd.turnId !== turnId || generating) return false;
+    emit({ kind: 'turn_end', turnId, outcome: 'stopped', ...(stoppedEnd.detail ? { detail: stoppedEnd.detail } : {}) });
+    void flush();
+    return true;
+  }
+  /**
+   * A stopped turn the app holds open again although its live projection names no active turn:
+   * its own feed carries this page's `turn_end` and still records the turn, which only a reopening
+   * after that end produces. Follow it again as for a call started after Stop. Each reopening is
+   * proven by a newer call of the turn, and is answered once, so an end the app does not take
+   * cannot become a repeating stream of them.
+   */
+  function reconcileReopenedStop(data, recordedQuestionId) {
+    if (generating || !stoppedEnd || stoppedEnd.turnId !== turnId || data.recordedTurnId !== turnId ||
+        ![...streamBySeq.values()].some(entry => entry?.kind === 'turn_end' && entry.turnId === turnId)) return;
+    let reopening = -1;
+    for (const [seq, entry] of streamBySeq) {
+      if (entry?.kind === 'tool_call' && entry.turnId === turnId && seq > reopening) reopening = seq;
+    }
+    if (stoppedEnd.resumedFor === reopening) return;
+    stoppedEnd.resumedFor = reopening;
+    resumeStoppedTurn(recordedQuestionId);
+  }
   function stopQuestionMatches(userMessageId) {
     const users = CLF_DOM.messages().filter(message => message.role === 'user' && message.id);
     return typeof userMessageId === 'string' && !!userMessageId && users.at(-1)?.id === userMessageId;
@@ -1953,6 +2124,29 @@
     if (stoppedAppCommands.has(commandId)) {
       await ask({ type: 'stop_ack', id: commandId, client: RUN_ID, conversationId: target, turnId: expected, status: 'sent' });
       return true;
+    }
+    // The app asks to stop a turn this page already ended as stopped and that late work reopened,
+    // whether or not this page follows it again (see stoppedEnd). With ChatGPT idle there is
+    // nothing to click: the answer is the end, said again or taken by the quiet path at once.
+    const idleStopped = () => current() && !CLF_DOM.generating() &&
+      (generating ? resumedFromStop === expected : stoppedEnd?.turnId === expected);
+    if (idleStopped()) {
+      const reply = await ask({ type: 'stop_redeem', id: commandId, client: RUN_ID, conversationId: target });
+      observe();
+      const command = reply?.command;
+      if (!reply?.ok || command?.type !== 'stop' || command.turnId !== expected || command.conversationId !== target) return false;
+      let stopped = false;
+      if (idleStopped()) {
+        if (generating) { stopRequestedAt = Date.now(); stopped = true; }
+        else stopped = restateStoppedEnd();
+      }
+      if (stopped) {
+        stoppedAppCommands.add(commandId);
+        if (stoppedAppCommands.size > 100) stoppedAppCommands.delete(stoppedAppCommands.values().next().value);
+      }
+      await ask({ type: 'stop_ack', id: commandId, client: RUN_ID, conversationId: target, turnId: expected,
+        status: stopped ? 'sent' : 'failed', error: stopped ? undefined : 'native_stop_unavailable_or_turn_changed' });
+      return stopped;
     }
     const native = currentAssistantTurn();
     const nativeId = pageTurnIds.get(expected);
@@ -2145,7 +2339,7 @@
    * gives no evidence for, so it is never made: an unexplained stop stays unknown.
    */
   function endOutcome(turn, nativeFinal = false) {
-    if (stopRequestedAt && !nativeFinal) return {
+    if ((stopRequestedAt || (resumedFromStop && resumedFromStop === turnId)) && !nativeFinal) return {
       outcome: 'stopped',
       detail: t('content_turn_stop_requested', 'Stop was requested; the native page no longer shows generation.')
     };
@@ -2461,7 +2655,6 @@
     // other named turn by accident. Modern generations always mint/adopt an id; this is the
     // fail-closed guard for stale/legacy/reinjected state.
     const endedTurnId = turnId;
-    syncLivePreview(livePreviewSent.conversationId, null);
     streamGone = null;
     resumedOrder = 0;
     generating = false;
@@ -2504,6 +2697,11 @@
     const nativeEnd = result.outcome === 'completed' ? fiberTurnFor(ended) : null;
     const imageEnd = nativeEnd?.endMessageId && nativeEnd.images?.some(image =>
       image.messageId === nativeEnd.endMessageId && image.providerStatus === 'finished_successfully');
+    if (endedTurnId) {
+      // The same turn ending again keeps the reopening it already followed (reconcileReopenedStop).
+      const resumedFor = stoppedEnd?.turnId === endedTurnId ? stoppedEnd.resumedFor : undefined;
+      stoppedEnd = result.outcome === 'stopped' ? { turnId: endedTurnId, detail: result.detail, resumedFor } : null;
+    }
     if (endedTurnId) emit({ kind: 'turn_end', turnId: endedTurnId, ...result,
       ...(imageEnd ? { providerMessageId: nativeEnd.endMessageId } : {}) });
     // Same moment, the other reader: the goal loop wants this turn's answer while `ended`
@@ -2515,6 +2713,7 @@
     genNode = null;
   }
 
+  let observedRoute = null;
   function observe() {
     // This duplicate source document is only the native Project entry point. Its transcript
     // belongs to A's original recorder; do not adopt it while preparing the fresh composer.
@@ -2573,6 +2772,11 @@
           pendingObjectiveSend = opening.receipt;
           pendingObjectiveSend.current = submittedSendLifetime(id, epoch);
         }
+        // A Send the app already accepted for exactly this new chat moves with it, so its answer
+        // still opens the first turn. A hidden tab can prove the Send (ChatGPT's request and the
+        // new address) before this page adopts that address (2026-10-15).
+        const acceptedSend = userSendReceipt?.accepted;
+        if (acceptedSend && acceptedSend.conversationId === id && acceptedSend.epoch === epoch - 1) acceptedSend.epoch = epoch;
         // The same question boot asks, at the same moment boot asks it: which of this chat's
         // user messages does the app already hold? resetConversation() has just armed the
         // identity gate, and until it is answered this document reads no transcript at all,
@@ -2607,7 +2811,16 @@
         }
       }
     }
+    publishHistoryRateLimit();
     flushStreamRequestOrigins();
+    // A Send waiting on its receipt re-checks once this document has taken a new address. A
+    // hidden tab (Firefox's minimized window for app-opened chats) can move to /c/<id> without
+    // drawing anything, and the receipt then waited for the next redraw: 40-95 s, once never
+    // (2026-10-15). After the adoption above, so the receipt belongs to the new chat's epoch.
+    if (id !== observedRoute) {
+      observedRoute = id;
+      if (id) for (const check of pageViewChecks) void check();
+    }
     // Route assignment and authored text can arrive in either order. This receipt is
     // evaluated on the existing observer, rather than only on the one route-change edge.
     if (id && pendingObjectiveSend?.accepted && pendingObjectiveSend.current()) {
@@ -2748,7 +2961,15 @@
             )
           }
         : result;
-      finishGeneration(ended, bounded, false);
+      // Steered, or an unfinished answer a new message replaced: ChatGPT carries that answer on past
+      // the message, under the same request id. Stop is not a reliable witness here (measured
+      // 2026-10-11: it was already gone at the tick that saw the message). The app files later calls
+      // of that request under the next turn only past an end marked so (#1301). A turn that ended
+      // with its answer is not marked: its trailing calls stay with it. Where Fiber answers, its
+      // end_turn is that proof, and interim prose without it is an unfinished answer too (live
+      // 2026-10-12: ten calls and the final answer followed a message sent after "I'll pick up…").
+      const replacedUnfinished = result.outcome === 'unknown' && (bounded.outcome === 'interrupted' || fiberPresent === true);
+      finishGeneration(ended, steering || replacedUnfinished ? { ...bounded, continued: true } : bounded, false);
     }
 
     // A turn is opened by a send, and by nothing else.
@@ -2812,12 +3033,15 @@
       // state the resume exists to keep, since recorder.ts empties `progress`, `pageTools`
       // and the pending sightings on every turn_start.
       emit({ kind: 'turn_start', turnId });
-      // Without a witnessed Send, every final already on the page is history.
-      const finalsAtSend = submission?.baseline?.finals;
+      // A witnessed Send's baseline is exact. A claimed turn keeps its own final (#1226);
+      // any other turn without a baseline files every final already on the page as history.
+      const finalsAtSend = submission ? submission.baseline?.finals : claimedHistoryFinals(newUserMessage);
       for (const known of knownFinals) if (!finalsAtSend || finalsAtSend.has(known)) settledFinals.add(known);
 
       // The compaction binding is made here and only here: the first generation to open
     }
+    // ChatGPT already said this chat is deleted: a question it shows now cannot be answered.
+    endDeletedTurn();
 
     // Which generation an error first came into view during, recorded before anything reads
     // it and after this tick has opened its generation, so a banner arriving with a turn is
@@ -3445,7 +3669,7 @@
   // 11: adds exact typed thought-notification ids and ephemeral DOM stamps for selective
   //     presentation suppression. Caption text and per-call adjacency remain non-authority.
   // 12: adds exact provider-message/sediment generated-image descriptors and DOM pixel stamps.
-  const FIBER_VERSION = 21;
+  const FIBER_VERSION = 22;
   const FIBER_TIMEOUT_MS = 1500;
   const FIBER_MAX_ROWS = 400;
   /** Assistant turns whose per-call evidence is accepted from one scan. */
@@ -3491,6 +3715,7 @@
    * whole turn, so without this the same request would be re-sent on every poll.
    */
   const callsReported = new Map();
+  const sightingsReported = new Set();
   /** Exact request ids the app has ACKed as owned by a concrete conversation. */
   const requestOwnersConfirmed = new Map();
   const pendingStreamOrigins = new Map();
@@ -3567,7 +3792,9 @@
       createTime: typeof raw.createTime === 'number' && Number.isFinite(raw.createTime) ? raw.createTime : null,
       hidden,
       localCount,
-      answered: raw.answered === true
+      answered: raw.answered === true,
+      // fiber.js's ownership verdict (app id, link, then name); absent from older frames.
+      ...(typeof raw.own === 'boolean' ? { own: raw.own } : {})
     };
   }
 
@@ -3641,6 +3868,17 @@
       });
     }
 
+    // Connector identity sightings: ids only, never payloads. The app trusts none of them on its
+    // own; only a request id it served teaches it anything (connector-identity.ts).
+    const sightings = [];
+    for (const entry of (Array.isArray(raw.sightings) ? raw.sightings : []).slice(0, 50)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const appId = cap(entry.appId, 200);
+      const requestId = cap(entry.requestId, 100);
+      if (!requestId || !appId || !/^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(appId)) continue;
+      sightings.push({ requestId, appId, linkId: cap(entry.linkId, 200) || null, appName: cap(entry.appName, 200) || null });
+    }
+
     const messages = [];
     const messageIndex = new Map();
     const conflictingMessages = new Set();
@@ -3655,7 +3893,8 @@
         .map(({ id, name, size, mimeType }) => ({ id, name, size, mimeType })) : [];
       // Whole markup or none, for the same reason the wire bound above drops it.
       const renderedHtml =
-        typeof entry.renderedHtml === 'string' && entry.renderedHtml.length <= 120_000 ? entry.renderedHtml : '';
+        typeof entry.renderedHtml === 'string' && entry.renderedHtml.length <=
+          (entry.role === 'assistant' && entry.stable === true ? 256_000 : 120_000) ? entry.renderedHtml : '';
       if (!rawText && !renderedHtml && !attachments.length &&
           !(entry.role === 'assistant' && entry.rawMessageId && entry.rawMessageId === raw.endMessageId)) continue;
       const references = entry.role === 'assistant' ? readReferences(entry.references) : null;
@@ -3785,10 +4024,9 @@
       codeIds.add(messageId);
       codeModeCalls.push({ messageId, tool: 'functions.exec', requestId: cap(entry.requestId, 100), answered: entry.answered === true });
     }
-    // Presentation only (#942): a caption line for a running turn, never a recorded message.
-    const preview = !endMessageId && typeof raw.preview === 'string' ? cap(raw.preview.trim(), 300) : null;
+    const trace = turnTraceOf(raw.trace);
     if (codeModeCalls.length === 0 && kept.length === 0 && requests.length === 0 && keptMessages.length === 0 && keptActivities.length === 0 &&
-        keptThoughtNotifications.length === 0 && keptImages.length === 0 && !endMessageId && !preview) {
+        keptThoughtNotifications.length === 0 && keptImages.length === 0 && !endMessageId && !trace && sightings.length === 0) {
       return null;
     }
     return {
@@ -3801,12 +4039,51 @@
       calls: kept,
       codeModeCalls,
       requests,
+      sightings,
       messages: keptMessages,
       activities: keptActivities,
       thoughtNotifications: keptThoughtNotifications,
       images: keptImages,
-      preview
+      trace,
+      // #1301: the user message that opened this page turn; files its outline under the right turn.
+      ...(cap(raw.question, 200) ? { question: cap(raw.question, 200) } : {})
     };
+  }
+
+  /**
+   * The provider's outline of one turn's rounds (fiber.js `shellTurnTrace`), revalidated: what
+   * the model said between steps, this app's calls in order, and each round's recap. It crosses
+   * to the app as presentation for the timeline and is never a message, a call or work evidence.
+   */
+  function turnTraceOf(value) {
+    if (!Array.isArray(value) || value.length === 0) return null;
+    const out = [];
+    let room = 128 * 1024;
+    for (const item of value.slice(0, 400)) {
+      const kind = item && item.kind;
+      if (kind === 'say' || kind === 'recap' || kind === 'now') {
+        const text = typeof item.text === 'string' ? item.text.slice(0, kind === 'say' ? 8000 : 300) : '';
+        if (!text.trim() || text.length > room) continue;
+        room -= text.length;
+        const id = kind === 'say' ? cap(item.id, 200) : null;
+        out.push(kind === 'say' ? { kind, ...(id ? { id } : {}), text, done: item.done === true } : { kind, text });
+      } else if (kind === 'answer') {
+        const id = cap(item.id, 200);
+        if (id) out.push({ kind, id });
+      } else if (kind === 'call' || kind === 'exec') {
+        const id = cap(item.id, 200);
+        if (!id) continue;
+        const tool = kind === 'call' ? cap(item.tool, 100) : null;
+        out.push({ kind, id, ...(tool ? { tool } : {}), done: item.done === true });
+        if (kind === 'call') {
+          // When this document first showed the call, kept per call: the app aligns it with the
+          // recorded call that started then. Only a turn this page runs live is stamped below.
+          const seen = traceCallsSeen.get(id);
+          if (seen) out[out.length - 1].at = seen;
+        }
+      }
+    }
+    return out.length ? out : null;
   }
 
   const nativeImageKey = image => `${image.messageId}\u0000${image.assetId}`;
@@ -4049,7 +4326,7 @@
       window.addEventListener('message', onMessage);
       setTimeout(() => finish(null), FIBER_TIMEOUT_MS);
       try {
-        window.postMessage({ source: FIBER_ASK, nonce, apps: CLF_DOM.connectorNames() }, location.origin);
+        window.postMessage({ source: FIBER_ASK, nonce, apps: CLF_DOM.connectorNames(), appIds: CLF_DOM.connectorApps() }, location.origin);
       } catch {
         finish(null);
       }
@@ -4235,28 +4512,6 @@
       });
     }
     return fiberRepairing ? await fiberRepairing : null;
-  }
-
-  /** The caption last sent for the running turn (#942), so an unchanged scan sends nothing. */
-  let livePreviewSent = { conversationId: null, text: null };
-  /**
-   * Tells the app the newest sentence ChatGPT shows for a running turn whose message it has not
-   * published yet. ChatGPT keeps a new chat's first-turn narration out of its page model until it
-   * fetches history again, so without this the app showed only the calls until the final answer.
-   * The app holds it in memory as a caption; the sentence is recorded the ordinary way, with its
-   * own message id, once ChatGPT publishes it.
-   */
-  function syncLivePreview(forConversation, text) {
-    const id = typeof forConversation === 'string' && /^[0-9a-f-]{8,64}$/i.test(forConversation) ? forConversation : null;
-    const next = id && typeof text === 'string' && text ? text : null;
-    const previous = livePreviewSent;
-    if (previous.conversationId === id && previous.text === next) return;
-    livePreviewSent = { conversationId: id, text: next };
-    // A route change must not leave the old chat's caption behind.
-    if (previous.text && previous.conversationId && previous.conversationId !== id) {
-      void ask({ type: 'live_preview', conversationId: previous.conversationId, text: null });
-    }
-    if (id && (next || previous.conversationId === id)) void ask({ type: 'live_preview', conversationId: id, text: next });
   }
 
   async function refreshFiber(settled = null, presentationOnly = false) {
@@ -4461,11 +4716,6 @@
     }
     const activeTurnIndex =
       ownedPageTurn && activeLocalTurnId ? answer.turns.indexOf(ownedPageTurn) : -1;
-    // #942: a caption for the generation this document owns right now, never for a settled scan.
-    if (!presentationOnly && !settled) {
-      syncLivePreview(askedConversation || concreteConversation(CLF_DOM.conversationId()),
-        activeTurnIndex >= 0 && generating ? ownedPageTurn.preview : null);
-    }
     if (askedConversation) {
       // Ownership evidence is no longer gated on `activeTurnIndex`.
       //
@@ -4530,6 +4780,14 @@
     }
     for (let index = 0; index < answer.turns.length; index++) {
       const turn = answer.turns[index];
+      // Every connector result row's ids, ours or not, once per request id. The app learns only
+      // from request ids it served itself, so a foreign row teaches nothing.
+      const newSightings = (turn.sightings || []).filter(sighting => !sightingsReported.has(sighting.requestId));
+      if (newSightings.length) {
+        if (sightingsReported.size > 2000) sightingsReported.clear();
+        for (const sighting of newSightings) sightingsReported.add(sighting.requestId);
+        emit({ kind: 'app_sightings', apps: newSightings });
+      }
       const pageConversation = concreteConversation(turn.conversationId);
       const provisionalOwnedTurn = turn.requestOwnerRequired || Boolean(
         turn === ownedPageTurn &&
@@ -4833,6 +5091,26 @@
           expediteActivityPull();
         }
       }
+      // The provider's outline of this turn's rounds, for the timeline only. It needs a local turn
+      // to be filed under, so an unowned historical section sends none; an unchanged outline sends
+      // nothing, and a settled turn read after a reload refreshes the outline its recaps came late to.
+      if (localOwner && turn.trace) {
+        if (index === activeTurnIndex && generating) {
+          const now = Date.now();
+          for (const item of turn.trace) {
+            if (item.kind !== 'call' || item.at) continue;
+            item.at = now;
+            traceCallsSeen.set(item.id, now);
+          }
+          while (traceCallsSeen.size > 2000) traceCallsSeen.delete(traceCallsSeen.keys().next().value);
+        }
+        const signature = JSON.stringify(turn.trace);
+        if (tracesReported.get(localOwner) !== signature) {
+          tracesReported.delete(localOwner);
+          tracesReported.set(localOwner, signature);
+          emit({ kind: 'turn_trace', turnId: localOwner, trace: turn.trace, ...(turn.question ? { question: turn.question } : {}) });
+        }
+      }
     }
     // ChatGPT's own message model is stronger completion evidence than the renderer's Stop
     // button. If the final assistant message says `end_turn:true`, close the exact local
@@ -4864,6 +5142,7 @@
     if (callsReported.size > 4000) callsReported.clear();
     if (messagesReported.size > 4000) messagesReported.clear();
     if (pageToolsReported.size > 4000) pageToolsReported.clear();
+    while (tracesReported.size > 64) tracesReported.delete(tracesReported.keys().next().value);
     if (nativeImagesReported.size > 2000) {
       for (const key of nativeImagesReported.keys()) {
         nativeImagesReported.delete(key);
@@ -5968,7 +6247,7 @@
         head.replaceChildren(...[...members[members.length - 1].querySelector('summary').childNodes].map(node => node.cloneNode(true)));
         head.dataset.clfSignature = signature;
       }
-      head.title = t('content_tool_calls_count', '$1 tool calls', members.length);
+      setAttr(head, 'title', t('content_tool_calls_count', '$1 tool calls', members.length));
       reconcileStreamChildren(group.lastElementChild, members);
       children.push(group); i = end;
     }
@@ -6119,6 +6398,7 @@
 
   function ourConnectorSeen(seen) {
     if (!seen) return false;
+    if (typeof seen.own === 'boolean') return seen.own;
     if (ourConnectorApp(seen.app)) return true;
     if (typeof seen.path !== 'string' || !seen.path.startsWith('/')) return false;
     const end = seen.path.indexOf('/', 1);
@@ -6537,7 +6817,7 @@
       // an old-known/new-unknown authored descriptor never enters this branch.
       if (!websiteRender && compatiblePriorKey && existing &&
           identity.messageMatches.length === 0 && identity.missingMessages === false) {
-        for (const node of nodes) if (node.dataset) node.dataset.clfStreamKey = streamKey;
+        for (const node of nodes) if (node.dataset) setData(node, 'clfStreamKey', streamKey);
         // Root continuity is presentation identity, not continuing proof that a native
         // connector row is covered. Re-evaluate the current answered/app/request evidence on
         // every paint so an in-flight or restamped row becomes visible immediately.
@@ -6557,7 +6837,7 @@
         record.strongKeys = [...strongStreamIdentityKeys(rendered)];
         record.anchors = placement.anchors;
         streamRootsByKey.set(streamKey, record);
-        for (const node of nodes) if (node.dataset) node.dataset.clfStreamKey = streamKey;
+        for (const node of nodes) if (node.dataset) setData(node, 'clfStreamKey', streamKey);
         CLF_DOM.replaceActivity(turn, null, true);
         syncNativeActivity(turn, [], websiteRender ? placement : null);
         painted.add(streamKey);
@@ -6580,10 +6860,10 @@
       for (const gap of gaps) {
         kept.add(gap.key);
         const root = record.chunks.get(gap.key) || document.createElement('div');
-        root.className = 'clf-stream';
-        root.dataset.clfKey = streamKey;
-        root.dataset.clfGap = gap.key;
-        root.dataset.clfTurn = turn.id || groupKey || 'anchored';
+        if (root.className !== 'clf-stream') root.className = 'clf-stream';
+        setData(root, 'clfKey', streamKey);
+        setData(root, 'clfGap', gap.key);
+        setData(root, 'clfTurn', turn.id || groupKey || 'anchored');
         renderStreamChunk(root, gap.entries, record, retainedRows, retainedGroups, priorGroups);
         record.chunks.set(gap.key, root);
         CLF_DOM.replaceActivity(gap.turn || turn, root, true, gap);
@@ -6604,7 +6884,7 @@
       record.completeAt = Date.now();
       record.strongKeys = [...strongStreamIdentityKeys(rendered)];
       record.anchors = placement.anchors;
-      for (const node of nodes) if (node.dataset) node.dataset.clfStreamKey = streamKey;
+      for (const node of nodes) if (node.dataset) setData(node, 'clfStreamKey', streamKey);
       CLF_DOM.replaceActivity(turn, null, true);
       syncNativeActivity(turn, coveredNativeBlocks(turn, gaps), websiteRender ? placement : null);
       painted.add(streamKey);
@@ -6674,6 +6954,30 @@
     }
   }
 
+  /**
+   * ChatGPT's tool approval card, answered from the app (2.1.38). Each card element gets one id for
+   * as long as it stands; the app files an answer for that id, and this document presses Deny or
+   * Allow once only while it still shows that very card. Each answer token is carried out once, and
+   * its outcome travels back on the next poll.
+   */
+  const approvalCardIds = new WeakMap();
+  const approvalTokensDone = new Set();
+  let approvalResult = null;
+  function currentApprovalCard() {
+    const card = CLF_DOM.approvalCard();
+    if (!card) return null;
+    if (!approvalCardIds.has(card.node)) approvalCardIds.set(card.node, crypto.randomUUID());
+    return { id: approvalCardIds.get(card.node), lines: card.lines, allow: card.allow, node: card.node };
+  }
+  function answerApproval(answer) {
+    if (!answer || typeof answer.token !== 'string' || approvalTokensDone.has(answer.token)) return;
+    approvalTokensDone.add(answer.token);
+    const card = currentApprovalCard();
+    const outcome = card && card.id === answer.cardId ? CLF_DOM.answerApprovalCard(card.node, answer.choice) : 'card_changed';
+    approvalResult = { token: answer.token, outcome };
+    setTimeout(() => void pullActivity(), 400);
+  }
+
   async function pullActivity() {
     if (!CLF_DOM.conversationId()) {
       // A New Chat has no feed: /activity is addressed by conversation, and this composer is
@@ -6689,6 +6993,8 @@
     const forId = conversationId;
     const forEpoch = epoch;
     const current = () => alive && conversationId === forId && epoch === forEpoch;
+    const approvalCard = currentApprovalCard();
+    const sentResult = approvalResult;
     try {
       const reply = await ask({
         type: 'activity',
@@ -6699,9 +7005,13 @@
         // This document's own open turn, which it closes itself on end_turn or after ten
         // minutes without progress. Keeps a long-thinking worker from being slept as silent.
         generating,
-        // ChatGPT's own approval card: the turn waits for a person, so the app tells them.
-        approval: CLF_DOM.approvalWaiting()
+        // ChatGPT's own approval card: the turn waits for a person, so the app tells them and
+        // shows its words, and an answer given in the app comes back on this same feed.
+        approval: Boolean(approvalCard),
+        ...(approvalCard ? { approvalCard: { id: approvalCard.id, lines: approvalCard.lines, allow: approvalCard.allow } } : {}),
+        ...(sentResult ? { approvalResult: sentResult } : {})
       });
+      if (sentResult && reply && reply.ok === true && approvalResult === sentResult) approvalResult = null;
       if (!reply || reply.ok !== true || !reply.data) {
         // Keep waiting only for failures that can genuinely mean "the local app/worker is
         // not reachable yet". A structured application refusal is an answer to the identity
@@ -6712,6 +7022,7 @@
       }
       if (!current()) return;
       const data = reply.data;
+      if (data.approvalAnswer) answerApproval(data.approvalAnswer);
       // Popup-only. `sessionId` is the app saying it has a session for this exact chat,
       // which is the difference between "delivered" and "the app is actually recording it".
       observed.session = typeof data.sessionId === 'string' ? data.sessionId : null;
@@ -6860,7 +7171,8 @@
       appSettledQuestionId = typeof data.settledQuestionId === 'string' && data.settledQuestionId ? data.settledQuestionId : null;
       if (!generating && pendingTools > 0 && appActiveTurnId === turnId && fiberSettled?.reason === 'thinking_failed') noteTurnProgress(turnId, 'tool-resumed');
       const recordedQuestionId = typeof data.recordedQuestionId === 'string' ? data.recordedQuestionId : null;
-      if (resumedStoppedTurn && !generating && appActiveTurnId === turnId) adoptOpenTurn(turnId, recordedQuestionId);
+      if (resumedStoppedTurn && !generating && appActiveTurnId === turnId) resumeStoppedTurn(recordedQuestionId);
+      reconcileReopenedStop(data, recordedQuestionId);
       const lateAdoption = !generating && !turnId && genCount === 0 && !stopRequestedAt && !commandAttempt &&
         recordedQuestionId && stopQuestionMatches(recordedQuestionId);
       if (resumeIdentityPending || lateAdoption) {
@@ -6903,6 +7215,7 @@
       // text OpenRouter has streamed so far, and — once it is `ready` — the message to type.
       // Nothing is typed here; maybeSendGoalReply below owns that, after the pull has
       // finished and the page has been repainted with what the draft is doing.
+      const goalBefore = JSON.stringify([goalConfig?.enabled ?? null, goalConfig?.objective ?? null, bootstrap]);
       goalConfig = data.goal && typeof data.goal === 'object' ? data.goal : null;
       if (goalConfig) goalDraft = goalConfig.draft || null;
       const nextBootstrap = data.bootstrap === 'resume' || data.bootstrap === 'worker' ? data.bootstrap : null;
@@ -6941,6 +7254,9 @@
       foldBootstrap();
       renderControl();
       injectStage();
+      // A pull that brought the Goal settings or this chat's resume role re-reads the transcript
+      // with them. A page settled before this pull (a hidden tab) has nothing else to wake it.
+      if (JSON.stringify([goalConfig?.enabled ?? null, goalConfig?.objective ?? null, bootstrap]) !== goalBefore) observe();
       // The activity snapshot is now authoritative and visible. Arm the next read before
       // compaction or Goal side effects below can wait on the page for tens of seconds.
       armNextActivityPull();
@@ -7588,17 +7904,23 @@
    * outlines in `currentColor`, and this has to sit in a row of them without announcing that
    * it came from somewhere else.
    */
-  const ICON =
-    '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" ' +
-    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-    '<circle cx="12" cy="12" r="3.1"/>' +
-    '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 ' +
-    '1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 8.6 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 ' +
-    '0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 ' +
-    '0 4.6 8.6a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 ' +
-    '0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 ' +
-    '2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>' +
-    '</svg>';
+  /**
+   * The gear on the compact button, built from DOM nodes rather than markup: Mozilla's add-on
+   * review flags any `innerHTML` assignment, and the Firefox package shares this file.
+   */
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const ICON_PATH = 'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 8.6 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 8.6a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z';
+  function gearIcon() {
+    const svg = document.createElementNS(SVG_NS, 'svg');
+    for (const [name, value] of [['width', '20'], ['height', '20'], ['viewBox', '0 0 24 24'], ['fill', 'none'], ['stroke', 'currentColor'],
+      ['stroke-width', '1.7'], ['stroke-linecap', 'round'], ['stroke-linejoin', 'round'], ['aria-hidden', 'true']]) svg.setAttribute(name, value);
+    const circle = document.createElementNS(SVG_NS, 'circle');
+    circle.setAttribute('cx', '12'); circle.setAttribute('cy', '12'); circle.setAttribute('r', '3.1');
+    const gear = document.createElementNS(SVG_NS, 'path');
+    gear.setAttribute('d', ICON_PATH);
+    svg.append(circle, gear);
+    return svg;
+  }
 
   /** The switch itself, one per settings row. Two nodes so the knob can slide. */
   function buildSwitch() {
@@ -7654,7 +7976,7 @@
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'clf-compact-btn';
-    button.innerHTML = ICON;
+    button.append(gearIcon());
 
     /**
      * The context meter: a bar around the button that fills as the conversation does.
@@ -8539,27 +8861,27 @@
     if (!control || !control.root.isConnected) return;
     const state = currentState();
     const busy = state.mode === 'busy' || state.mode === 'waiting';
-    control.root.hidden = state.mode === 'hidden';
-    control.root.dataset.clfMode = state.mode;
+    setHidden(control.root, state.mode === 'hidden');
+    setData(control.root, 'clfMode', state.mode);
     // Only over the chat it is about: an id-less New Chat route inherits nothing.
-    control.blocked.hidden = !(
+    setHidden(control.blocked, !(
       composerChat().state === 'chat' &&
       goalConfig &&
       goalConfig.blocked === 'blocked'
-    );
+    ));
     // Never disabled any more: it opens a sheet, and a sheet that explains why compaction is
     // unavailable is exactly what somebody clicking a dead button wanted to be told.
     control.button.disabled = false;
-    control.button.setAttribute('aria-label', t('content_settings_aria', 'Chat On Steroids settings'));
-    control.button.setAttribute('aria-haspopup', 'dialog');
+    setAttr(control.button, 'aria-label', t('content_settings_aria', 'Chat On Steroids settings'));
+    setAttr(control.button, 'aria-haspopup', 'dialog');
     if (!control.button.hasAttribute('aria-expanded')) control.button.setAttribute('aria-expanded', 'false');
     // The meter only while the button is a button. During a run the control is saying what
     // it is doing, and a fill level is neither the question nor the answer any more.
     const meter = state.action === 'start' ? meterView() : null;
-    control.meter.hidden = meter === null;
+    setHidden(control.meter, meter === null);
     if (meter) {
       control.meterFill.style.width = `${Math.round(meter.filled * 100)}%`;
-      control.meter.dataset.clfLevel = meter.level;
+      setData(control.meter, 'clfLevel', meter.level);
     }
     // The hover says what the settings are, because that is what the button is now. A run in
     // progress, or a failure, is the more urgent thing and takes the line back for as long as
@@ -8571,14 +8893,14 @@
         : state.hint
           ? `${state.label} — ${state.hint}`
           : state.label;
-    control.button.setAttribute('data-clf-tip', meter ? `${tip}\n${meter.tip}` : tip);
+    setAttr(control.button, 'data-clf-tip', meter ? `${tip}\n${meter.tip}` : tip);
     if (menuOpen) renderMenu();
     // The pill carries transient run state — progress, the opened chat, a failure. `idle` and
     // `off` are neither, and their label is the button's own name: a pill reading "Compact"
     // beside the Compact button said nothing and spent scarce composer width doing it. Why the
     // control is off is real information, but it is a sentence, so it lives on the hover tip.
-    control.pill.hidden = state.mode === 'idle' || state.mode === 'off';
-    control.cancel.hidden = state.action !== 'cancel';
+    setHidden(control.pill, state.mode === 'idle' || state.mode === 'off');
+    setHidden(control.cancel, state.action !== 'cancel');
     // One word, always. The pill sits inside ChatGPT's composer and has a button's width
     // to work with; `label · hint` spent all of it on a sentence that then got ellipsed
     // halfway through, so it read as neither. The hint is on the hover tip, in full.
@@ -9482,6 +9804,8 @@
    * ChatGPT's own marker or at an explicit cancel, never at a second Send.
    */
   async function maybeResumePendingCompaction(forId = conversationId, forEpoch = epoch) {
+    if (job && job.stage === 'handoff-pending' && job.sourceSend?.state === 'dispatched-unresolved' &&
+        !(await releaseUndeliveredHandoff(forId, forEpoch))) return;
     const source = job && job.stage === 'handoff-pending' ? job.sourceSend : null;
     if (!source || nativeBusy) return;
     if (source.state !== 'not-attempted' && source.state !== 'attempted-unresolved') return;
@@ -9520,6 +9844,51 @@
     // authority — a refused focus changes nothing about the ticket.
     if (automatic) void ask({ type: 'focus_tab', conversationId: forId }).catch(() => undefined);
     await startCompact(automatic);
+  }
+
+  /**
+   * Proves to the app that an armed handoff click never reached ChatGPT, so it may be sent once.
+   *
+   * Only a document loaded after the click can say so, and only once ChatGPT is idle: it then
+   * shows the chat as ChatGPT holds it, and an accepted handoff would be its newest user message.
+   * The newest one still being the message that was newest before the click is the proof. The
+   * app checks the same facts again before it releases anything.
+   */
+  const UNDELIVERED_READY_MS = 30_000;
+  const UNDELIVERED_SECOND_READ_MS = 3_000;
+  async function releaseUndeliveredHandoff(forId, forEpoch) {
+    const source = job && job.stage === 'handoff-pending' ? job.sourceSend : null;
+    if (!source || source.state !== 'dispatched-unresolved' || typeof source.before !== 'string' || !source.before ||
+        !Number.isFinite(source.dispatchedAt) || nativeBusy) return false;
+    const here = () => alive && conversationId === forId && epoch === forEpoch && CLF_DOM.conversationId() === forId;
+    if (!here() || !(performance.timeOrigin > source.dispatchedAt) || Date.now() - source.dispatchedAt < 15_000) return false;
+    // This is the one path that may send a handoff a second time, so its proof is read only from
+    // a settled page: a reloaded transcript can hydrate in steps, and one shown for a moment
+    // without its newest turn would still name the pre-click question as newest. The view must be
+    // the pickup's ready one (an editable composer, nothing running) and must already show that
+    // pre-click question; the verdict is then read twice, a few seconds apart.
+    const editable = () => {
+      const box = CLF_DOM.composer();
+      return Boolean(box?.isConnected && CLF_DOM.composerVisible() && box.getAttribute('contenteditable') !== 'false' &&
+        box.getAttribute('aria-disabled') !== 'true');
+    };
+    const newestUser = () => CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id ?? null;
+    const settledView = () => editable() && !generating && !CLF_DOM.generating() && pendingTools === 0 &&
+      CLF_DOM.messages().some(row => row.role === 'user' && row.id === source.before);
+    if (!(await waitPageView(() => settledView() || null, here, UNDELIVERED_READY_MS, 250)) || !here()) return false;
+    if (newestUser() !== source.before) return false;
+    await new Promise(resolve => setTimeout(resolve, UNDELIVERED_SECOND_READ_MS));
+    if (!here() || nativeBusy || !settledView()) return false;
+    const newest = newestUser();
+    if (newest !== source.before) return false;
+    const reply = await ask({
+      type: 'compact', conversationId: forId, token: job.token, sourceUndelivered: true,
+      newestUserMessage: newest, documentSince: Math.floor(performance.timeOrigin)
+    });
+    if (!here() || !reply || reply.ok !== true || reply.data?.released !== true) return false;
+    if (reply.data.job) job = reply.data.job;
+    localError = '';
+    return true;
   }
 
   /** The current generation's still-visible recoverable transport error, or a gone stream. */
@@ -9814,7 +10183,15 @@
           )
         ));
       }
-      const existing = CLF_DOM.composer();
+      let existing = CLF_DOM.composer();
+      // An earlier attempt's own handoff request, left in the box by a cancel or a reload while it
+      // was being composed; ChatGPT restores that draft on every load. It is this app's text, not
+      // the person's, yet it refused every later attempt as "a draft is already in ChatGPT"
+      // (measured 2026-10-10). Its marker is the proof, and attachments still protect a real draft.
+      if (handoffResidue(existing, prompt) && squeeze(existing.textContent) !== squeeze(prompt)) {
+        CLF_DOM.clearPromptExact(existing.textContent);
+        existing = CLF_DOM.composer();
+      }
       const occupiedByOtherDraft =
         Boolean(existing && (existing.textContent || '').trim()) &&
         squeeze(existing?.textContent) !== squeeze(prompt);
@@ -9895,7 +10272,9 @@
         // button timing out is still a provably unsent request. Once dispatched,
         // a missing reply retains custody rather than granting another click.
         attemptCrossed = true;
-        const armed = await ask({ type: 'compact', conversationId: forId, token, sourceDispatch: true });
+        const before = CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id;
+        const armed = await ask({ type: 'compact', conversationId: forId, token, sourceDispatch: true,
+          ...(typeof before === 'string' && before ? { before } : {}) });
         if (!current()) return false;
         if (!armed || armed.ok !== true || armed.data?.armed !== true) {
           localError = t(
@@ -9960,6 +10339,22 @@
   }
 
   const CONTINUATION_MARKER = /^\s*\[\[CLF-(HANDOFF|RESUME):([A-Za-z0-9_-]{16,64})\]\](?:\s|$)/;
+  /**
+   * A composer holding only an earlier attempt's unsent handoff request, exactly as this app typed
+   * it: the same instruction under another token's marker, with no attachment. Any edit makes it
+   * the person's draft again, which is preserved (#134).
+   */
+  // ChatGPT's editor keeps paragraphs as elements, so in its text the marker runs straight into the
+  // instruction ("]]Chat On Steroids…"); CONTINUATION_MARKER, which wants a space, missed it live.
+  const HANDOFF_MARKED = /^\s*\[\[CLF-HANDOFF:[A-Za-z0-9_-]{16,64}\]\]/;
+  /** A composer holding a handoff request this app typed (any attempt's), and no attachment. */
+  function handoffMarked(box) {
+    return Boolean(box && HANDOFF_MARKED.test(box.textContent || '') && !CLF_DOM.hasComposerAttachments());
+  }
+  function handoffResidue(box, prompt) {
+    const body = text => String(text || '').replace(HANDOFF_MARKED, '').replace(/\s+/g, '');
+    return handoffMarked(box) && !!body(box.textContent) && body(box.textContent) === body(prompt);
+  }
   // Same grammar as src/shared/session.ts; letters and digits cannot carry Markdown escapes.
   // A prompt that mentions an app is stored as Markdown: its marker line ends in a hard break.
   const CONTINUATION_MARKER_ESCAPED = /^\s*(?:\\?\[){2}CLF\\?-(HANDOFF|RESUME)\\?:((?:[A-Za-z0-9]|\\?[_-]){16,64})(?:\\?\]){2}\\?(?:\s|$)/;
@@ -10944,9 +11339,18 @@
 
   // -------------------------------------------------------------- commands
 
+  /** This install's names, proven apps and remembered Core, from `status` or a redeemed command. */
+  function applyCoreIdentity(reply) {
+    const known = reply?.ownCoreApp;
+    knownOwnCore = known && typeof known.appId === 'string' && /^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(known.appId) &&
+      typeof known.name === 'string' ? { path: `app://${known.appId}`, name: known.name } : null;
+    if (reply?.connectorNames && CLF_DOM.setConnectorNames(reply.connectorNames)) { ownNamesKnown = true; reportCorePlugin(); }
+    if (reply?.connectorApps && CLF_DOM.setConnectorApps(reply.connectorApps)) reportCorePlugin();
+  }
+
   async function checkStatus() {
     const reply = await ask({ type: 'status' });
-    if (reply?.connectorNames && CLF_DOM.setConnectorNames(reply.connectorNames)) { ownNamesKnown = true; reportCorePlugin(); }
+    applyCoreIdentity(reply);
     if (reply) {
       status = {
         connected: reply.connected === true,
@@ -11468,6 +11872,9 @@
       reportClaim(false);
       return;
     }
+    // This runs before the first status reply: the command brings this install's Core identity,
+    // so the bootstrap mentions this computer's own Core (see applyCoreIdentity).
+    if (reply.identity) applyCoreIdentity(reply.identity);
     const commandExpiresAt = Number.isFinite(boot.expiresAt) ? boot.expiresAt : null;
     const commandAlive = () => commandExpiresAt === null || Date.now() < commandExpiresAt;
     const commandWaitMs = (fallbackMs, reserveMs = 0) => commandExpiresAt === null
@@ -11591,10 +11998,12 @@
     // is what turned a fresh resume tab into a blank tab for a minute on a throttled page.
     step('composer');
     const readyComposer = await waitForComposer();
+    // `transient`: this page redeemed the command, loaded the chat and typed nothing, so a wake
+    // may be tried again without counting against the chat (#1086).
     if (!readyComposer) return void (await fail(t(
       'content_bootstrap_composer_unavailable',
       'ChatGPT never exposed a usable composer for bootstrap'
-    )));
+    ), 'transient'));
     if (await failIfRetargeted()) return;
 
     if (boot.model || boot.reasoningEffort) step('model');
@@ -11615,7 +12024,7 @@
       return void (await fail(t(
         'content_bootstrap_composer_unavailable',
         'ChatGPT never re-exposed a usable composer after model selection'
-      )));
+      ), 'transient'));
     }
     const selectionConfirmedAt = Date.now();
     const publishBootstrapSelection = async (id) => {
@@ -11808,7 +12217,9 @@
       // to send (#864). Clear only our own unchanged text; anything the user typed stays.
       await bootstrapDraft.clear();
       const notAccepted = t('content_bootstrap_send_not_accepted', 'ChatGPT did not accept the bootstrap send');
-      return void (await fail(sendRefusal ? `${notAccepted} (${sendRefusal})` : notAccepted));
+      // Refusals decided before the native Send click: nothing reached ChatGPT (#1086).
+      const beforeSend = ['draft-changed', 'page-busy', 'mention-changed', 'send-not-ready'].includes(sendRefusal);
+      return void (await fail(sendRefusal ? `${notAccepted} (${sendRefusal})` : notAccepted, beforeSend ? 'transient' : undefined));
     }
     agent = boot.agent || null;
     agentCommandId = agent && typeof boot.id === 'string' ? boot.id : null;
@@ -11912,25 +12323,52 @@
    */
   const LOAD_FAILURE_SETTLE_MS = 5_000;
   const LOAD_FAILURE_BACKOFF_MS = [0, 15_000, 30_000, 60_000];
+  /*
+   * Once ChatGPT has said it is limiting this history, a press a minute is what keeps the limit
+   * alive: measured 2026-10-11, each press after Retry-After drew another 429 with a longer
+   * Retry-After (11 s → 47 s) and the chat stayed unreadable for half an hour. The first press
+   * still comes when ChatGPT said it may; the ones after it back off further, to one every 15
+   * minutes, and still never stop.
+   */
+  const LOAD_FAILURE_LIMITED_BACKOFF_MS = [0, 120_000, 240_000, 480_000, 900_000];
   let loadFailureSince = 0;
   let loadFailureRetries = 0;
+  let loadFailureLimited = false;
   let loadFailureRoute = null;
+  let loadFailureToldAt = 0;
   function recoverConversationLoad(now = Date.now()) {
     const route = CLF_DOM.conversationId();
     if (route !== loadFailureRoute) {
       loadFailureRoute = route;
+      loadFailureToldAt = 0;
       loadFailureSince = 0;
       loadFailureRetries = 0;
+      loadFailureLimited = false;
+    }
+    // The provider has already told this exact history read when it may be tried again.
+    // Do not spend the page's own Retry button inside that window: each click is another
+    // history request and can extend the throttle. Once Retry-After expires, the
+    // established settle/backoff logic below resumes unchanged.
+    if (pendingHistoryRateLimit?.conversationId === route) {
+      loadFailureLimited = true;
+      if (pendingHistoryRateLimit.retryAt > now) return false;
+      pendingHistoryRateLimit = null;
     }
     const retry = CLF_DOM.conversationLoadFailure ? CLF_DOM.conversationLoadFailure() : null;
     if (!retry) {
       loadFailureSince = 0;
-      if (CLF_DOM.turns().length) loadFailureRetries = 0;
+      if (CLF_DOM.turns().length) { loadFailureRetries = 0; loadFailureLimited = false; }
       return false;
     }
+    // Whoever presses Retry here, the tab may leave this chat for ChatGPT's home page. Say so first,
+    // so that departure is not taken for the user closing the chat (#1086). At most every 30 s.
+    if (route && now - loadFailureToldAt >= 30_000) {
+      loadFailureToldAt = now;
+      void ask({ type: 'load_failure', conversationId: route }).catch(() => undefined);
+    }
     if (!loadFailureSince) loadFailureSince = now;
-    const wait = LOAD_FAILURE_SETTLE_MS +
-      LOAD_FAILURE_BACKOFF_MS[Math.min(loadFailureRetries, LOAD_FAILURE_BACKOFF_MS.length - 1)];
+    const schedule = loadFailureLimited ? LOAD_FAILURE_LIMITED_BACKOFF_MS : LOAD_FAILURE_BACKOFF_MS;
+    const wait = LOAD_FAILURE_SETTLE_MS + schedule[Math.min(loadFailureRetries, schedule.length - 1)];
     if (now - loadFailureSince < wait) return false;
     loadFailureRetries++;
     loadFailureSince = now;
@@ -11949,7 +12387,9 @@
 
   function currentActivityPullDelay() {
     const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
-    const active = nativeBusy || Boolean(job && job.busy) || pendingTools > 0;
+    // A standing approval card polls at the active cadence even hidden: an answer given in the app
+    // waits for this document's next poll.
+    const active = nativeBusy || Boolean(job && job.busy) || pendingTools > 0 || CLF_DOM.approvalWaiting();
     // A goal draft lives entirely on this feed — its streamed text is what the stage panel
     // shows, and the finished message only arrives here — so it polls at the live cadence
     // even in a hidden tab, which is exactly the tab this feature runs in.
@@ -12089,6 +12529,72 @@
     if (encoded.length > 24000 || encoded === lastUsageProjection) return;
     void ask({ type: 'usage_observation', rows, observedAt }).then((reply) => { if (reply?.ok) lastUsageProjection = encoded; });
   });
+  /**
+   * A chat ChatGPT says it deleted, read by usage.js from ChatGPT's own `conversation_deleted`
+   * answer to its history or send request (2026-10-11). Without it a message into an open deleted
+   * chat stayed "Working" until the ten-minute watchdog, and one for a closed tab either waited
+   * with no status or failed as an unconfirmed model, because the reopened tab lands on home.
+   *
+   * Only this document's chats count: its route, its recorded chat, or the chat it was loaded
+   * for (content.js can start after ChatGPT has already moved the tab home). The app ends the
+   * messages waiting for it; an open turn here ends as failed with the same reason.
+   */
+  const LOADED_CONVERSATION = (() => {
+    try { return CLF_DOM.conversationFromPath(new URL(performance.getEntriesByType('navigation')[0]?.name || location.href).pathname); }
+    catch { return null; }
+  })();
+  /**
+   * Ends this document's open turn when its chat is one ChatGPT deleted. The send's answer can
+   * arrive before the page shows the question that opens the turn (measured 2026-10-11: 2.8 s
+   * earlier), so this runs both when the answer arrives and when a turn opens after it.
+   */
+  function endDeletedTurn() {
+    if (!generating || !turnId || typeof conversationId !== 'string' || !deletedConversations.has(conversationId.toLowerCase())) return;
+    emit({ kind: 'chat_error', turnId, recoverable: false, text: CONVERSATION_DELETED });
+    finishGeneration(generationTurn(), { outcome: 'failed', detail: CONVERSATION_DELETED });
+    void flush();
+  }
+  window.addEventListener('message', (event) => {
+    if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-conversation-deleted') return;
+    const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId.toLowerCase() : '';
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(claimed) || deletedConversations.has(claimed)) return;
+    const ours = [CLF_DOM.conversationId(), conversationId, OPENED_CONVERSATION, LOADED_CONVERSATION]
+      .some(id => typeof id === 'string' && id.toLowerCase() === claimed);
+    if (!ours) return;
+    if (deletedConversations.size >= 16) deletedConversations.delete(deletedConversations.values().next().value);
+    deletedConversations.add(claimed);
+    void ask({ type: 'conversation_deleted', conversationId: claimed }).catch(() => undefined);
+    endDeletedTurn();
+  });
+  let pendingHistoryRateLimit = null;
+  function publishHistoryRateLimit() {
+    const limit = pendingHistoryRateLimit;
+    if (!limit || limit.retryAt <= Date.now() || limit.published === limit.retryAt) return;
+    if (conversationId !== limit.conversationId || CLF_DOM.conversationId() !== limit.conversationId) return;
+    limit.published = limit.retryAt;
+    emit({
+      kind: 'chat_error',
+      text: t('content_history_rate_limited', 'ChatGPT temporarily rate-limited loading this conversation history. Chat On Steroids is pausing automatic recovery until the retry wait ends.'),
+      recoverable: false,
+      blocking: true,
+      retryAt: limit.retryAt
+    });
+    void flush();
+  }
+  window.addEventListener('message', (event) => {
+    if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-history-rate-limit') return;
+    const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId : '';
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claimed) ||
+        CLF_DOM.conversationId() !== claimed) return;
+    const retryAt = Number(event.data.retryAt), observedAt = Number(event.data.observedAt);
+    if (!Number.isFinite(retryAt) || !Number.isFinite(observedAt) || retryAt <= observedAt ||
+        retryAt - observedAt > 24 * 60 * 60_000 || retryAt <= Date.now()) return;
+    if (!pendingHistoryRateLimit || pendingHistoryRateLimit.conversationId !== claimed ||
+        retryAt > pendingHistoryRateLimit.retryAt) {
+      pendingHistoryRateLimit = { conversationId: claimed, retryAt, observedAt, published: 0 };
+    }
+    publishHistoryRateLimit();
+  });
   function flushStreamRequestOrigins() {
     const route = CLF_DOM.conversationId();
     const pendingEpoch = epoch, calls = [];
@@ -12147,6 +12653,27 @@
           ...(reported.createTime ? { time: reported.createTime, authoredTime: true, authoredAt: reported.createTime } : {}) });
       }
     }
+  });
+  // The app a connector result names, read by usage.js from this chat's response stream (#1305):
+  // the first turn of a new chat can show no tool rows to the page at all. Same shape and the same
+  // once-per-request rule as the Fiber sightings; only a request id the app served teaches it.
+  window.addEventListener('message', (event) => {
+    if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-app-sighting') return;
+    if (temporaryPlannerPage()) return;
+    const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId : '';
+    if (!claimed || CLF_DOM.conversationId() !== claimed) return;
+    const fresh = [];
+    for (const entry of (Array.isArray(event.data.sightings) ? event.data.sightings : []).slice(0, 16)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const appId = cap(entry.appId, 200), requestId = cap(entry.requestId, 100);
+      if (!requestId || !appId || !/^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(appId) || sightingsReported.has(requestId)) continue;
+      const linkId = cap(entry.linkId, 200);
+      fresh.push({ requestId, appId, linkId: linkId && /^link_[A-Za-z0-9_-]{1,160}$/.test(linkId) ? linkId : null, appName: cap(entry.appName, 200) || null });
+    }
+    if (!fresh.length) return;
+    if (sightingsReported.size > 2000) sightingsReported.clear();
+    for (const sighting of fresh) sightingsReported.add(sighting.requestId);
+    emit({ kind: 'app_sightings', apps: fresh });
   });
   window.addEventListener('message', (event) => {
     if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-request-origin') return;
@@ -12350,7 +12877,11 @@
     // discard a draft or cross a new user message while main is granting the claim.
     // The first reason that holds, so the app can log why a repair waits (#820). Order matters
     // only for the message; every one of them keeps the page untouched.
-    const draft = () => Boolean((CLF_DOM.composer()?.textContent || '').trim() || CLF_DOM.hasComposerAttachments());
+    // A handoff request this app typed does not hold the repair: the attempt it starts replaces it
+    // only when it is exactly the instruction, and refuses visibly when the person edited it (#134).
+    // Holding here instead left the chat's handoff waiting with nothing on screen (2026-10-10).
+    const draft = () => !handoffMarked(CLF_DOM.composer()) &&
+      Boolean((CLF_DOM.composer()?.textContent || '').trim() || CLF_DOM.hasComposerAttachments());
     const verdict = (holds, extra) => {
       const why = holds.find(([held]) => held)?.[1];
       return { safe: !why, ...(why ? { why } : {}), ...extra };
@@ -12382,7 +12913,7 @@
   async function acceptDesktopInput(message) {
     const silencePickup = typeof message.silenceTurnId === 'string';
     let sourceQuiet = silencePickup;
-    if (desktopInputBusy || modelCatalogBusy || !alive || (generating && !message.directTurn && !silencePickup) || pendingTools > 0 || goalBusy || job?.busy) return false;
+    if (desktopInputBusy || modelCatalogBusy || !alive || (generating && !message.directTurn && !silencePickup) || (pendingTools > 0 && !message.directTurn) || goalBusy || job?.busy) return false;
     const target = message.conversationId || null;
     const forEpoch = epoch;
     const sourceTurn = turnId;
@@ -12393,7 +12924,8 @@
       (!message.recovery || sendAttempted || !stopRequestedAt) &&
       (!sourceQuiet || sendAttempted || (turnProgressRevision === sourceActivity && turnId === sourceTurn &&
         CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === sourceUser)) &&
-      (!message.directTurn || sendAttempted || (CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === sourceUser &&
+      // A first turn's question can be missing from the page (#942); its turn id alone names it.
+      (!message.directTurn || sendAttempted || ((sourceUser === undefined || CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === sourceUser) &&
         (!turnId || turnId === sourceTurn)));
     // Which onTarget condition failed, in its order, for the release report (#820). A pickup that
     // kept being withdrawn for 17 minutes could not say whether its page moved or its chat changed (#882).
@@ -12401,7 +12933,8 @@
       if (!alive) return 'page-closed';
       if (epoch !== forEpoch || CLF_DOM.conversationId() !== target) return 'left-chat';
       if (message.recovery && !sendAttempted && stopRequestedAt) return 'stop-requested';
-      const newUser = CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id !== sourceUser;
+      const newUser = !(message.directTurn && sourceUser === undefined) &&
+        CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id !== sourceUser;
       if ((sourceQuiet || message.directTurn) && !sendAttempted && newUser) return 'new-user-message';
       if ((sourceQuiet || message.directTurn) && !sendAttempted && turnId && turnId !== sourceTurn) return 'turn-changed';
       if (sourceQuiet && !sendAttempted && turnProgressRevision !== sourceActivity) return 'turn-progressed';
@@ -12457,10 +12990,20 @@
         return false;
       }
     }
+    // The running turn is named by the page's own turn id. Its question is usually shown too, but
+    // not in the first turn of a chat the app opened (#942, live 2026-10-15), and refusing there
+    // left every automatic continue of a new chat unsent.
     if (message.directTurn && (!target || ((generating || CLF_DOM.generating()) &&
-        (!sourceUser || sourceTurn !== message.directTurn.id)))) return false;
-    const ownsFreshPage = () => !target && onTarget() && location.pathname === '/' &&
-      new URL(location.href).searchParams.get('cos-input') === message.id && !CLF_DOM.turns().length;
+        (!sourceTurn || sourceTurn !== message.directTurn.id)))) return false;
+    // A new chat of a project with a native ChatGPT Project is typed only on that Project's own
+    // page, never at the root; ChatGPT may rewrite that route, so its marker can be in the hash.
+    const project = typeof message.project === 'string' && /^g-p-[0-9a-f]{32}$/.test(message.project) ? message.project : null;
+    const freshMarker = () => {
+      const url = new URL(location.href);
+      return url.searchParams.get('cos-input') === message.id || new URLSearchParams(url.hash.slice(1)).get('cos-input') === message.id;
+    };
+    const ownsFreshPage = () => !target && onTarget() && (project ? CLF_DOM.projectHomeId() === project : location.pathname === '/') &&
+      (project ? freshMarker() : new URL(location.href).searchParams.get('cos-input') === message.id) && !CLF_DOM.turns().length;
     if (!target && !ownsFreshPage()) return false;
     desktopInputBusy = true;
     let decision = null;
@@ -12483,7 +13026,7 @@
       // Keep the input queued until this same document exposes its composer again.
       const composer = await waitPageView(() => (message.directTurn || !CLF_DOM.generating()) &&
         (message.directTurn ? CLF_DOM.composerVisible() && CLF_DOM.composer() : writableComposer()),
-        () => onTarget() && (message.directTurn || silencePickup || !generating) && pendingTools === 0, 15000);
+        () => onTarget() && (message.directTurn || ((silencePickup || !generating) && pendingTools === 0)), 15000);
       if (!composer && onTarget() && CLF_DOM.generating() && await confirmedProviderTerminal() && onTarget() && CLF_DOM.generating()) {
         // Only after readiness expires, re-prove the exact terminal: a Retry or
         // new user turn must never become authority to reload the page.
@@ -12500,13 +13043,18 @@
         return false; // No claim, insertion or Send: queued input survives recovery.
       }
       if (!composer || !onTarget() || (!message.directTurn && ((!silencePickup && generating) || CLF_DOM.generating())) || !CLF_DOM.composerVisible()) return false;
-      const reply = await ask({ type: 'desktop_input', id: message.id, conversationId: target, requiresAuthorization: true });
+      const reply = await ask({ type: 'desktop_input', id: message.id, conversationId: target, requiresAuthorization: true,
+        ...(project ? { project: CLF_DOM.projectHomeId() } : {}) });
       const input = reply?.data?.input;
       if (input?.silenceBoundary || input?.completedTurnId) { claimedSilence = input; sourceQuiet = true; }
       if (!input) return false;
       if (!onTarget()) { noteWithdraw(offTarget()); return false; }
       withdrawableRecoveryDraft = Boolean(input.recovery) && !(input.images || []).length && !(input.attachments || []).length;
-      const fail = async (error) => { await ask({ type: 'desktop_input', id: input.id, owner: input.owner, fail: true, error }); return false; };
+      // A chat ChatGPT deleted fails every check after it (its tab moves home); say why instead.
+      const fail = async (error) => {
+        const why = target && deletedConversations.has(target.toLowerCase()) ? CONVERSATION_DELETED : error;
+        await ask({ type: 'desktop_input', id: input.id, owner: input.owner, fail: true, error: why }); return false;
+      };
       // ChatGPT restores its shared home draft even in a newly opened input tab.
       // This exact claimed bootstrap owns replacement text; existing chats and
       // attachment drafts remain protected. Re-evaluate after model selection,
@@ -12533,32 +13081,22 @@
         'ChatGPT already contains an unsent draft. Send or clear that draft in Chrome before trying again.'
       ));
       if (message.directTurn) {
-        // The offer only wakes this document. The just-committed outbox claim
-        // authorizes interrupting this exact tool-free turn, like handoff's Stop
-        // then normal Send. A changed question, tool call or lost claim forbids it.
-        if (input.directTurn?.id !== message.directTurn.id || pendingTools > 0) return fail(t(
+        // The offer only wakes this document. The just-committed outbox claim names the exact turn
+        // this message is for; a changed turn or a lost claim forbids sending it into another one.
+        // ChatGPT takes a message while it works and folds it into the running turn, a call still
+        // running included (measured 2026-10-09, #1231), so nothing is stopped first.
+        if (input.directTurn?.id !== message.directTurn.id) return fail(t(
           'content_delivery_turn_changed',
           'The turn changed before direct delivery.'
         ));
-        if (CLF_DOM.generating()) {
-          if (turnId !== input.directTurn.id || !requestNativeStop(onTarget)) return fail(t(
-            'content_delivery_stop_failed',
-            'The current answer could not be stopped.'
-          ));
-        }
-        const idle = await waitPageView(() => !CLF_DOM.generating() && !generating && CLF_DOM.composerVisible(),
-          () => onTarget() && pendingTools === 0, INTERRUPT_WAIT_MS);
-        if (!idle || !onTarget()) return fail(t(
-          'content_delivery_chat_changed_or_busy',
-          'The chat changed or did not stop. The message was not sent.'
-        ));
-        // Publish the native stopped/completed boundary before final Send policy.
         await flush();
         if (!onTarget()) return fail(t(
           'content_delivery_chat_changed',
           'The chat changed before direct delivery.'
         ));
       }
+      // A message for the running turn keeps that turn's model: the picker belongs to the next turn.
+      const intoRunningTurn = () => !!message.directTurn && CLF_DOM.generating();
       const temporary = input.lifetime === 'temporary-planner';
       // On the newer shell an empty temporary chat is proven only by the page-model stamp, and
       // nothing else scans a document with no conversation yet: ask for one before judging.
@@ -12574,7 +13112,7 @@
       const providerLimitation = () => CLF_DOM.errors().find(error => error.blocking === true)?.text;
       const limitation = providerLimitation();
       if (limitation) return fail(limitation);
-      if (!(await CLF_DOM.selectModelSettings(input.model, input.reasoningEffort, onTarget))) return fail(
+      if (!intoRunningTurn() && !(await CLF_DOM.selectModelSettings(input.model, input.reasoningEffort, onTarget))) return fail(
         providerLimitation() || t(
           'content_delivery_model_unconfirmed',
           'Requested model or reasoning could not be confirmed'
@@ -12582,14 +13120,14 @@
       );
       // Native picker closure can precede re-enabling the same editor. Wait before
       // its one insertion; a disabled editing host is not a rejected helper prompt.
-      if (!await waitPageView(writableComposer, () => onTarget() && !CLF_DOM.generating(), 15000)) return fail(t(
+      if (!await waitPageView(writableComposer, () => onTarget() && (!!message.directTurn || !CLF_DOM.generating()), 15000)) return fail(t(
         'content_delivery_editor_not_writable',
         'The ChatGPT editor did not become writable before sending.'
       ));
       // Same allowance as the draft check above, for the same reason: text this delivery itself left
       // behind is not a composer that "changed". Re-read rather than reusing `ownResidue`, because
       // model selection and the writability wait sit between the two and can replace the editor.
-      if (!onTarget() || CLF_DOM.generating() ||
+      if (!onTarget() || (CLF_DOM.generating() && !message.directTurn) ||
           (!ownsFreshPage() && (CLF_DOM.composer()?.textContent || '').trim() &&
             sendText(CLF_DOM.composer()?.textContent) !== sendText(input.text)) ||
           CLF_DOM.hasComposerAttachments()) return fail(t(
@@ -12655,6 +13193,21 @@
       // comparison never matched, and that first turn got no ACK, no turn start and no turn end
       // for Goal or Loop to act on. The bootstrap comparison is exact either way (raw, then one
       // unescape); a person's own sends keep the raw comparison in matchesUserSendReceipt.
+      // While ChatGPT thinks or runs a tool it offers only Stop, no Send (measured 2026-10-15 on
+      // the user's Mac: every automatic continue for a long turn timed out unsent, and the turns
+      // broke at 41 and 52 minutes anyway). The automatic continue then does what #1402 decided by
+      // hand: Stop right after the tool result, then send Continue as the next message. A person's
+      // own message is never allowed to stop a turn; it waits for the turn's end instead.
+      let intoTurn = !!message.directTurn;
+      if (intoTurn && input.purpose === 'rotation' && CLF_DOM.generating() &&
+          !await waitPageView(() => !!CLF_DOM.sendButton(), onTarget, 3000)) {
+        if (!CLF_DOM.stopGeneration(onTarget) ||
+            !await waitPageView(() => !CLF_DOM.generating() && !!CLF_DOM.sendButton() && draft.current(), onTarget, 20000)) return fail(t(
+          'content_delivery_rotation_not_stopped',
+          'ChatGPT offered no Send in the running answer, and stopping it for the automatic continue did not finish.'
+        ));
+        intoTurn = false;
+      }
       const nativeSend = () => sendSubmittedText(sendingTarget, false, async sendCurrent => {
         // Preserve the outbox's revocable claim until the actual native Send is ready.
         if (input.recovery && !await recoveryPageUnfinished(() => sendCurrent() && onTarget() && draft.current(), withdrawWhy)) return false;
@@ -12685,14 +13238,25 @@
       // ChatGPT switches its own image tool off for a message that mentions an app).
       input.purpose === 'decision' || (input.coreMention === false && !input.recovery && !agent) ? null
         : input.recovery || agent || mentionCore ? currentCoreMention() : null,
-      sentRequestSince);
+      since => sentRequestSince(since, forEpoch), intoTurn);
       // #744: one retry when the editor was replaced before anything asked to send it.
       if (!(await nativeSend()) &&
           !(!authorizing && !sendAttempted && !receipt && !draft.current() && draftCurrent() && await nativeSend())) {
         // Send was clicked, but no row proved it. Say so instead of keeping the claim open: the
         // app retires it as an uncertain send, never a replay, and this document takes the next
         // input. The reason is a fixed code the app recognises (see failBrowserInput).
-        if (sendAttempted && !receipt) return fail('Native Send receipt was not confirmed.');
+        if (sendAttempted && !receipt) {
+          // Proof that the click did not deliver: ChatGPT left this exact text in its composer and
+          // showed no new user message. Clearing that exact draft lets the app send it once more;
+          // anything less certain stays an unconfirmed send that is never replayed (#821).
+          if (onTarget() && sendText(CLF_DOM.composer()?.textContent) === submittedText &&
+              CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === previousUserId) {
+            let cleared = false;
+            try { cleared = await draft.clear(); } catch { /* An unclearable draft is no proof. */ }
+            if (cleared) return fail('Native Send did not take the message.');
+          }
+          return fail('Native Send receipt was not confirmed.');
+        }
         return false;
       }
       if (!receipt || !sendingTarget()) return false;
@@ -12814,12 +13378,87 @@
     return (url.pathname === '/' && /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(url.hash)?.[1]) ||
       (!url.hash && /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(url.pathname)?.[1]) || null;
   }
+  /**
+   * Creates a new CoS project's native ChatGPT Project through ChatGPT's own dialog (#1176).
+   *
+   * Only the helper the app opened for this exact request does it: ChatGPT's home with its marker.
+   * Before the click that creates the Project nothing can exist remotely, so any failure is a plain
+   * failure. The app records `arm` before that click; from there a missing id makes the request
+   * uncertain in the app, never retried on its own. The id is taken only from the new Project's own
+   * page, which ChatGPT opens by itself after creating it.
+   */
+  let projectCreateBusy = false;
+  /**
+   * Archives one retired worker chat with ChatGPT's own reversible archive (#1460): the chat
+   * leaves the chat list and can be restored from ChatGPT's settings. One request for one exact
+   * chat of the signed-in account; nothing is deleted and nothing else is touched.
+   */
+  async function archiveWorkerChat(conversationId) {
+    const id = String(conversationId || '').toLowerCase();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) return 'failed';
+    const signedIn = await fetch(`${location.origin}/api/auth/session`, { credentials: 'include' });
+    const session = signedIn.ok ? await signedIn.json() : null;
+    const token = typeof session?.accessToken === 'string' ? session.accessToken : '';
+    if (!token) return 'failed';
+    const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+    // A workspace chat belongs to that workspace's account, which ChatGPT names in this header.
+    if (typeof session.account?.id === 'string' && session.account.id) headers['ChatGPT-Account-Id'] = session.account.id;
+    const archived = await fetch(`${location.origin}/backend-api/conversation/${id}`, {
+      method: 'PATCH', credentials: 'include', headers, body: JSON.stringify({ is_archived: true })
+    });
+    return archived.ok ? 'archived' : 'failed';
+  }
+
+  async function createChatgptProject(request) {
+    if (projectCreateBusy || !request || !/^[a-f0-9-]{36}$/i.test(String(request.id)) || typeof request.name !== 'string' || !request.name) return false;
+    const marked = () => alive && location.pathname === '/' && new URL(location.href).searchParams.get('cos-project-create') === request.id;
+    if (!marked()) return false;
+    projectCreateBusy = true;
+    const report = (action, extra = {}) => ask({ type: 'project_create', action, id: request.id, ...extra });
+    const fail = async error => { await report('fail', { error }); return false; };
+    try {
+      // Claimed first, so that any failure from here is the app's `failed`, shown with Retry,
+      // rather than a request offered to this page again on every pass.
+      if ((await report('claim'))?.data?.ok !== true || !marked()) return false;
+      let revealed = false;
+      const control = await waitPageView(() => CLF_DOM.projectCreateControl() ||
+        (!revealed && (revealed = CLF_DOM.revealSidebar()) && null), marked, 20_000, 250);
+      if (!control) return fail('ChatGPT did not show its New project control');
+      control.click();
+      // A click can be lost while the page is still settling (1 of 13 live, 2026-10-10). Nothing is
+      // armed yet, so one more click on the same native control is safe.
+      let form = await waitPageView(() => CLF_DOM.projectCreateForm(), marked, 8_000, 250);
+      if (!form && marked() && CLF_DOM.projectCreateControl()) {
+        CLF_DOM.projectCreateControl().click();
+        form = await waitPageView(() => CLF_DOM.projectCreateForm(), marked, 8_000, 250);
+      }
+      if (!form) return fail('ChatGPT did not open its Create project dialog');
+      if (!CLF_DOM.fillProjectName(form.input, request.name)) return fail('The Project name could not be entered');
+      const ready = await waitPageView(() => { const now = CLF_DOM.projectCreateForm(); return now && !now.submit.disabled && now.input.value === request.name ? now : null; }, marked, 5_000, 250);
+      if (!ready) return fail('ChatGPT did not accept the Project name');
+      // The Projects ChatGPT already lists: the new one's id must not be among them, so another
+      // Project's page reached some other way can never be taken for it.
+      const existing = new Set(CLF_DOM.projectIdsShown());
+      if ((await report('arm'))?.data?.ok !== true || !marked()) return fail('The app did not confirm the Project creation');
+      ready.submit.click();
+      // ChatGPT opens the new Project's page itself; that route is the only proof of its id.
+      const id = await waitPageView(() => { const shown = CLF_DOM.projectHomeId(); return shown && !existing.has(shown) ? shown : null; },
+        () => alive, 20_000, 250);
+      if (!id) return fail('ChatGPT did not open the new Project');
+      return (await report('done', { chatgptId: id }))?.data?.ok === true;
+    } finally {
+      projectCreateBusy = false;
+    }
+  }
+
   async function refreshManagedPlugin(request) {
     if (pluginRefreshBusy || !request || !/^[a-f0-9-]{36}$/i.test(request.id) || !ownsPluginRefreshPage(request.id)) return false;
     pluginRefreshBusy = true;
-    const requestEpoch = epoch;
-    const ownsRequest = () => epoch === requestEpoch && ownsPluginRefreshPage(request.id);
-    const fail = error => ask({ type: 'plugin_refresh', action: 'fail', id: request.id, error });
+    const requestEpoch = epoch, requestHref = location.href;
+    // Settings routes share a conversation epoch. A different marked settings URL is
+    // still a navigation, never permission to act or attribute this page's failed read.
+    const ownsRequest = () => epoch === requestEpoch && location.href === requestHref && ownsPluginRefreshPage(request.id);
+    const fail = error => ownsRequest() ? ask({ type: 'plugin_refresh', action: 'fail', id: request.id, error }, ownsRequest) : null;
     const canonical = value => Array.isArray(value) ? `[${value.map(canonical).join(',')}]` : value && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}` : JSON.stringify(value);
     const schemaKey = tools => Array.isArray(tools) ? canonical(tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })).sort((a, b) => a.name.localeCompare(b.name))) : null;
     try {
@@ -12827,23 +13466,44 @@
       const listUrl = new URL(location.href);
       const pathList = listUrl.pathname === '/settings/plugins-settings' && !listUrl.hash;
       if (pathList || (listUrl.pathname === '/' && listUrl.hash === '#settings/Plugins')) {
-        if (request.appId) {
+        const installedAppId = request.observeOnly === true ? request.appId ?? null : null;
+        const installedSurface = installedAppId ? request.surface ?? null : null;
+        if (request.appId && !installedAppId) {
           const url = new URL(location.href);
           if (pathList) url.pathname = `/settings/plugins-settings/plugin_${request.appId}`;
           else url.hash = `settings/Plugins/plugin_${request.appId}`;
           if (!current()) return false;
           location.assign(url.href); return true;
         }
-        const buttons = await waitPageView(() => CLF_DOM.pluginInstalledButtons(request.connectorName), current, 8000);
-        if (!buttons || !current()) return false;
-        if (buttons.length !== 1) {
+        let linkHref = null;
+        const buttons = await waitPageView(() => {
+          const found = CLF_DOM.pluginInstalledButtons(request.connectorName, installedAppId, installedSurface);
+          linkHref = found?.length === 1 && found[0].tagName === 'A' ? found[0].href : null;
+          return found;
+        }, current, 8000);
+        if (!current()) return false;
+        if (!buttons && !installedAppId) return false;
+        if (!buttons || buttons.length !== 1 || (installedAppId && buttons[0].tagName !== 'A')) {
           await fail(t(
             'content_connector_identity_ambiguous',
-            'Installed connector identity is unavailable or ambiguous'
+            'Installed plugin identity is unavailable or ambiguous'
           ));
           return false;
         }
-        buttons[0].click();
+        const button = buttons[0];
+        if (button.tagName === 'A') {
+          // The native installed link already names an exact management route. Recheck
+          // the same visible owner across the await and carry custody into navigation;
+          // reading the destination's schema is a later step, not a prerequisite here.
+          const found = CLF_DOM.pluginInstalledButtons(request.connectorName, installedAppId, installedSurface);
+          if (!current() || !button.isConnected || found?.length !== 1 || found[0] !== button || button.href !== linkHref) return false;
+          const url = new URL(linkHref, requestHref);
+          const route = /^\/settings\/plugins-settings\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(url.pathname);
+          if (url.origin !== listUrl.origin || !route || url.hash || (installedAppId && route[1] !== installedAppId)) return false;
+          url.searchParams.set('cos-plugin-refresh', request.id);
+          location.assign(url.href); return true;
+        }
+        button.click();
         // The provider's installed-row navigation drops the query marker. This
         // already-owned discovery may learn its resulting exact App Id, but cannot
         // claim Refresh until the management document has its marker again.
@@ -12881,7 +13541,7 @@
         // cause in the durable row, which is the opposite of the point.
         if (current()) await fail(t(
           'content_connector_settings_unreadable',
-          'The connector settings card could not be read on the page this request owns'
+          'The plugin settings card could not be read on the page this request owns'
         ));
         return false;
       }
@@ -12889,7 +13549,7 @@
       if (request.appId && view.appId !== request.appId) {
         await fail(t(
           'content_connector_settings_unverified',
-          'Exact connector settings could not be verified'
+          'Exact plugin settings could not be verified'
         ));
         return false;
       }
@@ -12897,28 +13557,37 @@
       const stillCurrent = () => current() && epoch === ownedEpoch && pluginViewAppId(location.href) === appId;
       const before = schemaKey(view.tools), expected = schemaKey(request.tools);
       if (before === expected) {
-        return (await ask({ type: 'plugin_refresh', action: 'current', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId }))?.data?.ok === true && stillCurrent();
+        return (await ask({ type: 'plugin_refresh', action: 'current', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId }, stillCurrent))?.data?.ok === true && stillCurrent();
+      }
+      if (request.observeOnly) {
+        await fail(t('content_connector_settings_unverified', 'Exact plugin settings could not be verified'));
+        return false;
       }
       if (!view.refresh || view.refresh.disabled) {
         const error = t(
           'content_connector_schema_no_refresh',
-          'Connector schema differs, but ChatGPT exposes no Refresh control. Recreate or republish this custom app to load the current tool schema.'
+          'Plugin schema differs, but ChatGPT exposes no Refresh control. Recreate or republish this plugin to load the current tool schema.'
         );
-        return (await ask({ type: 'plugin_refresh', action: 'manual', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId, error }))?.data?.ok === true && stillCurrent();
+        return (await ask({ type: 'plugin_refresh', action: 'manual', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId, error }, stillCurrent))?.data?.ok === true && stillCurrent();
       }
-      const claimed = await ask({ type: 'plugin_refresh', action: 'claim', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId });
+      const claimed = await ask({ type: 'plugin_refresh', action: 'claim', id: request.id, appId, connectorName: request.connectorName, tools: view.tools, tunnelId }, stillCurrent);
       if (!claimed?.data?.ok || !stillCurrent() || view.refresh.isConnected === false || view.refresh.disabled) {
         await fail(t(
           'content_connector_refresh_claim_unconfirmed',
-          'Connector refresh claim or page ownership was not confirmed'
+          'Plugin refresh claim or page ownership was not confirmed'
         ));
         return false;
       }
       view.refresh.click(); // the durable main-process attempt owns this one click
+      // The page does not show the tool list, so the new tools arriving changes no element: a
+      // wait that looked only on page changes saw them when the Refresh button turned active
+      // again, about 10 s later, and gave up at 12 s. Measured on Windows 2026-10-13, it recorded
+      // a refresh that had worked as failed in 2 of 3 runs. Look every half second, for up to a
+      // minute (the worker leaves a busy tab open); the one click stays one click.
       const after = await waitPageView(async () => {
         const next = await CLF_DOM.pluginRefreshView(request.connectorName, request.tools, appId);
         return next && before !== expected && schemaKey(next.tools) === expected ? next : null;
-      }, stillCurrent, 12000);
+      }, stillCurrent, 60000, 500);
       if (!after) {
         await fail(t(
           'content_connector_refresh_schema_unchanged',
@@ -12926,9 +13595,9 @@
         ));
         return false;
       }
-      return (await ask({ type: 'plugin_refresh', action: 'complete', id: request.id, appId, tools: after.tools, versionId: after.versionId }))?.data?.ok === true;
+      return (await ask({ type: 'plugin_refresh', action: 'complete', id: request.id, appId, tools: after.tools, versionId: after.versionId }, stillCurrent))?.data?.ok === true;
     } catch {
-      await fail(t('content_connector_refresh_unverified', 'Connector refresh could not be verified'));
+      await fail(t('content_connector_refresh_unverified', 'Plugin refresh could not be verified'));
       return false;
     }
     finally { pluginRefreshBusy = false; }
@@ -13048,6 +13717,10 @@
       // background.js uses this only to distinguish a live isolated-world recorder from the
       // dead context Chrome leaves behind when an unpacked extension is reloaded while the
       // ChatGPT document stays open. No page/session data crosses in this health check.
+      if (message.type === 'clf-archive-chat') {
+        void archiveWorkerChat(message.conversationId).then(outcome => sendResponse({ outcome })).catch(() => sendResponse({ outcome: 'failed' }));
+        return true;
+      }
       if (message.type === 'clf-stop-turn') {
         void stopAppTurn(message).then(ok => sendResponse({ ok })).catch(() => sendResponse({ ok: false }));
         return true;
@@ -13064,10 +13737,26 @@
       if (message.type === 'clf-plugin-refresh-state') {
         sendResponse({ safe: !pluginRefreshBusy && ownsPluginRefreshPage(message.id) && CLF_DOM.pluginManagementIdle() }); return false;
       }
+      if (message.type === 'clf-project-create') {
+        void createChatgptProject(message.request).then(ok => sendResponse({ ok })).catch(() => sendResponse({ ok: false }));
+        return true;
+      }
+      if (message.type === 'clf-project-create-state') {
+        // The helper may close once it holds nothing of the person's: no chat, no draft, no work.
+        const box = CLF_DOM.composer();
+        sendResponse({ safe: !projectCreateBusy && !CLF_DOM.conversationId() && !CLF_DOM.generating() &&
+          !(box && (box.textContent || '').trim()) && !CLF_DOM.hasComposerAttachments() &&
+          (location.pathname === '/' || !!CLF_DOM.projectHomeId()) });
+        return false;
+      }
       if (message.type === 'clf-model-catalog-state') {
         const reason = modelCatalogBusy ? 'inspection_busy' : catalogPageBlocker();
-        sendResponse({ ready: !modelCatalogBusy && (!reason || (reason === 'composer_missing' && catalogHelper())), reason });
-        return false;
+        const ready = !modelCatalogBusy && (!reason || (reason === 'composer_missing' && catalogHelper()));
+        // A borrowed chat must also have a picker the reader accepts; an owned helper is a fresh home page.
+        if (!ready || catalogHelper()) { sendResponse({ ready, reason }); return false; }
+        void CLF_DOM.modelPickerReadable().catch(() => false)
+          .then(readable => sendResponse(readable ? { ready: true, reason: null } : { ready: false, reason: 'picker_unreadable' }));
+        return true;
       }
       if (message.type === 'clf-input-reuse-state') {
         sendResponse({ safe: inputReuseSafe(), navigationEpoch: epoch });
@@ -13080,6 +13769,19 @@
       if (message.type === 'clf-desktop-input') {
         void acceptDesktopInput(message).then((ok) => sendResponse({ ok })).catch(() => sendResponse({ ok: false }));
         return true;
+      }
+      if (message.type === 'clf-keep-awake') {
+        sendResponse({ ok: true, held: setKeepAwake(message.on === true) });
+        return false;
+      }
+      if (message.type === 'clf-route-changed') {
+        // The extension saw this page take a new address. A hidden tab's own observe tick can be
+        // held back for long; this observation runs now (2026-10-15).
+        if (recorderHandle.healthy()) {
+          try { observe(); } catch { /* The regular tick observes again. */ }
+        }
+        sendResponse({ ok: true });
+        return false;
       }
       if (message.type === 'clf-recorder-ping') {
         // `busy`: this page is mid-turn or mid-handoff, so the extension must not reload under it.
@@ -13096,7 +13798,23 @@
         return true;
       }
       if (message.type === 'clf-resume-compaction') {
-        sendResponse({ accepted: resumePendingCompactionFromRepair(message.conversationId) });
+        const accepted = resumePendingCompactionFromRepair(message.conversationId);
+        if (accepted || job?.stage === 'handoff-pending' || !alive || !message.conversationId || conversationId !== message.conversationId) {
+          sendResponse({ accepted });
+          return false;
+        }
+        // A desktop Compact hands its pickup ~90 ms after opening the ticket, before this page's
+        // feed has carried the job. Declining then reloaded a healthy chat, and the handoff request
+        // met a composer that was not ready yet (VM 2026-10-09). Read the feed once, then decide.
+        void (async () => {
+          for (let wait = 0; pulling && wait < 15; wait++) await new Promise(resolve => setTimeout(resolve, 100));
+          await pullActivity();
+        })().catch(() => {}).then(() => sendResponse({ accepted: resumePendingCompactionFromRepair(message.conversationId) }));
+        return true;
+      }
+      // Diagnostics report: which of ChatGPT's controls this page still has. Booleans only.
+      if (message.type === 'clf-page-checks') {
+        sendResponse(CLF_DOM.pageChecks());
         return false;
       }
       // Popup diagnostics. Ids and counters only — no prose, no transcript, no page text.
@@ -13132,9 +13850,17 @@
         return false;
       }
       if (message.type === 'clf-tab-close-check') {
+        // A fresh chat the app opened, or the source chat it opened only to follow its Project link
+        // for Compact & resume; both are the app's own tab for that one command.
+        // The entry tab never binds its source chat as this page's own, so the chat it may show is
+        // the one the app opened it on.
+        const failedEntry = () => OPENED_PROJECT_ENTRY && !!OPENED_CONVERSATION && !conversationId &&
+          CLF_DOM.conversationId() === OPENED_CONVERSATION;
         const failedBootstrap = message.failedCommand?.id === startupCommandId && message.failedCommand?.client === RUN_ID &&
-          markerId() === startupCommandId && !OPENED_CONVERSATION && !conversationId && commandsHandled.has(startupCommandId) &&
+          markerId() === startupCommandId && commandsHandled.has(startupCommandId) &&
+          ((!OPENED_CONVERSATION && !conversationId) || failedEntry()) &&
           (!commandAttempt || (commandAttempt.id === startupCommandId && commandAttempt.phase === 'failed'));
+        const shownConversation = failedBootstrap && failedEntry() ? OPENED_CONVERSATION : conversationId;
         // Maintenance carries the app's terminal tombstone for this exact claimed
         // document. Revocation is independent of whether the renderer is safe to close.
         const retired = (Array.isArray(message.cancelledDecisions) ? message.cancelledDecisions : [])
@@ -13154,7 +13880,7 @@
           // authorizing closure; the final answer must survive the document.
           if (terminal) { await flush(); observe(); }
           sendResponse({ conversationId: CLF_DOM.conversationId(), navigationEpoch: epoch,
-            safe: alive && epoch === observedEpoch && message.conversationId === conversationId && CLF_DOM.conversationId() === conversationId &&
+            safe: alive && epoch === observedEpoch && message.conversationId === shownConversation && CLF_DOM.conversationId() === shownConversation &&
               !generating && pendingTools === 0 && (!CLF_DOM.generating() ||
                 (terminal && expectedTerminal === fiberTerminalMessageId && fiberTurnFor(currentAssistantTurn())?.endMessageId === expectedTerminal)) && !desktopInputBusy && !modelCatalogBusy && !pluginRefreshBusy && !desktopDecision &&
               ((!commandAttempt && !commandJournalGate) || failedBootstrap) && (!message.failedCommand || failedBootstrap) &&
@@ -13174,8 +13900,9 @@
         sendResponse({ safe: temporaryPlannerPage() && (location.href.includes(`cos-input=${message.id}`) || routedHelper) &&
           !generating && !CLF_DOM.generating() && pendingTools === 0 && !CLF_DOM.hasComposerAttachments() &&
           !(CLF_DOM.composer()?.textContent || '').trim() &&
-          // A remembered helper whose decision is gone may still show its own one prompt.
-          (users.length === 0 || (exact && users.length === 1 && (desktopDecision ? matchesSubmittedUser(users[0], desktopDecision.text) : !!servedPlanner))) });
+          // A remembered helper whose decision is gone may still show its own one prompt. The app
+          // inserted that prompt, so ChatGPT may store it Markdown-escaped, as its receipt allows.
+          (users.length === 0 || (exact && users.length === 1 && (desktopDecision ? matchesSubmittedBootstrap(users[0], desktopDecision.text) : !!servedPlanner))) });
         return false;
       }
       if (message.type === 'clf-render-stream') {
@@ -13380,6 +14107,7 @@
       pullActivity,
       activityPullDelay,
       currentActivityPullDelay,
+      recoverConversationLoad,
       notePresentation,
       presentationPending,
       runCommand,

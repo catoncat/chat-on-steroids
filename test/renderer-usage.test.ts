@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { JSDOM } from 'jsdom';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { UsageOverview } from '../src/shared/usage.js';
+import type { ProviderUsage } from '../src/shared/provider-usage.js';
 
 let dom: JSDOM;
 /**
@@ -137,7 +138,8 @@ it.each([256_000, 400_000])('shows the calculated %i context cap and edits formu
   expect(balances.textContent).not.toMatch(/deep_research|file_upload|paste_text_to_file|image_gen|below/);
   expect(field('usageDivisor')).toBe(divisor);
   expect(dom.window.document.getElementById('costModel')).toBeNull();
-  expect(cost()).toContain(usd(0.48)); expect(cost()).toContain('unpriced');
+  // Unpriced tokens make the priced sum a lower bound.
+  expect(cost()).toContain(`≥ ${usd(0.48)}`);
   change(divisor, '4');
   expect(cost()).toContain(usd(0.24));
   expect(dom.window.document.getElementById('usageFormula')!.textContent).toContain('÷ 4');
@@ -148,7 +150,7 @@ it.each([256_000, 400_000])('shows the calculated %i context cap and edits formu
   expect(cost()).toContain(usd(0.24));
   const unknownRate = dom.window.document.querySelector('input[aria-label="another-model cached-input USD per million tokens"]') as HTMLInputElement;
   change(unknownRate, '1');
-  expect(cost()).toContain(usd(0.84)); expect(cost()).not.toContain('unpriced');
+  expect(cost()).toContain(usd(0.84)); expect(cost()).not.toContain('≥');
   change(field('usageMultiplier'), '1');
   expect(cost()).toContain(usd(0.7));
   expect(getUsage).toHaveBeenCalledTimes(1);
@@ -199,7 +201,7 @@ it('combines equivalent recorded names in the table while keeping raw rate edits
   expect(dom.window.document.querySelectorAll('#usageRates input')).toHaveLength(3);
   const rate = dom.window.document.querySelector('input[aria-label="5.6 cached-input USD per million tokens"]') as HTMLInputElement;
   rate.value = ''; rate.dispatchEvent(new dom.window.Event('input'));
-  expect(table().textContent).toContain(`${usd(0.96)} + unpriced`);
+  expect(table().textContent).toContain(`≥ ${usd(0.96)}`);
   expect(getUsage).toHaveBeenCalledTimes(1);
   expect(models[0]!.model).toBe('5.6');
 });
@@ -225,7 +227,8 @@ it.each(['2026-09-28', '2026-10-01', '2027-01-01', '2028-02-29'])('draws an annu
   expect(cells.filter(cell => cell.dataset.level && cell.dataset.level !== '0')).toHaveLength(2);
   const cellAt = (cell: HTMLElement) => [cell.style.gridRow, cell.style.gridColumn];
   expect(cellAt(today)).toEqual([String(todayRow + 2), '53']);
-  expect([...heat.querySelectorAll('.heat-day')].map(label => label.textContent)).toEqual(['Mon', 'Wed', 'Fri', 'Sun']);
+  // Every row has its (sticky) label cell; every other day is named.
+  expect([...heat.querySelectorAll('.heat-day')].map(label => label.textContent)).toEqual(['Mon', '', 'Wed', '', 'Fri', '', 'Sun']);
   expect(heat.querySelectorAll('.heat-month')).toHaveLength(12);
   expect(new Set([...heat.querySelectorAll('.heat-month')].map(label => label.textContent)).size).toBe(12);
   expect(heat.querySelector('.heat-legend')!.textContent).toBe('LessMore');
@@ -257,4 +260,72 @@ it('prints totals and amounts in the app language and follows a language change'
   expect(cost()).toMatch(/\$/);
   setLanguage('en');
   expect(processed()).toBe(compact('en'));
+});
+
+// German compact notation does not shorten thousands, so an estimated count showed its fraction:
+// "307.373,5" peak daily tokens (2026-10-09). Counts print as whole numbers in every language.
+it('prints estimated token counts as whole numbers where compact notation keeps the thousands', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const models = [{ model: 'gpt-5.6-sol', reasoningEffort: 'high', assumed: false, tokens: 307_373.5 }];
+  const data: UsageOverview = { contextTokenCap: 256_000, messages: { through: Date.now(), days: [] }, tokens: 307_373.5, models, days: [{ date: '2026-10-08', tokens: 307_373.5, models }], sessions: 1, limits: [] };
+  Object.assign(dom.window, { api: { getUsage: vi.fn(async () => ({ ok: true, data })), getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const { initUsage, refreshUsage } = await import('../src/renderer/usage.js');
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  initUsage(); await refreshUsage();
+  const peak = () => dom.window.document.querySelector('[data-usage-metric="Peak daily tokens"] strong')!.textContent;
+  setLanguage('de');
+  expect(peak()).toBe('307.374');
+  setLanguage('en');
+  expect(peak()).toBe('307.4K');
+});
+
+// #482: Codex's and Claude Code's usage, read from their own logs on this computer.
+it('shows other apps’ reported limits apart from tokens counted here, and says what is not reported', async () => {
+  dom = new JSDOM(readFileSync(new URL('../src/renderer/index.html', import.meta.url), 'utf8'), { url: 'https://local.test/' });
+  vi.stubGlobal('window', dom.window); vi.stubGlobal('document', dom.window.document); vi.stubGlobal('localStorage', dom.window.localStorage);
+  const now = Date.now();
+  const today = new Date(now); const key = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+  const providers: ProviderUsage = { enabled: true, readAt: now,
+    codex: { limits: [
+      { id: 'codex', plan: 'plus', reached: null, observedAt: now - 60_000, credits: null, windows: [
+        { windowMinutes: 300, usedPercent: 30, resetsAt: now + 3_600_000 },
+        { windowMinutes: 10080, usedPercent: 65, resetsAt: now - 1000 }
+      ] },
+      { id: 'premium', plan: null, reached: 'workspace_owner_credits_depleted', observedAt: now - 60_000, credits: null, windows: [] }
+    ], days: [{ date: key, input: 2_000_000, cachedInput: 1_500_000, output: 40_000 }] },
+    claude: { days: [{ date: key, models: [{ model: 'claude-opus-5-5', input: 10, cacheWrite: 1000, cacheRead: 3_000_000, output: 5000 }] }] } };
+  const getProviderUsage = vi.fn(async () => ({ ok: true, data: providers }));
+  const data: UsageOverview = { contextTokenCap: 256_000, tokens: 0, models: [], days: [], sessions: 0, limits: [], messages: { through: now, days: [] } };
+  Object.assign(dom.window, { api: { getUsage: async () => ({ ok: true, data }), getProviderUsage, getChatModels: async () => ({ ok: true, data: { models: [] } }) } });
+  const { initLanguage } = await import('../src/renderer/i18n.js'); initLanguage();
+  const usage = await import('../src/renderer/usage.js'); usage.initUsage();
+  await usage.refreshUsage();
+  const host = dom.window.document.getElementById('otherAppsUsage')!;
+  const text = host.textContent!;
+  expect(text).toContain('Codex · 5-hour limit');
+  expect(text).toContain('70% remaining');
+  // A window that has reset since Codex last reported is not shown as still 35% left.
+  expect(text).toContain('Reset since this reading');
+  expect(text).not.toContain('35% remaining');
+  expect(text).toContain('Limit reached');
+  // Codex's own reason code reads as a sentence in the app's language, not as raw text.
+  expect(text).toContain("The workspace's Codex credits are used up");
+  expect(text).not.toContain('workspace_owner_credits_depleted');
+  expect(text).not.toContain('workspace owner credits depleted');
+  expect(text).toContain('Claude Code');
+  expect(text).toContain('Plan limits not reported');
+  expect(text).toContain('3M');
+  expect(getProviderUsage).toHaveBeenCalledWith(false);
+  (dom.window.document.getElementById('refreshUsage') as HTMLButtonElement).click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(getProviderUsage).toHaveBeenLastCalledWith(true);
+
+  getProviderUsage.mockResolvedValueOnce({ ok: true, data: { enabled: true, readAt: now, codex: null, claude: null } });
+  await usage.refreshUsage();
+  expect(host.textContent).toContain('No Codex logs on this computer');
+  getProviderUsage.mockResolvedValueOnce({ ok: true, data: { enabled: false, readAt: now, codex: null, claude: null } });
+  await usage.refreshUsage();
+  expect(host.textContent).toContain('Off');
+  expect(host.textContent).not.toContain('Codex ·');
 });
